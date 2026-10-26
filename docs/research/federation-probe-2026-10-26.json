@@ -1,0 +1,13 @@
+{
+  "screen_probe": {
+    "fixture": "historical approval text followed by a current goal footer",
+    "latest_footer_state": "Pursuing goal",
+    "reported_state": "APPROVAL",
+    "raw_screen_in_report": false
+  },
+  "transport_probe": {
+    "run_execution_timeout_seconds": null,
+    "scp_execution_timeout_seconds": null,
+    "all_transport_calls_mocked": true
+  }
+}
