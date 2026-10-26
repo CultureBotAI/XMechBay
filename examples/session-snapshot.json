@@ -1,0 +1,11 @@
+{
+  "processes": [
+    {"pid": 100, "ppid": 1, "tty": "pts/0", "executable": "sh"},
+    {"pid": 101, "ppid": 100, "tty": "pts/0", "executable": "codex"},
+    {"pid": 200, "ppid": 1, "tty": "pts/1", "executable": "claude"}
+  ],
+  "panes": [
+    {"pane": "%1", "pid": 100, "tty": "pts/0", "session": "demo", "executable": "codex", "cwd": "examples/demo-repo", "screen": "Working (3s · esc to interrupt)\n"}
+  ],
+  "errors": []
+}
