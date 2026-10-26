@@ -66,6 +66,11 @@ ownership, naming, prompt handling, and verification. The
 [publication policy](docs/publication-policy.md) explains what may be committed
 and what a local scan can and cannot establish.
 
+The [multi-Claw research and roadmap](docs/research/federated-mech-fleets-2026-10-26.md)
+assesses how one MechBay session could coordinate independent remote fleets toward
+verified, high-value outcomes. It distinguishes existing tools from proposed
+coordination services and includes a dependency-ordered implementation plan.
+
 ## Develop and verify
 
 ```bash
