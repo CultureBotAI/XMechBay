@@ -199,6 +199,93 @@ class CommandTests(unittest.TestCase):
     def test_aliases_and_combined_selection_preserve_order_without_duplicates(self):
         self.assertEqual(FLEET.selected_keys(["b", "first", "a"], self.config["hosts"], self.config["aliases"]), ["b", "a"])
 
+    @patch.dict(FLEET.os.environ, {}, clear=True)
+    @patch.object(FLEET.sys, "platform", "darwin")
+    @patch.object(FLEET, "open_excel")
+    @patch("fleet_excel.export_reports")
+    @patch.object(FLEET, "fetch_snapshot", side_effect=lambda host: snapshot())
+    def test_live_tables_open_same_collection_in_excel_at_150(self, fetch, export, opened):
+        export.return_value = Path(self.temporary.name) / "fleet.xlsx"
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = FLEET.main(["a", "b", "--config", str(self.path), "--no-cache"])
+        self.assertEqual(code, 0)
+        self.assertEqual(fetch.call_count, 2)
+        reports = export.call_args.args[0]
+        self.assertEqual([report["key"] for report in reports], ["a", "b"])
+        self.assertEqual(out.getvalue().count("| Session · target |"), 2)
+        self.assertEqual(reports[0]["observed_at"], snapshot()["observed_at"])
+        self.assertEqual(export.call_args.kwargs["zoom"], 150)
+        opened.assert_called_once_with(export.return_value, zoom=150)
+
+    @patch.dict(FLEET.os.environ, {}, clear=True)
+    @patch.object(FLEET.sys, "platform", "darwin")
+    @patch.object(FLEET, "open_excel")
+    @patch("fleet_excel.export_reports")
+    @patch.object(FLEET, "fetch_snapshot", side_effect=lambda host: snapshot())
+    def test_terminal_json_and_list_modes_do_not_export(self, fetch, export, opened):
+        for option in ("--no-excel", "--json", "--list"):
+            with self.subTest(option=option), redirect_stdout(io.StringIO()):
+                self.assertEqual(FLEET.main(["a", "--config", str(self.path), "--no-cache", option]), 0)
+        export.assert_not_called()
+        opened.assert_not_called()
+
+    @patch.dict(FLEET.os.environ, {"SSH_CONNECTION": "synthetic"}, clear=True)
+    @patch.object(FLEET.sys, "platform", "darwin")
+    @patch("fleet_excel.export_reports")
+    @patch.object(FLEET, "fetch_snapshot", side_effect=lambda host: snapshot())
+    def test_ssh_invocation_does_not_default_to_gui(self, fetch, export):
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(FLEET.main(["a", "--config", str(self.path), "--no-cache"]), 0)
+        export.assert_not_called()
+
+    @patch.dict(FLEET.os.environ, {}, clear=True)
+    @patch.object(FLEET.sys, "platform", "darwin")
+    @patch.object(FLEET, "open_excel", side_effect=RuntimeError("synthetic_open_failure"))
+    @patch("fleet_excel.export_reports")
+    @patch.object(FLEET, "fetch_snapshot", side_effect=lambda host: snapshot())
+    def test_gui_failure_preserves_terminal_table_and_reports_failure(self, fetch, export, opened):
+        export.return_value = Path(self.temporary.name) / "fleet.xlsx"
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(FLEET.main(["a", "--config", str(self.path), "--no-cache"]), 1)
+        self.assertIn("| Session · target |", out.getvalue())
+        self.assertIn("synthetic_open_failure", err.getvalue())
+        self.assertIn(str(export.return_value), err.getvalue())
+
+    @patch.dict(FLEET.os.environ, {}, clear=True)
+    @patch.object(FLEET.sys, "platform", "darwin")
+    @patch.object(FLEET, "open_excel")
+    @patch("fleet_excel.export_reports")
+    @patch.object(FLEET, "fetch_snapshot", side_effect=[snapshot(), RuntimeError("ssh_probe_failed")])
+    def test_failed_host_is_in_workbook_and_preserves_collection_exit_code(self, fetch, export, opened):
+        export.return_value = Path(self.temporary.name) / "fleet.xlsx"
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(FLEET.main(["a", "b", "--config", str(self.path), "--no-cache"]), 2)
+        self.assertEqual(len(export.call_args.args[0]), 2)
+        self.assertFalse(export.call_args.args[0][1]["reachable"])
+
+    @patch.dict(FLEET.os.environ, {}, clear=True)
+    @patch.object(FLEET.sys, "platform", "darwin")
+    @patch.object(FLEET.subprocess, "run")
+    def test_excel_open_uses_literal_arguments_and_verifies_identity_and_zoom(self, run):
+        path = (Path(self.temporary.name) / "quoted ' workbook.xlsx").resolve()
+        run.return_value.stdout = str(path) + "\n150\n"
+        FLEET.open_excel(path)
+        self.assertEqual(run.call_args.args[0][-2:], [str(path), "150"])
+        self.assertNotIn("shell", run.call_args.kwargs)
+        run.return_value.stdout = str(path) + "\n100\n"
+        with self.assertRaises(RuntimeError):
+            FLEET.open_excel(path)
+
+    @patch.dict(FLEET.os.environ, {"SSH_TTY": "synthetic"}, clear=True)
+    @patch.object(FLEET.sys, "platform", "darwin")
+    @patch.object(FLEET.subprocess, "run")
+    def test_excel_opener_refuses_remote_gui_launch(self, run):
+        with self.assertRaises(RuntimeError):
+            FLEET.open_excel(Path(self.temporary.name) / "fleet.xlsx")
+        run.assert_not_called()
+
     def test_ssh_options_and_unconfigured_hosts_are_refused(self):
         self.config["hosts"]["a"]["host"] = "-oProxyCommand=bad"
         self.path.write_text(json.dumps(self.config))

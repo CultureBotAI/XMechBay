@@ -3,9 +3,9 @@
 
 Purpose: reusable fleet status skill; 2026-10-27.
 Inputs: private host configuration or synthetic snapshots; bounded SSH probes.
-Outputs: Markdown/JSON, optional private hashes for comparisons between calls.
+Outputs: Markdown/JSON, optional private Excel workbook and comparison hashes.
 No session input, model calls, credential access, or autonomous scheduling.
-Python 3.9+ standard library.
+Python 3.9+; Excel export additionally uses XlsxWriter.
 """
 
 from __future__ import annotations
@@ -373,6 +373,17 @@ def collect_host(key, host, max_age, state_dir=None):
         return unavailable(key, label, code)
 
 
+def open_excel(workbook, zoom=150):
+    """Open only on the local Mac and verify this workbook's display zoom."""
+    if sys.platform != "darwin" or os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+        raise RuntimeError("Excel opening requires a local macOS GUI session")
+    path = Path(workbook).resolve()
+    result = subprocess.run(["/usr/bin/osascript", str(SCRIPT_DIR / "open_fleet_excel.applescript"),
+                             str(path), str(zoom)], check=True, capture_output=True, text=True, timeout=45)
+    if result.stdout.strip() != str(path) + "\n" + str(zoom):
+        raise RuntimeError("Excel workbook identity or zoom could not be verified")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("hosts", nargs="*", help="configured host keys; one table per key")
@@ -382,7 +393,18 @@ def main(argv=None):
     parser.add_argument("--snapshot", type=Path, help="offline multi-host fixture, no SSH or comparison cache")
     parser.add_argument("--json", action="store_true", help="normalized report including exact known IDs, without raw screens or paths")
     parser.add_argument("--no-cache", action="store_true", help="do not read or write comparison state")
+    excel = parser.add_mutually_exclusive_group()
+    excel.add_argument("--excel", dest="excel", action="store_true", default=None,
+                       help="export and open in local Microsoft Excel at 150%% (default for live tables on macOS)")
+    excel.add_argument("--no-excel", dest="excel", action="store_false", help="terminal output only")
+    parser.add_argument("--excel-dir", type=Path, default=ROOT / ".local/fleet-reports",
+                        help="private directory for timestamped Excel snapshots")
     args = parser.parse_args(argv)
+    if args.excel and (args.json or args.list):
+        parser.error("--excel cannot be combined with --json or --list")
+    wants_excel = (args.excel if args.excel is not None else
+                   sys.platform == "darwin" and not args.json and not args.snapshot
+                   and not os.environ.get("SSH_CONNECTION") and not os.environ.get("SSH_TTY"))
     try:
         if args.snapshot:
             envelope = read_json(args.snapshot)
@@ -413,7 +435,18 @@ def main(argv=None):
             print(json.dumps({"schema_version": 1, "hosts": reports}, indent=2))
         else:
             print("\n\n".join(render_host(report) for report in reports))
-        return 0 if all(report["reachable"] for report in reports) else 2
+        report_code = 0 if all(report["reachable"] for report in reports) else 2
+        if wants_excel:
+            try:
+                from fleet_excel import export_reports
+                workbook = export_reports(reports, args.excel_dir, zoom=150)
+                print("Excel snapshot: " + str(workbook), file=sys.stderr)
+                open_excel(workbook, zoom=150)
+                print("Opened in Microsoft Excel at 150%.", file=sys.stderr)
+            except (OSError, ValueError, RuntimeError, ImportError, subprocess.SubprocessError) as error:
+                print("Excel export/open failed: " + str(error) + ". Use --no-excel for terminal output only.", file=sys.stderr)
+                return report_code or 1
+        return report_code
     except (OSError, ValueError, TypeError) as error:
         code = str(error)
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):

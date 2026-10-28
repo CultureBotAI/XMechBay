@@ -33,6 +33,23 @@ to inspect configured host keys. The [synthetic configuration](../../../examples
 shows the schema. Keep actual SSH destinations, labels, paths, caches and reports
 in ignored local storage. A relative `state_dir` is resolved beside the config.
 
+On the local Mac, a live table command also opens Microsoft Excel at **150%**
+display zoom by default. It exports the same collected observation, with one
+worksheet per requested host, to a unique private `.local/fleet-reports/` workbook.
+Keep the terminal tables in the response. A failed host remains explicit in both
+outputs. Excel's opened workbook identity and zoom are checked before reporting
+success; the saved worksheets also retain 150% zoom.
+
+Use `--no-excel` for terminal-only output or `--excel-dir DIR` for another private
+output directory. Install the optional local exporter dependency with
+`python3 -m pip install -r requirements-excel.txt`. There is no automatic install,
+upload, remote GUI launch, or second fleet collection for Excel. `--json`, `--list`,
+and offline `--snapshot` remain GUI-free by default. An explicit `--excel` can open
+an offline snapshot on the local Mac; it cannot be combined with `--json` or
+`--list`. SSH invocations stay terminal-only; use `--no-excel` for other headless
+automation. If Excel opening fails,
+report the failure and the saved workbook path, rather than claiming it opened.
+
 Use `--json` for structured details and `--no-cache` when comparison state should
 not be retained. `--snapshot FILE` renders supplied offline collector evidence
 without SSH. Prefer the existing commands over creating ad hoc collectors.
@@ -74,7 +91,7 @@ not an ownership grant. Control still requires the configured owner session and
 a fresh target check.
 
 When asked to open or export an existing table in Excel, preserve that snapshot
-and timestamp. Use one worksheet per host, filters, frozen headers, wrapped
+and timestamp. Use one worksheet per host at 150% zoom, filters, frozen headers, wrapped
 activity text and matching state colors with text labels; retain the evidence
 legend. Label the workbook as a static snapshot. A fresh collection is a separate
 request, and a local export does not authorize uploading fleet data.
