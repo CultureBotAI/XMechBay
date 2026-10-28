@@ -17,8 +17,11 @@ data, or a particular organization's deployment.
 | `agy-permissions` | Inspect a supplied permission-policy file without modifying it |
 | `scripts/sync_skill_mirrors.py` | Keep the agent skill directories identical, including hidden and ignored entries |
 | `scripts/check_public_content.py` | Check publishable files and Git history for private-data patterns |
+| `scripts/check_port_pressure.py` | Observe local TCP port pressure and retain private alerts without controlling sessions |
+| `scripts/install_port_pressure_watch.py` | Preview or install a per-user macOS monitor that checks every 60 seconds |
 
-Python 3.10 or later is required. Terminal commands require macOS and Terminal.app;
+Python 3.10 or later is required for the fleet tools; the standalone port pressure
+monitor also supports Python 3.9. Terminal commands require macOS and Terminal.app;
 remote commands require SSH access configured by the operator. The tmux path
 requires an existing tmux server on the selected host. Nothing starts remote GUI
 applications, authenticates accounts, or installs host software automatically.
@@ -63,6 +66,8 @@ tree makes every branch switch and partial edit a live deployment.
 
 The [fleet control contract](docs/fleet-control-contract.md) defines session
 ownership, naming, prompt handling, and verification. The
+[port pressure recovery guide](docs/port-pressure-recovery.md) covers monitoring,
+safe session recycling, and the limits of software updates. The
 [publication policy](docs/publication-policy.md) explains what may be committed
 and what a local scan can and cannot establish.
 
