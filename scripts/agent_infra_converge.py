@@ -21,9 +21,11 @@ import argparse
 import importlib.util
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import textwrap
 
 AUDIT = Path(__file__).resolve().with_name("agent_infra_audit.py")
 _spec = importlib.util.spec_from_file_location("agent_infra_audit", AUDIT)
@@ -135,18 +137,22 @@ def paragraphs(text: str) -> list[list[str]]:
 
 
 def carried_lines(path: Path, other: str) -> list[str]:
-    """Paragraphs of a pointer file worth keeping: not the heading, not 'read <other>'."""
+    """Text of a pointer file worth keeping: every sentence except 'read <other>' ones."""
     kept: list[str] = []
     for block in paragraphs(path.read_text(encoding="utf-8", errors="replace")):
         joined = " ".join(l.strip() for l in block)
         if joined.startswith("# "):
             continue
-        lowered = joined.lower()
-        if other.lower() in lowered and any(w in lowered for w in READ_WORDS) and len(joined) < 240:
+        prefix = ""
+        if joined.startswith(("- ", "* ")):
+            prefix, joined = joined[:2], joined[2:]
+        sentences = [s for s in re.split(r"(?<=[.!?])\s+(?=[A-Z`\[])", joined) if s]
+        remaining = [s for s in sentences if not (other.lower() in s.lower() and any(w in s.lower() for w in READ_WORDS))]
+        if not remaining:
             continue
         if kept:
             kept.append("")
-        kept.extend(block)
+        kept.extend(textwrap.wrap(" ".join(remaining), width=80, initial_indent=prefix, subsequent_indent="  " if prefix else "", break_long_words=False, break_on_hyphens=False))
     return kept
 
 
