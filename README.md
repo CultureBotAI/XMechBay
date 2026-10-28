@@ -66,6 +66,13 @@ bash scripts/fleet-status.sh laptop-a laptop-b
 The combined command collects concurrently and prints two separate tables. Each
 shows every observed logical session with its target, model, state, reported
 activity, process age, observation changes, and available listener pressure.
+On a local Mac, these live commands also open the same snapshot in Microsoft
+Excel at **150% zoom**, with one worksheet per host, colored states, filters and
+frozen headers. Workbooks are saved privately under `.local/fleet-reports/`.
+Install the optional dependency with `python3 -m pip install -r requirements-excel.txt`.
+Use `--no-excel` for terminal-only output; `--json`, `--list`, SSH invocations and
+offline snapshots do not open Excel by default. Use `--snapshot FILE --excel` to
+open a supplied snapshot locally. Nothing launches Excel on the observed hosts.
 Chat reports render these as formatted Markdown tables with colored state
 symbols and text labels by default. Each host keeps its own timestamp, summary
 and evidence legend; copying the output into a code block hides that formatting.

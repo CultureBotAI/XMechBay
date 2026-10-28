@@ -1,0 +1,2 @@
+# Optional local Excel export support; fleet CLI feature, 2026-10-27.
+XlsxWriter>=3.2,<4
