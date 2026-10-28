@@ -172,20 +172,43 @@ def ancestors(pid, processes):
 
 
 def parse_panes(text):
-    panes, errors = [], []
+    # Linked/grouped sessions list the same server-wide pane more than once.
+    # Count and probe the pane once; memberships are observations, not ownership.
+    panes, errors = {}, []
     for line in text.splitlines():
         fields = line.split("\t", 8)
         if (len(fields) != 9 or not re.fullmatch(r"%\d+", fields[0]) or
                 not fields[1].isdigit() or not re.fullmatch(r"@\d+", fields[4])):
             errors.append("tmux_row_unparsed")
             continue
-        if len(panes) >= MAX_PANES:
-            errors.append("tmux_panes_truncated")
-            break
-        panes.append({"pane": fields[0], "pid": int(fields[1]), "tty": tty_name(fields[2]),
-                      "tmux_session": fields[3], "window": fields[5], "tmux_window_id": fields[4],
-                      "pane_index": fields[6], "command": fields[7], "cwd": fields[8]})
-    return panes, sorted(set(errors))
+        row = {"pane": fields[0], "pid": int(fields[1]), "tty": tty_name(fields[2]),
+               "tmux_session": fields[3], "window": fields[5], "tmux_window_id": fields[4],
+               "pane_index": fields[6], "command": fields[7], "cwd": fields[8]}
+        if row["pane"] not in panes:
+            if len(panes) >= MAX_PANES:
+                errors.append("tmux_panes_truncated")
+                continue  # Still retain later memberships of admitted panes.
+            row["tmux_sessions"] = {row["tmux_session"]}
+            panes[row["pane"]] = row
+            continue
+        previous = panes[row["pane"]]
+        if previous is None:
+            continue
+        if any(row[key] != previous[key] for key in ("pid", "tty", "tmux_window_id")):
+            # Conflicting identity cannot safely attach an OS process to a pane.
+            errors.append("pane_rows_invalid")
+            panes[row["pane"]] = None
+            continue
+        previous["tmux_sessions"].add(row["tmux_session"])
+    result = []
+    for row in panes.values():
+        if row is None:
+            continue
+        row["tmux_sessions"] = sorted(row["tmux_sessions"])
+        # Retain the legacy selector deterministically, without choosing an owner.
+        row["tmux_session"] = row["tmux_sessions"][0]
+        result.append(row)
+    return result, sorted(set(errors))
 
 
 def session_id_evidence(agent, tokens):
@@ -550,7 +573,7 @@ def collect(health_report=None, runner=None):
             row["errors"].append("argv_identity_unavailable")
         pane = attached[row["pid"]]
         if pane:
-            row["target"] = {key: pane[key] for key in ("pane", "tmux_session", "window", "tmux_window_id", "pane_index")}
+            row["target"] = {key: pane[key] for key in ("pane", "tmux_session", "tmux_sessions", "window", "tmux_window_id", "pane_index")}
             row["target"]["transport"] = "tmux"
             if not row["cwd"]:
                 row["cwd"] = pane["cwd"]
@@ -592,6 +615,7 @@ def collect(health_report=None, runner=None):
                 "tty": pane["tty"], "started_at": None, "age_seconds": None, "cwd": pane["cwd"],
                 "session_id": None, "session_id_source": None,
                 "target": {"transport": "tmux", "pane": pane["pane"], "tmux_session": pane["tmux_session"],
+                           "tmux_sessions": pane["tmux_sessions"],
                            "window": pane["window"], "tmux_window_id": pane["tmux_window_id"]},
                 "screen": "", "title": "", "errors": ["agent_process_unverified"]})
     result["health"] = read_health(health_report or Path.home() / "Library" / "Application Support" / "XMechBay" / "port-pressure" / "state" / "latest.json")

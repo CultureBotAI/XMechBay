@@ -27,6 +27,42 @@ directory. Logs contain host, target, command, state, timestamp, and any overrid
 reason; they exclude screen contents and input text. Keep logs and real host
 configuration out of version control.
 
+## Visible viewer for each session
+
+For an authorized new remote coding CLI session that supports tmux, use the
+configured host-controller session with one named window and pane per repository
+loop. Follow the contract's naming and ownership rules; check for an existing
+live thread before starting another. GUI-only agents retain their native UI.
+
+Keep one visible Terminal window per agent session, including coordinator and
+repository agents, clearly titled for the session it displays. Reuse an existing
+appropriate shell window when possible. Each tmux viewer must independently show
+its intended agent: attaching several clients to a shared session is insufficient
+if selecting a window in one viewer switches the others. Verify each viewer's
+tty, attachment and displayed pane, and confirm that changing one view leaves
+the others on their intended agents. Do not start duplicate agents to obtain
+separate views. A repository title alone does not identify a running agent.
+
+Stagger the visible Terminal windows from bottom-left to top-right, leaving
+enough vertical spacing for two terminal lines to remain visible at each bottom
+edge. Derive spacing from the current font and window geometry, and verify the
+result on screen. On macOS, a tmux server that needs login-session keychain access
+must originate in an already running Terminal app in the GUI login session.
+Never launch that app from SSH.
+
+The default tmux keys are **Ctrl+B, then W** to choose a window and **Ctrl+B,
+then D** to detach a viewer. Detaching leaves agents running. Restore the view
+through its existing attachment arrangement; do not launch another agent. Use
+the host's configured prefix if it differs from the default.
+
+Existing agents running directly in Terminal remain there until an authorized
+idle checkpoint permits the exact-session graceful restart below. Window cleanup
+does not authorize interrupting or migrating them. When asked to close redundant
+windows, inspect every tab's current tty, processes and screen; close only
+verified shell-only windows without child jobs. Preserve active agents, the
+per-session viewers and unrelated terminals. Verify one closure before repeating
+it, then confirm the retained agents and viewers are still present.
+
 ## Safe workflow
 
 1. Inspect `windows`, `status`, and `screen WINDOW_ID`. Status returns the
