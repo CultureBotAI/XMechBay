@@ -61,3 +61,20 @@ class SpliceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ValidateBeforeWriteTests(SpliceTests):
+    def test_backup_collision_on_one_target_writes_none(self):
+        one = self.dir / "one.md"
+        two = self.dir / "two.md"
+        one.write_text("# One\n")
+        two.write_text("# Two\n")
+        (self.dir / "two.md.bak-common-20260101").write_text("old backup\n")
+        self.assertEqual(self.run_sync(one, two), 2)
+        self.assertEqual(one.read_text(), "# One\n")
+
+    def test_lone_marker_is_refused(self):
+        one = self.dir / "one.md"
+        one.write_text(f"# One\n{sync.END}\n")
+        self.assertEqual(self.run_sync(one), 2)
+        self.assertEqual(one.read_text(), f"# One\n{sync.END}\n")

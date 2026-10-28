@@ -82,3 +82,12 @@ class MirrorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReverseLayoutTests(MirrorTests):
+    def test_source_symlink_to_target_is_parity(self):
+        self.source.rmdir()
+        self.source.symlink_to(Path("target"), target_is_directory=True)
+        (self.target / "skill").mkdir()
+        (self.target / "skill/SKILL.md").write_text("x")
+        self.assertEqual(self.sync(), 0)

@@ -80,9 +80,10 @@ python3 scripts/check_public_content.py
 ```
 
 `.claude/skills` is a symlink to `.agents/skills`, so a canonical skill needs no
-mirroring step; the check confirms the two paths are one directory. A checkout
-that cannot use symlinks may keep copies instead: `python3
-scripts/sync_skill_mirrors.py` updates them, and the checker refuses unexpected
-destination entries so that they are inspected rather than deleted. The
+mirroring step; the check confirms the two paths are one directory (in either
+direction). A checkout made without symlink support receives stub files
+instead of links; delete them and keep identical copies with `python3
+scripts/sync_skill_mirrors.py`, whose checker refuses unexpected destination
+entries so that they are inspected rather than deleted. The
 [agent infrastructure contract](docs/agent-infra-contract.md) explains the
 layout and `python3 scripts/agent_infra_audit.py .` reports compliance.

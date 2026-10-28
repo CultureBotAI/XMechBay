@@ -2,8 +2,9 @@
 """Audit agent instruction files and skill trees for Claude Code, Codex and agy (2026-10-28).
 
 Inputs: repository paths (positional) or --scan ROOT [--max-depth N] to find Git
-checkouts; --global to audit the user-level files instead. Reads only; follows
-no symlink outside the repository for content, reports link targets as text.
+checkouts; --global to audit the user-level files instead. Reads only. A symlink
+counts as unified only when its target is relative and resolves to the sibling
+file or directory; absolute and dangling links are reported as such.
 Output: a text table (default) or --json. Exit 1 when any audited repository is
 not in the target state described in docs/agent-infra-contract.md.
 """
@@ -15,6 +16,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
 
 INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md", "GEMINI.md")
@@ -23,18 +26,20 @@ COMMON_BEGIN = "<!-- common-agreements:begin -->"
 COMMON_END = "<!-- common-agreements:end -->"
 POINTER_MAX_LINES = 12
 DEFAULT_GLOBAL_FILES = (
-    "~/.claude/CLAUDE.md",
-    "~/.codex/AGENTS.md",
-    "~/.codex-pro/AGENTS.md",
+    str(Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")) / "CLAUDE.md"),
+    str(Path(os.environ.get("CODEX_HOME", "~/.codex")) / "AGENTS.md"),
     "~/.gemini/AGENTS.md",
 )
+READ_RE = re.compile(r"\b(read|follow|see)\b", re.IGNORECASE)
 
 
 def kind_of(path: Path) -> str:
-    """'missing', 'file', 'dir', 'symlink:<target>' or 'broken-symlink:<target>'."""
+    """'missing', 'file', 'dir', 'symlink:<target>', 'absolute-symlink:<target>' or 'broken-symlink:<target>'."""
     if path.is_symlink():
         target = os.readlink(path)
-        return f"{'symlink' if path.exists() else 'broken-symlink'}:{target}"
+        if not path.exists():
+            return f"broken-symlink:{target}"
+        return f"{'absolute-symlink' if os.path.isabs(target) else 'symlink'}:{target}"
     if not path.exists():
         return "missing"
     return "dir" if path.is_dir() else "file"
@@ -47,16 +52,28 @@ def same_file(a: Path, b: Path) -> bool:
         return False
 
 
+def content_files(root: Path) -> list[Path]:
+    """Files that count as content: in a git checkout, tracked plus untracked
+    non-ignored entries (caches and .local records do not make copies drift);
+    elsewhere every file, hidden ones included."""
+    repo = root
+    while repo != repo.parent and not (repo / ".git").exists():
+        repo = repo.parent
+    if (repo / ".git").exists():
+        rel = str(root.relative_to(repo))
+        out = subprocess.run(["git", "-C", str(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", rel], capture_output=True, text=True, check=False)
+        return sorted(repo / p for p in out.stdout.split("\0") if p)
+    return sorted(p for p in root.rglob("*") if not p.is_dir() or p.is_symlink())
+
+
 def tree_digest(root: Path) -> dict[str, str]:
-    """Relative path -> sha256 (files) or 'dir', including hidden entries."""
+    """Relative path -> sha256 (files) or symlink target, for the content files."""
     result: dict[str, str] = {}
-    for path in sorted(root.rglob("*")):
+    for path in content_files(root):
         rel = str(path.relative_to(root))
         if path.is_symlink():
             result[rel] = "symlink:" + os.readlink(path)
-        elif path.is_dir():
-            result[rel] = "dir"
-        else:
+        elif path.is_file():
             result[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
     return result
 
@@ -68,12 +85,18 @@ def skill_names(root: Path) -> list[str]:
 
 
 def is_pointer(path: Path, other_name: str) -> bool:
+    """A short file with a sentence that tells the reader to read/follow/see the other file."""
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
     lines = [line for line in text.splitlines() if line.strip()]
-    return len(lines) <= POINTER_MAX_LINES and other_name in text
+    if len(lines) > POINTER_MAX_LINES:
+        return False
+    for sentence in re.split(r"(?<=[.!?])\s+", " ".join(l.strip() for l in lines)):
+        if other_name.lower() in sentence.lower() and READ_RE.search(sentence):
+            return True
+    return False
 
 
 def classify_instructions(repo: Path) -> dict:
@@ -82,6 +105,8 @@ def classify_instructions(repo: Path) -> dict:
     verdict, canonical = "none", None
     if any(k.startswith("broken-symlink") for k in (kinds["AGENTS.md"], kinds["CLAUDE.md"])):
         verdict = "broken-link"
+    elif any(k.startswith("absolute-symlink") for k in (kinds["AGENTS.md"], kinds["CLAUDE.md"])):
+        verdict = "absolute-link"
     elif kinds["AGENTS.md"] != "missing" and kinds["CLAUDE.md"] != "missing":
         if kinds["CLAUDE.md"].startswith("symlink") and same_file(claude, agents):
             verdict, canonical = "unified", "AGENTS.md"
@@ -104,7 +129,7 @@ def classify_instructions(repo: Path) -> dict:
         verdict, canonical = "claude-only", "CLAUDE.md"
     result = {"kinds": kinds, "verdict": verdict, "canonical": canonical}
     if kinds["GEMINI.md"] != "missing":
-        result["gemini"] = "pointer" if kinds["GEMINI.md"] == "file" and is_pointer(gemini, "AGENTS.md") else kinds["GEMINI.md"].split(":")[0]
+        result["gemini"] = "pointer" if kinds["GEMINI.md"] == "file" and (is_pointer(gemini, "AGENTS.md") or is_pointer(gemini, "CLAUDE.md")) else kinds["GEMINI.md"].split(":")[0]
     return result
 
 
@@ -113,8 +138,11 @@ def classify_skills(repo: Path) -> dict:
     kinds = {d: kind_of(repo / d) for d in SKILL_DIRS}
     names = {d: skill_names(repo / d) for d in SKILL_DIRS}
     drifted: list[str] = []
+    drift_detail: dict[str, list[str]] = {}
     if any(kinds[d].startswith("broken-symlink") for d in SKILL_DIRS):
         verdict, canonical = "broken-link", None
+    elif any(kinds[d].startswith("absolute-symlink") for d in SKILL_DIRS):
+        verdict, canonical = "absolute-link", None
     elif kinds[".agents/skills"] == "missing" and kinds[".claude/skills"] == "missing":
         verdict, canonical = "none", None
     elif kinds[".claude/skills"].startswith("symlink") and same_file(claude, agents):
@@ -127,14 +155,18 @@ def classify_skills(repo: Path) -> dict:
             verdict, canonical = "copies-identical", ".agents/skills"
         else:
             verdict, canonical = "copies-drifted", None
-            drifted = sorted({p.split("/")[0] for p in set(a) ^ set(c)} | {p.split("/")[0] for p in set(a) & set(c) if a[p] != c[p]})
+            for p in sorted(set(a) | set(c)):
+                if p not in a or p not in c or a[p] != c[p]:
+                    tag = "" if p in a and p in c else (" (only in .agents)" if p in a else " (only in .claude)")
+                    drift_detail.setdefault(p.split("/")[0], []).append(p + tag)
+            drifted = sorted(drift_detail)
     elif kinds[".agents/skills"] != "missing" and kinds[".claude/skills"] == "missing":
         verdict, canonical = "agents-only", ".agents/skills"
     elif kinds[".claude/skills"] != "missing" and kinds[".agents/skills"] == "missing":
         verdict, canonical = "claude-only", ".claude/skills"
     else:
         verdict, canonical = "divergent", None
-    return {"kinds": kinds, "counts": {d: len(n) for d, n in names.items()}, "verdict": verdict, "canonical": canonical, "drifted": drifted}
+    return {"kinds": kinds, "counts": {d: len(n) for d, n in names.items()}, "verdict": verdict, "canonical": canonical, "drifted": drifted, "drift_detail": drift_detail}
 
 
 def audit_repo(repo: Path) -> dict:
@@ -191,8 +223,8 @@ def audit_global(files: list[str]) -> dict:
 
 def instruction_summary(info: dict) -> str:
     text = info["verdict"]
-    if text == "broken-link":
-        text += "(" + ", ".join(f"{n}->{k.split(':', 1)[1]}" for n, k in info["kinds"].items() if k.startswith("broken")) + ")"
+    if text in ("broken-link", "absolute-link"):
+        text += "(" + ", ".join(f"{n}->{k.split(':', 1)[1]}" for n, k in info["kinds"].items() if k.startswith(("broken", "absolute"))) + ")"
     if info["canonical"] and info["verdict"] in ("unified", "pointer"):
         text += f"({info['canonical']})" + ("(reverse)" if info["verdict"] == "unified" and info["canonical"] == "CLAUDE.md" else "")
     if "gemini" in info:
@@ -202,8 +234,8 @@ def instruction_summary(info: dict) -> str:
 
 def skills_summary(info: dict) -> str:
     text = info["verdict"]
-    if text == "broken-link":
-        text += "(" + ", ".join(f"{n}->{k.split(':', 1)[1]}" for n, k in info["kinds"].items() if k.startswith("broken")) + ")"
+    if text in ("broken-link", "absolute-link"):
+        text += "(" + ", ".join(f"{n}->{k.split(':', 1)[1]}" for n, k in info["kinds"].items() if k.startswith(("broken", "absolute"))) + ")"
     if info["verdict"] == "unified-symlink" and info["canonical"] == ".claude/skills":
         text += "(reverse)"
     if info["drifted"]:

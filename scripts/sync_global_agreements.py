@@ -51,11 +51,22 @@ def main(argv: list[str] | None = None) -> int:
     if BEGIN in common or END in common:
         print("the common file must not contain the markers", file=sys.stderr)
         return 2
-    drift = 0
+    # Validate every target before writing any, so a refusal never leaves a partial set.
+    work = []
     for target in args.target:
         target = target.expanduser()
         current = target.read_text(encoding="utf-8") if target.exists() else ""
+        if current.count(BEGIN) != current.count(END) or current.count(BEGIN) > 1 or (BEGIN in current and current.find(BEGIN) > current.find(END)):
+            print(f"malformed markers in {target}; fix by hand", file=sys.stderr)
+            return 2
         wanted = splice(current, common)
+        backup = target.with_name(f"{target.name}.bak-common-{args.date}") if target.exists() else None
+        if wanted != current and not args.check and backup is not None and backup.exists():
+            print(f"backup exists, not overwriting: {backup}", file=sys.stderr)
+            return 2
+        work.append((target, current, wanted, backup))
+    drift = 0
+    for target, current, wanted, backup in work:
         if wanted == current:
             print(f"ok       {target}")
             continue
@@ -63,11 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.check:
             print(f"differs  {target}")
             continue
-        if target.exists():
-            backup = target.with_name(f"{target.name}.bak-common-{args.date}")
-            if backup.exists():
-                print(f"backup exists, not overwriting: {backup}", file=sys.stderr)
-                return 2
+        if backup is not None:
             shutil.copy2(target, backup)
             print(f"updated  {target} (backup {backup.name})")
         else:

@@ -18,13 +18,16 @@ discovery claim after an upgrade.
 | Memory | auto-memory per config dir and project path | `$CODEX_HOME/memories/` | per-conversation brain under `~/.gemini/antigravity-cli/` |
 | Permissions and hooks | `settings.json` hooks and permission rules | approval policy and sandbox in `config.toml` | `~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/hooks.json` |
 
-Evidence: Codex registers a repository's `.agents/skills` as a skill root and
-reports it by its resolved path, so a symlink is followed; the `agy` binary
-documents the `AGENTS.md`/`GEMINI.md` pair and `.agents/skills`; Claude Code reads
-`CLAUDE.md` through a symlink and lists a skill once when both skill directories
-resolve to the same content. Both symlinked user-level rules files are
-de-duplicated by `agy` (its changelog says so); a separate `GEMINI.md` next to an
-`AGENTS.md` is read twice.
+Evidence, measured once on 2026-10-28 and to be re-measured after an upgrade
+(no script in this repository exercises it): a Codex session registered a
+repository's `.agents/skills` as a skill root and reported it by its resolved
+path, so the symlink was followed; the `agy` binary's embedded documentation
+names the `AGENTS.md`/`GEMINI.md` pair and `.agents/skills`; Claude Code read
+`CLAUDE.md` through a symlink and listed a skill once when both skill
+directories resolved to the same content; `agy`'s changelog says symlinked
+user-level rules files are read once, while a separate `GEMINI.md` next to an
+`AGENTS.md` is read twice. The canary step in the `agent-infra-unify` skill is
+the way to re-verify all of this.
 
 ## Repository layout (the target state)
 
@@ -52,7 +55,10 @@ Rules:
 4. **Reverse direction is compliant, not preferred.** `AGENTS.md -> CLAUDE.md`
    and `.agents/skills -> ../.claude/skills` give every tool the same bytes and
    are accepted by the audit. New repositories use the forward direction; flip
-   existing ones only when another change touches the files.
+   existing ones only when another change touches the files. Where a fleet
+   hub lists `.claude/skills` with `git ls-files` (the exception at the end),
+   the reverse direction for skills is the rule for that fleet and wins over
+   this one. Link targets are relative; an absolute target is a defect.
 5. **Durable knowledge goes in the repository, not in a tool's memory.** Each
    tool's memory is a per-tool cache that no other tool reads. Anything a later
    session of any tool needs is written into `AGENTS.md`, `docs/` or a dated
@@ -63,12 +69,14 @@ Rules:
 
 ## User-level layout
 
-The four live files are read by different tools and cannot be one file:
+The live files are read by different tools and cannot be one file (a machine
+with several Claude config dirs or Codex homes has one per home; name the
+extra ones with `--global-file` and `--target`):
 
 | File | Read by |
 |---|---|
-| `~/.claude/CLAUDE.md` (shared into other Claude config dirs by symlink) | Claude Code |
-| `~/.codex/AGENTS.md`, `~/.codex-pro/AGENTS.md` | Codex CLI, one per account home |
+| `$CLAUDE_CONFIG_DIR/CLAUDE.md` (default `~/.claude/CLAUDE.md`), one per Claude config dir | Claude Code |
+| `$CODEX_HOME/AGENTS.md` (default `~/.codex/AGENTS.md`), one per Codex home | Codex CLI |
 | `~/.gemini/AGENTS.md` | Antigravity |
 
 They share one **common block** delimited by markers:
@@ -132,9 +140,13 @@ pull request per repository. Merging is the owner's decision.
 
 ## Known exceptions
 
-- A published repository that must work on checkouts without symlink support
-  keeps identical copies and a sync check in CI (this repository did until
-  2026-10-28; its CI now accepts the symlink).
+- A checkout made without symlink support (`core.symlinks=false`, the Windows
+  default) gets plain files holding the link text: `CLAUDE.md` then reads as
+  the single word `AGENTS.md` and `.claude/skills` is a one-line file, which
+  `sync_skill_mirrors.py --check` reports as "Expected a real skill directory".
+  Recovery: enable `core.symlinks` and re-checkout, or delete the stub files
+  and keep identical copies with `sync_skill_mirrors.py` (the audit then
+  reports `copies-identical`, which is compliant).
 - Governance tooling that reads `CLAUDE.md` by name keeps working: a symlink
   reads as the canonical file. Tooling that *writes* into `.claude/skills` also
   keeps working, because writes follow the symlink into `.agents/skills`.

@@ -278,3 +278,135 @@ class ConvergeTests(RepoCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRegressionTests(RepoCase):
+    """Behaviours the adversarial review of PR #20 found untested."""
+
+    def git_out(self, *args):
+        return subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, env=GIT_ENV).stdout
+
+    def test_dropped_copy_keeps_untracked_and_ignored_files(self):
+        self.write("AGENTS.md", "# Repo\n")
+        (self.repo / "CLAUDE.md").symlink_to("AGENTS.md")
+        self.skill(".agents/skills", "x", "# keep\n")
+        self.skill(".claude/skills", "x", "# keep\n")
+        self.write(".gitignore", ".local/\n")
+        self.commit()
+        self.write(".claude/skills/x/.local/record.txt", "live record\n")
+        self.write(".claude/skills/x/draft.md", "untracked draft\n")
+        self.assertEqual(self.converge("--apply", "--skills-from", ".agents/skills"), 2)  # untracked under the paths: refuse without --force
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            converge.main([str(self.repo), "--skills-from", ".agents/skills"])
+        self.assertIn("keeping 2 untracked/ignored path(s)", out.getvalue())
+        self.assertEqual(self.converge("--apply", "--force", "--skills-from", ".agents/skills"), 0)
+        self.assertEqual((self.repo / ".agents/skills/x/.local/record.txt").read_text(), "live record\n")
+        self.assertEqual((self.repo / ".agents/skills/x/draft.md").read_text(), "untracked draft\n")
+
+    def test_nested_git_inside_dropped_tree_refuses_before_any_change(self):
+        self.write("AGENTS.md", "# Repo\n")
+        (self.repo / "CLAUDE.md").symlink_to("AGENTS.md")
+        self.skill(".agents/skills", "x")
+        self.skill(".claude/skills", "x")
+        self.commit()
+        nested = self.repo / ".claude/skills/scratch"
+        nested.mkdir()
+        subprocess.run(["git", "init", "-q", str(nested)], check=True, env=GIT_ENV)
+        with self.assertRaises(SystemExit):
+            self.converge("--apply", "--force")
+        self.assertTrue((self.repo / ".claude/skills/x/SKILL.md").is_file())
+        self.assertFalse((self.repo / ".claude/skills").is_symlink())
+
+    def test_refusal_in_the_instructions_phase_changes_nothing(self):
+        self.write("CLAUDE.md", "# A long real file\n\n- rule one\n")
+        self.write("AGENTS.md", "# Another real file\n\n- rule two\n")
+        self.skill(".claude/skills", "a")
+        self.commit()
+        with self.assertRaises(SystemExit):
+            self.converge("--apply")
+        self.assertFalse((self.repo / ".agents").exists())
+        self.assertFalse((self.repo / ".claude/skills").is_symlink())
+        self.assertEqual(self.git_out("status", "--porcelain"), "")
+
+    def test_gemini_only_repo_becomes_agents_md(self):
+        self.write("GEMINI.md", "# Rules for agy\n\n- keep it\n")
+        self.commit()
+        self.assertEqual(self.converge("--apply"), 0)
+        self.assertEqual((self.repo / "AGENTS.md").read_text(), "# Rules for agy\n\n- keep it\n")
+        self.assertEqual(os.readlink(self.repo / "CLAUDE.md"), "AGENTS.md")
+        self.assertFalse((self.repo / "GEMINI.md").exists())
+        self.assertTrue(audit.audit_repo(self.repo)["ok"])
+
+    def test_no_git_keeps_the_branch_and_dirty_guards(self):
+        self.git("switch", "-q", "main")
+        self.write("CLAUDE.md", "# Rules\n")
+        self.commit()
+        self.assertEqual(self.converge("--apply", "--no-git"), 2)
+        self.git("switch", "-q", "topic")
+        self.write("CLAUDE.md", "# Rules edited\n")
+        self.assertEqual(self.converge("--apply", "--no-git"), 2)
+        self.assertTrue((self.repo / "CLAUDE.md").is_file())
+
+    def test_carried_text_keeps_structure_and_whole_words(self):
+        pointer = (
+            "# Repo\n\nRead CLAUDE.md for the rules. The hook in CLAUDE.md is already enforced.\n"
+            "Overseeing CLAUDE.md edits is the owner's job.\n\n"
+            "1. Run `make`.\n2. Then test.\n\n```bash\nmake test\nmake lint\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n> quoted\n"
+        )
+        self.write("AGENTS.md", pointer)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            lines = converge.carried_lines(self.repo / "AGENTS.md", "CLAUDE.md")
+        text = "\n".join(lines)
+        prose = " ".join(text.split())
+        self.assertNotIn("Read CLAUDE.md for the rules.", prose)
+        self.assertIn("The hook in CLAUDE.md is already enforced.", prose)
+        self.assertIn("Overseeing CLAUDE.md edits is the owner's job.", prose)
+        self.assertIn("1. Run `make`.\n2. Then test.", text)
+        self.assertIn("```bash\nmake test\nmake lint\n```", text)
+        self.assertIn("| a | b |\n|---|---|\n| 1 | 2 |", text)
+        self.assertIn("> quoted", text)
+        self.assertIn("DROP  from AGENTS.md: Read CLAUDE.md for the rules.", out.getvalue())
+
+    def test_short_real_file_that_mentions_the_other_is_not_a_pointer(self):
+        self.write("AGENTS.md", "# Repo\n\nClaude Code also gets a CLAUDE.md copy.\n\n- real rule\n")
+        self.write("CLAUDE.md", "# Rules\n\n- another real rule\n")
+        self.assertEqual(audit.audit_repo(self.repo)["instructions"]["verdict"], "divergent")
+        self.write("AGENTS.md", "# Repo\n\nRead CLAUDE.md for the rules.\n")
+        self.assertEqual(audit.audit_repo(self.repo)["instructions"]["verdict"], "pointer")
+
+    def test_absolute_symlink_target_is_a_defect(self):
+        self.write("AGENTS.md", "# Repo\n")
+        (self.repo / "CLAUDE.md").symlink_to(self.repo / "AGENTS.md")
+        result = audit.audit_repo(self.repo)
+        self.assertEqual(result["instructions"]["verdict"], "absolute-link")
+        self.assertFalse(result["ok"])
+        self.commit()
+        with self.assertRaises(SystemExit):
+            self.converge("--apply")
+
+    def test_ignored_cache_does_not_make_copies_drift(self):
+        self.write("AGENTS.md", "# Repo\n")
+        (self.repo / "CLAUDE.md").symlink_to("AGENTS.md")
+        self.skill(".agents/skills", "a")
+        self.skill(".claude/skills", "a")
+        self.write(".gitignore", "__pycache__/\n")
+        self.commit()
+        self.write(".claude/skills/a/__pycache__/x.pyc", "cache")
+        self.assertEqual(audit.audit_repo(self.repo)["skills"]["verdict"], "copies-identical")
+        self.write(".claude/skills/a/extra.md", "untracked but real content\n")
+        info = audit.audit_repo(self.repo)["skills"]
+        self.assertEqual(info["verdict"], "copies-drifted")
+        self.assertEqual(info["drift_detail"], {"a": ["a/extra.md (only in .claude)"]})
+
+    def test_case_insensitive_tracked_name_is_moved_with_git(self):
+        self.write("Claude.md", "# Rules\n")
+        self.commit()
+        if not (self.repo / "CLAUDE.md").exists():
+            self.skipTest("case-sensitive filesystem")
+        self.assertEqual(self.converge("--apply"), 0)
+        tracked = self.git_out("ls-files").split()
+        self.assertIn("AGENTS.md", tracked)
+        self.assertIn("CLAUDE.md", tracked)
+        self.assertNotIn("Claude.md", tracked)
+        self.assertEqual(os.readlink(self.repo / "CLAUDE.md"), "AGENTS.md")
+        self.assertTrue(audit.audit_repo(self.repo)["ok"])

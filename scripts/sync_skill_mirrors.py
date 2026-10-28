@@ -42,6 +42,9 @@ def synchronize(source: Path, target: Path, check: bool) -> int:
     if is_unified_symlink(source, target):
         print(f"Skill mirrors are one directory: {target} -> {source}.")
         return 0
+    if is_unified_symlink(target, source):
+        print(f"Skill mirrors are one directory: {source} -> {target} (reverse direction).")
+        return 0
     source_entries = inventory(source)
     target_entries = inventory(target)
     blockers = []

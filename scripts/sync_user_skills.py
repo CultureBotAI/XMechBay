@@ -7,7 +7,8 @@ Inputs: --tool DIR for each agent's user skill directory (defaults: Claude Code
 directory that lists every skill once. Each skill's real directory stays where
 it is; the canonical directory and every tool directory that lacks the skill
 get a symlink to that real directory. Names excluded by default: `synced`
-(claude.ai-managed) and `.system` (Codex-managed). A name that resolves to
+(claude.ai-managed) and `.system` (Codex-managed); --exclude adds to them. Only
+directories holding a SKILL.md count as skills. A name that resolves to
 different real directories with different content in two places is a conflict:
 reported, never touched.
 Output: a table (or --json); with --apply the symlinks are created and the
@@ -25,7 +26,11 @@ import os
 from pathlib import Path
 import sys
 
-DEFAULT_TOOLS = ("~/.claude/skills", "~/.codex/skills", "~/.codex-pro/skills", "~/.gemini/config/skills")
+DEFAULT_TOOLS = (
+    str(Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")) / "skills"),
+    str(Path(os.environ.get("CODEX_HOME", "~/.codex")) / "skills"),
+    "~/.gemini/config/skills",
+)
 DEFAULT_CANONICAL = "~/.agents/skills"
 DEFAULT_EXCLUDE = ("synced", ".system")
 
@@ -59,9 +64,12 @@ def plan(canonical: Path, tools: list[Path], exclude: set[str]) -> dict:
             if entry.name in exclude or entry.name.startswith("."):
                 continue
             target = real_dir(entry)
-            rec = names.setdefault(entry.name, {"real": None, "present": {}, "conflict": None, "broken": []})
+            rec = names.setdefault(entry.name, {"real": None, "present": {}, "conflict": None, "broken": [], "skipped": []})
             if target is None:
-                rec["broken"].append(str(entry))
+                (rec["skipped"] if (entry.is_file() and not entry.is_symlink()) else rec["broken"]).append(str(entry))
+                continue
+            if not (target / "SKILL.md").is_file():
+                rec["skipped"].append(str(entry))  # a directory without SKILL.md is not a skill
                 continue
             rec["present"][str(base)] = str(target)
             if rec["real"] is None:
@@ -71,6 +79,8 @@ def plan(canonical: Path, tools: list[Path], exclude: set[str]) -> dict:
     actions = []
     for name, rec in sorted(names.items()):
         if rec["conflict"] or rec["real"] is None:
+            continue
+        if rec["skipped"] and not rec["present"]:
             continue
         for base in [canonical, *tools]:
             entry = base / name
@@ -94,7 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--canonical", default=DEFAULT_CANONICAL)
     parser.add_argument("--tool", action="append", help="Agent skill directory (repeatable; default: the four known ones)")
-    parser.add_argument("--exclude", action="append", help="Name to leave alone (repeatable)")
+    parser.add_argument("--exclude", action="append", help="Name to leave alone, in addition to the defaults (repeatable)")
+    parser.add_argument("--no-default-exclude", action="store_true", help=f"Do not exclude {', '.join(DEFAULT_EXCLUDE)} by default")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--manifest", help="Where created links are logged (default <canonical>/.sync-user-skills.log)")
     parser.add_argument("--json", action="store_true")
@@ -102,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
 
     canonical = Path(args.canonical).expanduser()
     tools = [Path(t).expanduser() for t in (args.tool or DEFAULT_TOOLS)]
-    exclude = set(args.exclude or DEFAULT_EXCLUDE)
+    exclude = set(args.exclude or ()) | (set() if args.no_default_exclude else set(DEFAULT_EXCLUDE))
     result = plan(canonical, tools, exclude)
     if args.json:
         print(json.dumps(result, indent=2))
@@ -119,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
                 elif any(a["link"] == str(e) for a in result["actions"]):
                     cells.append("+link")
                 else:
-                    cells.append("broken" if str(e) in rec["broken"] else "-")
+                    cells.append("broken" if str(e) in rec["broken"] else "file/no-skill" if str(e) in rec["skipped"] else "-")
             flag = "  CONFLICT " + rec["conflict"] if rec["conflict"] else ""
             print(f"{name:<{width}}  " + "  ".join(c.rjust(18) for c in cells) + flag)
         print(f"\n{len(result['actions'])} symlink(s) to create" + ("" if args.apply else " (dry run; pass --apply)"))

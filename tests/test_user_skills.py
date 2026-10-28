@@ -73,3 +73,20 @@ class SyncTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExcludeAndShapeTests(SyncTests):
+    def test_exclude_adds_to_defaults_and_non_skills_are_skipped(self):
+        (self.a / "synced").mkdir()
+        (self.a / "synced/SKILL.md").write_text("x")
+        (self.a / "notes").mkdir()  # no SKILL.md
+        (self.a / "README.md").write_text("x")
+        (self.a / "real").mkdir()
+        (self.a / "real/SKILL.md").write_text("x")
+        self.assertEqual(self.run_sync("--exclude", "foo", "--apply"), 0)
+        self.assertFalse((self.b / "synced").exists())
+        self.assertFalse((self.b / "notes").exists())
+        self.assertFalse((self.b / "README.md").exists())
+        self.assertTrue((self.b / "real").is_symlink())
+        self.assertEqual(self.run_sync("--no-default-exclude", "--apply"), 0)
+        self.assertTrue((self.b / "synced").is_symlink())
