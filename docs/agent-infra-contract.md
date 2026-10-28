@@ -138,6 +138,11 @@ pull request per repository. Merging is the owner's decision.
 - Governance tooling that reads `CLAUDE.md` by name keeps working: a symlink
   reads as the canonical file. Tooling that *writes* into `.claude/skills` also
   keeps working, because writes follow the symlink into `.agents/skills`.
+- Code that opens path components with `O_NOFOLLOW` (a hardened path walker
+  such as a Mech's `scripts/record_review.py`) cannot reach a skill through
+  the symlinked tree. Configuration it reads (for example
+  `conf/record_review.yaml`) must name the real directory; CI catches the
+  other case with `NotADirectoryError`.
 - Tooling that lists `.claude/skills` with `git ls-files` sees only the symlink
   entry when that path is a link. A fleet whose hub inventories its members that
   way keeps `.claude/skills` as the real directory and `.agents/skills` as the
