@@ -1,0 +1,7 @@
+# Synthetic macOS-style TCP fixture, 2026-10-27; no live addresses or processes.
+Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rhiwat shiwat pid epid state options
+tcp4 0 0 127.0.0.1.50001 *.* LISTEN 0 0 131072 131072 agy:101 0 0 0
+tcp6 0 0 ::1.50001 *.* LISTEN 0 0 131072 131072 agy:101 0 0 0
+tcp4 0 0 127.0.0.1.50002 *.* LISTEN 0 0 131072 131072 agy:101 0 0 0
+tcp4 0 0 192.0.2.10.50003 198.51.100.20.443 ESTABLISHED 0 0 131072 131072 sample:202 0 0 0

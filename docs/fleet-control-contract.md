@@ -72,6 +72,16 @@ unrecognized screen is unknown. A process-only inventory cannot prove progress
 or idleness; retain an unknown state rather than inferring one from a process
 name. Keep the evidence source clear when combining reports.
 
+Host health is separate from a session's goal state. A `critical` or `unknown`
+port-pressure result holds admission of new work on that host until a fresh,
+usable observation clears the hold. Controllers honor the hold before launches
+and at safe dispatch checkpoints; they do not interrupt active work, dismiss
+human prompts, or stop processes automatically. A `warning` calls for inspection
+and planning an owned, idle checkpoint. The
+[port pressure recovery guide](port-pressure-recovery.md) defines the monitoring
+and verified recovery procedure; the monitor reports state but does not enforce
+dispatch decisions.
+
 ## Operations and evidence
 
 Keep real goal files and logs in a private deployment workspace. Record the target,

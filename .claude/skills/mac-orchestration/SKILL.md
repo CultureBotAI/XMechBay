@@ -56,7 +56,8 @@ constructed as shell code.
 The helper requires Terminal to be running already and refuses to launch it.
 `open DIRECTORY [COMMAND]` creates a new window in that existing app; use it only
 for a user-requested session. `front` and `cascade` change the existing layout.
-`quit-codex` requires an observed empty idle composer and verifies process exit.
+`quit-codex` is a legacy Ctrl+C helper, not the preferred routine exit path.
+Follow the graceful restart protocol below instead of selecting it automatically.
 Model menus vary between releases. Inspect each menu and use an explicitly
 authorized guarded `key` operation; there is no hard-coded model-picker sequence.
 The `key` command accepts named keys or a single printable character. Terminal's
@@ -68,6 +69,33 @@ as literal arguments. `open DIRECTORY 'COMMAND'` intentionally executes the
 explicit shell command only in the newly opened Terminal window.
 Review `--help` for the remaining commands. Never copy credentials between agent
 homes or inspect keychains as part of orchestration.
+
+## Graceful exit and exact-session restart
+
+1. Confirm ownership, PID, terminal, working directory, and a current idle screen
+   with an empty composer, no active goal or work, and no human prompt. Do not
+   interrupt working agents to create a restart checkpoint.
+2. As the penultimate interaction in the shutdown sequence, acquire or reconfirm
+   the exact session/conversation ID from authoritative CLI output or process
+   metadata tied to that PID and terminal. Save the ID, directory, model, and
+   effort privately. Check that the thread is not already live elsewhere. Error
+   IDs, most-recent-thread guesses, and unsupported model assertions are invalid.
+3. Immediately follow with the agent's supported `/quit` or `/exit` as the final
+   shutdown command, retaining all pre-input screen guards. Inspect the resulting
+   shell and verify the original PID exited; compare any printed resume ID with
+   the saved ID. Input delivery alone does not establish shutdown.
+4. If the exact ID or graceful exit cannot be verified, stop. Do not automatically
+   fall back to Ctrl+C, SIGTERM, another signal, or a duplicate launch. A signal
+   requires a separate explicit user instruction identifying the owned process
+   and action; the legacy `quit-codex` helper is not routine restart permission.
+5. After verified exit, use the agent's supported explicit-ID resume command from
+   the same directory with the same model and effort. Verify those settings and
+   the restored thread before further input. Never use `--last`/`--continue` as a
+   substitute, replay a goal automatically, or answer a new prompt without its
+   specific authorization.
+
+See the [port pressure recovery guide](../../../docs/port-pressure-recovery.md)
+for an AGY example and recovery verification.
 
 ## Synthetic example
 
