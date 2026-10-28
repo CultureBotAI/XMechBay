@@ -117,6 +117,14 @@ class PublicationGateTests(unittest.TestCase):
         self.assertIn("private-or-runtime-directory", self.categories(findings))
         self.assertEqual(counts["additional_worktree_files"], 1)
 
+    def test_local_file_name_is_not_a_hostname(self):
+        self.write("note.md", "edit .claude/settings.local.json and config.local.yaml")
+        self.git("add", ".")
+        self.assertNotIn("local-hostname", self.categories(self.scan()[0]))
+        self.write("note.md", "ssh host" + ".local")
+        self.git("add", ".")
+        self.assertIn("local-hostname", self.categories(self.scan()[0]))
+
     def test_symlinked_directories_are_audited_without_traversal(self):
         outside = self.root.parent / (self.root.name + "-outside")
         outside.mkdir()

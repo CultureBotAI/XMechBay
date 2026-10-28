@@ -15,7 +15,12 @@ data, or a particular organization's deployment.
 | `mac-orchestration` | Read and control macOS Terminal windows; paste files into an owned tmux session with prompt checks |
 | `session-status` | Read agent process and tmux inventory for an explicitly selected host |
 | `agy-permissions` | Inspect a supplied permission-policy file without modifying it |
-| `scripts/sync_skill_mirrors.py` | Keep the agent skill directories identical, including hidden and ignored entries |
+| `agent-infra-unify` | Audit and converge a repository's instruction files and skill trees to the layout every agent reads |
+| `scripts/agent_infra_audit.py` | Report, per checkout or user-level file set, whether Claude Code, Codex and Antigravity read the same instructions and skills |
+| `scripts/agent_infra_converge.py` | Move one checkout to that layout on a topic branch, without committing |
+| `scripts/sync_global_agreements.py` | Keep one common block identical across the user-level instruction files, with backups |
+| `scripts/sync_user_skills.py` | Give every agent's user-level skill directory the same skills through logged symlinks |
+| `scripts/sync_skill_mirrors.py` | Verify the skill trees are one directory, or keep copies identical where symlinks cannot ship |
 | `scripts/check_public_content.py` | Check publishable files and Git history for private-data patterns |
 
 Python 3.10 or later is required. Terminal commands require macOS and Terminal.app;
@@ -74,6 +79,11 @@ python3 scripts/sync_skill_mirrors.py --check
 python3 scripts/check_public_content.py
 ```
 
-After editing a canonical skill, run `python3 scripts/sync_skill_mirrors.py` to
-update its mirror. The checker refuses unexpected destination entries; inspect
-them instead of deleting them automatically.
+`.claude/skills` is a symlink to `.agents/skills`, so a canonical skill needs no
+mirroring step; the check confirms the two paths are one directory (in either
+direction). A checkout made without symlink support receives stub files
+instead of links; delete them and keep identical copies with `python3
+scripts/sync_skill_mirrors.py`, whose checker refuses unexpected destination
+entries so that they are inspected rather than deleted. The
+[agent infrastructure contract](docs/agent-infra-contract.md) explains the
+layout and `python3 scripts/agent_infra_audit.py .` reports compliance.

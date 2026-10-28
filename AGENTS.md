@@ -2,12 +2,17 @@
 
 This repository contains reusable tools, documentation, and synthetic examples.
 Keep deployments and operational evidence separate from the distributable source.
+These instructions are read by every coding agent: Codex and Antigravity read
+this file directly and Claude Code reads it through the `CLAUDE.md` symlink
+(`docs/agent-infra-contract.md`).
 
-- Read `README.md` and `docs/fleet-control-contract.md` before changing behavior.
+- Read `README.md`, `docs/fleet-control-contract.md` and
+  `docs/agent-infra-contract.md` before changing behavior.
 - Work on a topic branch and review changes through a pull request. Merging is a
   separate user decision.
-- `.agents/skills/` is canonical; synchronize `.claude/skills/` with
-  `python3 scripts/sync_skill_mirrors.py` and check equality before publishing.
+- `.agents/skills/` is the only skills tree; `.claude/skills` is a symlink to it.
+  `python3 scripts/sync_skill_mirrors.py --check` verifies that and
+  `python3 scripts/agent_infra_audit.py .` must report `OK` before publishing.
 - Keep helper scripts in `scripts/` or the relevant skill's `scripts/` directory.
   Document their purpose, inputs, and outputs. Tests belong in `tests/`.
 - Record live operations under ignored `.local/records/`, or outside the checkout.
@@ -20,3 +25,9 @@ Keep deployments and operational evidence separate from the distributable source
 - Never send input to live sessions merely to test a code change. Use mock
   transports. A requested live operation needs a current target/screen check and
   verification after the input.
+
+## Antigravity (agy)
+
+Permission audits are read-only: an audit result does not authorize changing a
+running agent's permission settings or answering a prompt. The maintained
+workflows are the skills under `.agents/skills/`.

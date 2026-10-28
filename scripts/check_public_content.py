@@ -24,7 +24,9 @@ PATTERNS = {
     "personal-home-path": re.compile(
         r"(?i)(?:/(?:Users|home)/[A-Za-z0-9_.-]+(?:/|\b)|[A-Z]:[\\/](?:Users|Documents and Settings)[\\/][^\s\\/]+)"
     ),
-    "local-hostname": re.compile(r"(?i)\b[A-Za-z0-9][A-Za-z0-9.-]*\.local\b"),
+    # mDNS host names (a name ending in the local domain), not file names whose
+    # stem ends in that word, such as a settings file with a .json suffix
+    "local-hostname": re.compile(r"(?i)\b[A-Za-z0-9][A-Za-z0-9.-]*\.local\b(?![.-]?[A-Za-z0-9])"),
     "private-network-address": re.compile(
         r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?![\d.])"
     ),
