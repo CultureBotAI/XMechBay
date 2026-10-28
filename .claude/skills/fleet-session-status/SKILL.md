@@ -61,6 +61,18 @@ process age and observation changes, and available listener counts. Highlight
 human prompts or failed coverage in a brief note after the affected table; do not
 replace all sessions with a selected highlights list.
 
+Explain target locations when presenting the table: `T…/…` identifies a native
+Terminal window/tab, `%…` a tmux pane, and `P…` an unmatched agent process. A tmux
+pane can be running while its viewer displays another repository or is detached.
+Old shell-only Terminal windows are not agent rows, even when their titles or
+scrollback still name a repository. Each visible viewer should identify the
+existing agent it displays; attaching a viewer does not start another agent.
+
+In JSON, `tmux_sessions` lists observed memberships, including viewer aliases.
+The deterministic `tmux_session` representative is a display/compatibility choice,
+not an ownership grant. Control still requires the configured owner session and
+a fresh target check.
+
 When asked to open or export an existing table in Excel, preserve that snapshot
 and timestamp. Use one worksheet per host, filters, frozen headers, wrapped
 activity text and matching state colors with text labels; retain the evidence

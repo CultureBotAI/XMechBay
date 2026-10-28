@@ -85,6 +85,12 @@ The `MAC_TERM_HOST` environment variable supplies a default host when useful.
 `XMECHBAY_RECORDS_DIR` selects a local refusal-log directory; its default is
 `.local/records/` within this checkout.
 
+New remote coding CLI sessions use tmux where supported, with one independently
+selected Terminal viewer per agent session. Stagger the windows from bottom-left
+to top-right so two terminal lines remain visible at each bottom edge. See the
+[viewer workflow](.agents/skills/mac-orchestration/SKILL.md#visible-viewer-for-each-session)
+for identity checks, existing-session handling and safe window cleanup.
+
 Deploy from a dedicated checkout or immutable release directory. Do development
 in a separate checkout. Routing a running system through a development working
 tree makes every branch switch and partial edit a live deployment.

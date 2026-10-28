@@ -236,6 +236,38 @@ class IdentityTests(unittest.TestCase):
 
 
 class ObservationTests(unittest.TestCase):
+    @patch.object(COLLECTOR, "MAX_PANES", 2)
+    def test_linked_memberships_do_not_consume_unique_pane_budget(self):
+        aliases = [f"%1\t10\t/dev/ttys001\tview-{index:03}\t@1\tproject-a\t0\tcodex\t/srv/a"
+                   for index in range(150)]
+        second = "%2\t20\t/dev/ttys002\tfleet\t@2\tproject-b\t0\tagy\t/srv/b"
+        rows, errors = COLLECTOR.parse_panes("\n".join(aliases + [second]))
+        self.assertFalse(errors)
+        self.assertEqual([row["pane"] for row in rows], ["%1", "%2"])
+        self.assertEqual(len(rows[0]["tmux_sessions"]), 150)
+        reversed_rows, errors = COLLECTOR.parse_panes("\n".join(list(reversed(aliases)) + [second]))
+        self.assertFalse(errors)
+        self.assertEqual(rows[0], reversed_rows[0])
+
+    @patch.object(COLLECTOR, "MAX_PANES", 1)
+    def test_unique_pane_cap_keeps_later_memberships_of_admitted_pane(self):
+        text = ("%1\t10\t/dev/ttys001\tfleet\t@1\tproject-a\t0\tcodex\t/srv/a\n"
+                "%2\t20\t/dev/ttys002\tfleet\t@2\tproject-b\t0\tagy\t/srv/b\n"
+                "%1\t10\t/dev/ttys001\tviewer\t@1\tproject-a\t0\tcodex\t/srv/a\n")
+        rows, errors = COLLECTOR.parse_panes(text)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tmux_sessions"], ["fleet", "viewer"])
+        self.assertEqual(errors, ["tmux_panes_truncated"])
+
+    def test_conflicting_identity_for_one_pane_cannot_attach_an_agent(self):
+        text = ("%1\t10\t/dev/ttys001\tfleet\t@1\tproject-a\t0\tcodex\t/srv/a\n"
+                "%1\t20\t/dev/ttys002\tviewer\t@1\tproject-a\t0\tcodex\t/srv/a\n")
+        rows, errors = COLLECTOR.parse_panes(text)
+        self.assertFalse(rows)
+        self.assertEqual(errors, ["pane_rows_invalid"])
+        self.assertIsNone(COLLECTOR.pane_for_process(process(11, 10, "codex"), rows,
+            {10: process(10, 1, "bash"), 11: process(11, 10, "codex")}))
+
     def test_terminal_absence_does_not_call_osascript(self):
         class NeverRun:
             def run(self, *args, **kwargs):
@@ -297,7 +329,8 @@ class ObservationTests(unittest.TestCase):
                 if command[0] == "/usr/bin/env":
                     return "10 1 ttys001 01:00 Mon Jan 5 12:00:00 2026 /bin/bash\n11 10 ttys001 00:59 Mon Jan 5 12:00:01 2026 /opt/bin/codex\n"
                 if command[1:2] == ["list-panes"]:
-                    return "%1\t10\t/dev/ttys001\tsample\t@1\texample-project\t0\tcodex\t/srv/example-project\n"
+                    return ("%1\t10\t/dev/ttys001\tsample\t@1\texample-project\t0\tcodex\t/srv/example-project\n"
+                            "%1\t10\t/dev/ttys001\tviewer\t@1\texample-project\t0\tcodex\t/srv/example-project\n")
                 if command[0] == "/bin/ps":
                     return "10 /bin/bash\n11 codex resume " + SID + "\n"
                 if command[0] == "/usr/sbin/lsof":
@@ -308,12 +341,35 @@ class ObservationTests(unittest.TestCase):
         report = COLLECTOR.collect(Path("/example/absent-health.json"), FakeRunner())
         self.assertEqual(len(report["sessions"]), 1)
         self.assertEqual(report["sessions"][0]["target"]["transport"], "tmux")
+        self.assertEqual(report["sessions"][0]["target"]["tmux_sessions"], ["sample", "viewer"])
+        self.assertEqual(len([command for command in commands if command[1:2] == ["capture-pane"]]), 1)
         self.assertIsNone(report["sessions"][0]["session_id"])
         self.assertEqual(report["coverage"]["terminal"], "unavailable")
         self.assertEqual(report["coverage"]["tmux"], "complete")
         self.assertFalse(any("osascript" in command[0] for command in commands))
         self.assertFalse(any(word in {"send-keys", "paste-buffer", "kill", "do script"} for command in commands for word in command))
         self.assertNotIn("args", report["sessions"][0])
+
+    @patch.object(COLLECTOR.shutil, "which", return_value="/mock/tmux")
+    @patch.object(COLLECTOR.Path, "is_file", return_value=False)
+    def test_linked_pane_without_verified_process_has_one_unknown_row(self, is_file, which):
+        class FakeRunner:
+            def run(self, command, **kwargs):
+                if command[0] == "/usr/bin/env":
+                    return "10 1 ttys001 01:00 Mon Jan 5 12:00:00 2026 /bin/bash\n"
+                if command[1:2] == ["list-panes"]:
+                    return ("%1\t10\t/dev/ttys001\tsample\t@1\texample-project\t0\tcodex\t/srv/example-project\n"
+                            "%1\t10\t/dev/ttys001\tviewer\t@1\texample-project\t0\tcodex\t/srv/example-project\n")
+                if command[0] == "/bin/ps":
+                    return "10 /bin/bash\n"
+                raise AssertionError("Unverified identity must not trigger a screen probe: " + str(command))
+        report = COLLECTOR.collect(Path("/example/absent-health.json"), FakeRunner())
+        self.assertEqual(len(report["sessions"]), 1)
+        row = report["sessions"][0]
+        self.assertIsNone(row["pid"])
+        self.assertEqual(row["screen"], "")
+        self.assertEqual(row["errors"], ["agent_process_unverified"])
+        self.assertEqual(row["target"]["tmux_sessions"], ["sample", "viewer"])
 
     @patch.object(COLLECTOR.shutil, "which", return_value=None)
     @patch.object(COLLECTOR.Path, "is_file", return_value=False)
