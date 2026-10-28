@@ -137,7 +137,7 @@ def audit_repo(repo: Path) -> dict:
     instructions = classify_instructions(repo)
     skills = classify_skills(repo)
     ok = (
-        instructions["verdict"] == "unified"
+        instructions["verdict"] in ("unified", "none")
         and "gemini" not in instructions
         and skills["verdict"] in ("unified-symlink", "copies-identical", "none")
     )

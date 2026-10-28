@@ -19,6 +19,7 @@ data, or a particular organization's deployment.
 | `scripts/agent_infra_audit.py` | Report, per checkout or user-level file set, whether Claude Code, Codex and Antigravity read the same instructions and skills |
 | `scripts/agent_infra_converge.py` | Move one checkout to that layout on a topic branch, without committing |
 | `scripts/sync_global_agreements.py` | Keep one common block identical across the user-level instruction files, with backups |
+| `scripts/sync_user_skills.py` | Give every agent's user-level skill directory the same skills through logged symlinks |
 | `scripts/sync_skill_mirrors.py` | Verify the skill trees are one directory, or keep copies identical where symlinks cannot ship |
 | `scripts/check_public_content.py` | Check publishable files and Git history for private-data patterns |
 

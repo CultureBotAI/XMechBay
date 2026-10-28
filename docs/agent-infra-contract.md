@@ -85,9 +85,12 @@ the file when absent), backing each target up as `<file>.bak-common-<YYYYMMDD>`
 first. `--check` reports drift and changes nothing. Text outside the markers is
 the tool-specific part and is never touched.
 
-User-level skills: keep one canonical directory of real skills or symlinks into
-repository checkouts, and give each tool's skill directory a symlink per skill.
-`agent_infra_audit.py --global` reports which tool directories lack which skills.
+User-level skills: `scripts/sync_user_skills.py` lists every skill once in a
+canonical directory (default `~/.agents/skills`) and gives each tool's skill
+directory a symlink for every skill it lacks, pointing at the skill's real
+directory wherever that lives. Names with different content in two places are
+reported as conflicts and left alone; created links are logged so they can be
+removed. Dry run by default.
 
 ## Compliance states reported by the audit
 
@@ -100,8 +103,8 @@ Skills: `unified-symlink` (either direction), `copies-identical`,
 `copies-drifted` (with the drifted skill names), `claude-only`, `agents-only`,
 `none`.
 
-A repository is **OK** when instructions are `unified` (either direction) with
-no `GEMINI.md`, and skills are `unified-symlink` (either direction),
+A repository is **OK** when instructions are `unified` (either direction) or
+absent, with no `GEMINI.md`, and skills are `unified-symlink` (either direction),
 `copies-identical` or `none`. Everything else is **FIX**. The audit marks the
 reverse direction `(reverse)`; `agent_infra_converge.py --flip-reverse` turns it
 forward when a change already touches those files.
