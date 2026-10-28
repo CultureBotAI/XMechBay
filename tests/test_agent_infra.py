@@ -174,6 +174,16 @@ class ConvergeTests(RepoCase):
         self.assertEqual((self.repo / ".agents/skills/a/SKILL.md").read_text(), "# keep\n")
         self.assertFalse((self.repo / "GEMINI.md").exists())
 
+    def test_identical_copies_keep_agents_and_recreate_pruned_claude_dir(self):
+        self.write("AGENTS.md", "# Repo\n")
+        (self.repo / "CLAUDE.md").symlink_to("AGENTS.md")
+        self.skill(".agents/skills", "a")
+        self.skill(".claude/skills", "a")
+        self.commit()
+        self.assertEqual(self.converge("--apply"), 0)
+        self.assertTrue(audit.audit_repo(self.repo)["ok"])
+        self.assertEqual(os.readlink(self.repo / ".claude/skills"), "../.agents/skills")
+
     def test_reverse_symlinks_are_flipped(self):
         self.write("CLAUDE.md", "# Rules\n")
         (self.repo / "AGENTS.md").symlink_to("CLAUDE.md")

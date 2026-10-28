@@ -102,6 +102,7 @@ class Plan:
         path = self.repo / rel
         if path.is_symlink() or path.exists():
             self._fs_remove(path)
+        path.parent.mkdir(parents=True, exist_ok=True)  # git rm prunes emptied parents
         path.symlink_to(target)
         if self.use_git:
             self.git("add", rel)
@@ -119,17 +120,33 @@ class Plan:
             self.git("add", rel)
 
 
+def paragraphs(text: str) -> list[list[str]]:
+    """Blocks of consecutive non-empty lines; a wrapped sentence stays together."""
+    blocks: list[list[str]] = []
+    for line in text.splitlines():
+        if line.strip():
+            if blocks and blocks[-1] and not line.lstrip().startswith(("- ", "* ", "#")):
+                blocks[-1].append(line.rstrip())
+            else:
+                blocks.append([line.rstrip()])
+        elif blocks and blocks[-1]:
+            blocks.append([])
+    return [b for b in blocks if b]
+
+
 def carried_lines(path: Path, other: str) -> list[str]:
-    """Lines of a pointer file worth keeping: not the heading, not 'read <other>'."""
-    kept = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("# "):
+    """Paragraphs of a pointer file worth keeping: not the heading, not 'read <other>'."""
+    kept: list[str] = []
+    for block in paragraphs(path.read_text(encoding="utf-8", errors="replace")):
+        joined = " ".join(l.strip() for l in block)
+        if joined.startswith("# "):
             continue
-        lowered = stripped.lower()
-        if other.lower() in lowered and any(w in lowered for w in READ_WORDS) and len(stripped) < 160:
+        lowered = joined.lower()
+        if other.lower() in lowered and any(w in lowered for w in READ_WORDS) and len(joined) < 240:
             continue
-        kept.append(line.rstrip())
+        if kept:
+            kept.append("")
+        kept.extend(block)
     return kept
 
 
