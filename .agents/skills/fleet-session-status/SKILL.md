@@ -46,11 +46,26 @@ labels are intentional, and its rows must never be presented as live observation
 
 ## Present the evidence compactly
 
+Render the generated Markdown table directly in chat, never inside a code block.
+Use this formatted, color-coded view by default for each host, including when the
+user asks to run the command. Preserve the bold host heading, timestamp, compact
+summary and aligned columns. Keep the renderer's colored state symbols beside
+their text labels: green active, white idle, yellow human input, orange paused,
+red stalled/quota, blue achieved, and black unknown. Color is a scanning aid;
+the state text and evidence still determine meaning. Do not add ANSI escapes or
+HTML styling to chat output. Plain text or JSON is available when requested.
+
 Keep the generated host summary, every session row, and its short legend. The
 table shows target, agent/model, state and UI timer, latest reported activity,
 process age and observation changes, and available listener counts. Highlight
 human prompts or failed coverage in a brief note after the affected table; do not
 replace all sessions with a selected highlights list.
+
+When asked to open or export an existing table in Excel, preserve that snapshot
+and timestamp. Use one worksheet per host, filters, frozen headers, wrapped
+activity text and matching state colors with text labels; retain the evidence
+legend. Label the workbook as a static snapshot. A fresh collection is a separate
+request, and a local export does not authorize uploading fleet data.
 
 - `~` marks screen-reported activity, not independently verified completion.
   A goal state, a model assertion, or a changing screen does not prove useful work.

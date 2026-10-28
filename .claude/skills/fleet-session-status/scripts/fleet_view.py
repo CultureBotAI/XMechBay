@@ -341,14 +341,14 @@ def _target(row):
     return label
 
 
-STATE_DISPLAY = {"Pursuing goal": "▶ goal", "Working": "▶ work", "idle": "○ idle",
-                 "Goal paused": "Ⅱ paused", "Goal stalled": "! stalled", "Goal achieved": "◆ achieved",
-                 "Goal hit usage limits": "! quota", "APPROVAL": "✋ approve", "QUESTION": "? question",
-                 "SIGN-IN": "! sign-in", "TRUST-PROMPT": "! trust", "UPDATE-PROMPT": "! update", "UNKNOWN": "? unknown"}
+STATE_DISPLAY = {"Pursuing goal": "🟢 goal", "Working": "🟢 work", "idle": "⚪ idle",
+                 "Goal paused": "🟠 paused", "Goal stalled": "🔴 stalled", "Goal achieved": "🔵 achieved",
+                 "Goal hit usage limits": "🔴 quota", "APPROVAL": "🟡 approve", "QUESTION": "🟡 question",
+                 "SIGN-IN": "🟡 sign-in", "TRUST-PROMPT": "🟡 trust", "UPDATE-PROMPT": "🟡 update", "UNKNOWN": "⚫ unknown"}
 
 
 def _state(row):
-    text = STATE_DISPLAY.get(row.get("status"), "? unknown")
+    text = STATE_DISPLAY.get(row.get("status"), STATE_DISPLAY["UNKNOWN"])
     timer = row.get("timer")
     if isinstance(timer, dict) and timer.get("text"):
         text += " · " + str(timer["text"])
@@ -405,13 +405,9 @@ def _error_codes(values):
 def _state_counts(sessions):
     counts = Counter()
     for row in sessions:
-        state = row.get("status", "UNKNOWN")
-        group = ("▶" if state in {"Working", "Pursuing goal"} else
-                 "○" if state == "idle" else "◆" if state == "Goal achieved" else
-                 "Ⅱ" if state == "Goal paused" else "!" if state in {"Goal stalled", "Goal hit usage limits"} else
-                 "?" if state == "UNKNOWN" else "✋")
+        group = STATE_DISPLAY.get(row.get("status"), STATE_DISPLAY["UNKNOWN"]).split()[0]
         counts[group] += 1
-    return " ".join(symbol + str(counts[symbol]) for symbol in ("▶", "○", "✋", "Ⅱ", "!", "◆", "?") if counts[symbol])
+    return " ".join(symbol + str(counts[symbol]) for symbol in ("🟢", "⚪", "🟡", "🟠", "🔴", "🔵", "⚫") if counts[symbol])
 
 
 def render_host(report):
@@ -486,5 +482,6 @@ def render_host(report):
                        ("; +" + str(len(attention) - 5) + " more" if len(attention) > 5 else "") + "."])
     if errors:
         output.extend(["", "Collection codes: " + ", ".join("`" + code + "`" for code in errors[:5]) + ("; more in JSON" if len(errors) > 5 else "") + "."])
-    output.extend(["", "Cx Codex · Ag AGY · Cl Claude; U ultra, XH extra-high, H high. ~ screen claim; Up process age; Δ observed change, not proven progress; L listeners. launch# is shortened argv evidence: reconfirm the current session ID before control. Full launch IDs are in JSON."])
+    output.extend(["", "🟢 active · ⚪ idle · 🟡 input needed · 🟠 paused · 🔴 stalled/quota · 🔵 achieved · ⚫ unknown.",
+                   "", "Cx Codex · Ag AGY · Cl Claude; U ultra, XH extra-high, H high. ~ screen claim; Up process age; Δ observed change, not proven progress; L listeners. launch# is shortened argv evidence: reconfirm the current session ID before control. Full launch IDs are in JSON."])
     return "\n".join(output) + "\n"

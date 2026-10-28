@@ -420,7 +420,7 @@ class CompactTableTests(unittest.TestCase):
         report["sessions"][0]["status"] = "APPROVAL"
         report["sessions"].append(dict(report["sessions"][0], repo_label="OtherMech", status="UNKNOWN"))
         text = VIEW.render_host(report)
-        self.assertIn("✋1 ?1", text)
+        self.assertIn("🟡1 ⚫1", text)
         self.assertIn("Attention:", text)
         self.assertIn("OtherMech", text)
 

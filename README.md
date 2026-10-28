@@ -66,6 +66,9 @@ bash scripts/fleet-status.sh laptop-a laptop-b
 The combined command collects concurrently and prints two separate tables. Each
 shows every observed logical session with its target, model, state, reported
 activity, process age, observation changes, and available listener pressure.
+Chat reports render these as formatted Markdown tables with colored state
+symbols and text labels by default. Each host keeps its own timestamp, summary
+and evidence legend; copying the output into a code block hides that formatting.
 Use `--all` for all configured hosts, `--list` for host keys, or `--json` for
 structured details. Unknown state, failed collection and stale health evidence
 remain explicit. No session input or model request is sent. See the
