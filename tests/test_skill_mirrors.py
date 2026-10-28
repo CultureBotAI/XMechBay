@@ -62,6 +62,23 @@ class MirrorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "symlink requires manual review"):
             self.sync(check=False)
 
+    def test_target_symlink_to_source_is_parity(self):
+        self.target.rmdir()
+        self.target.symlink_to(Path("source"), target_is_directory=True)
+        (self.source / "skill").mkdir()
+        (self.source / "skill/SKILL.md").write_text("x")
+        self.assertEqual(self.sync(), 0)
+        self.assertEqual(self.sync(check=False), 0)
+        self.assertTrue(self.target.is_symlink())
+
+    def test_target_symlink_elsewhere_is_refused(self):
+        self.target.rmdir()
+        elsewhere = Path(self.temp.name) / "elsewhere"
+        elsewhere.mkdir()
+        self.target.symlink_to(elsewhere, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "Expected a real skill directory"):
+            self.sync()
+
 
 if __name__ == "__main__":
     unittest.main()

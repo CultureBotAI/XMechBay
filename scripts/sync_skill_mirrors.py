@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Copy canonical .agents skills to .claude, or check parity (2026-10-25).
+"""Copy canonical .agents skills to .claude, or check parity (2026-10-25, symlink-aware 2026-10-28).
 
 Inputs: all files, including hidden and gitignored entries, in both skill trees.
 Output: mirror differences on stdout; updated .claude files unless --check is set.
-Unexpected destination entries and symlinks require manual review, never deletion.
+When .claude/skills is a symlink that resolves to .agents/skills the trees are
+one directory (the layout in docs/agent-infra-contract.md): parity holds and
+nothing is copied. Any other symlink, and unexpected destination entries,
+require manual review, never deletion.
 """
 
 from __future__ import annotations
@@ -27,7 +30,18 @@ def inventory(root: Path) -> dict[Path, str]:
     return result
 
 
+def is_unified_symlink(source: Path, target: Path) -> bool:
+    """True when target is a symlink resolving to the real source directory."""
+    try:
+        return target.is_symlink() and source.is_dir() and not source.is_symlink() and target.resolve() == source.resolve()
+    except OSError:
+        return False
+
+
 def synchronize(source: Path, target: Path, check: bool) -> int:
+    if is_unified_symlink(source, target):
+        print(f"Skill mirrors are one directory: {target} -> {source}.")
+        return 0
     source_entries = inventory(source)
     target_entries = inventory(target)
     blockers = []

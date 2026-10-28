@@ -20,3 +20,13 @@ Keep deployments and operational evidence separate from the distributable source
 - Never send input to live sessions merely to test a code change. Use mock
   transports. A requested live operation needs a current target/screen check and
   verification after the input.
+
+## Carried from the former CLAUDE.md (review and trim)
+
+coding agent. The skills in `.claude/skills/` are generated mirrors of
+`.agents/skills/`.
+
+## Antigravity (agy) notes carried from the former GEMINI.md
+
+authorize changing a running agent's permission settings or answering a prompt.
+Use `.agents/skills/` for the maintained workflows.
