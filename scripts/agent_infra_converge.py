@@ -156,42 +156,41 @@ def carried_lines(path: Path, other: str) -> list[str]:
     return kept
 
 
-def converge_skills(plan: Plan, info: dict, skills_from: str | None, flip_reverse: bool = False) -> None:
+def converge_skills(plan: Plan, info: dict, skills_from: str | None, flip_reverse: bool = False, canonical: str = ".agents/skills") -> None:
+    """Make `canonical` the real directory and the other path a symlink to it."""
+    other = ".claude/skills" if canonical == ".agents/skills" else ".agents/skills"
+    link_target = "../" + canonical.split("/")[0] + "/skills"
     verdict = info["verdict"]
     if verdict == "none":
         plan.notes.append("skills: none present, nothing to do")
         return
     if verdict == "unified-symlink":
-        if info["canonical"] == ".claude/skills" and flip_reverse:
-            plan.remove(".agents/skills")
-            plan.move(".claude/skills", ".agents/skills")
-            plan.symlink(".claude/skills", "../.agents/skills")
+        if info["canonical"] == canonical:
+            plan.notes.append(f"skills: already unified (canonical {canonical})")
+        elif flip_reverse:
+            plan.remove(canonical)
+            plan.move(other, canonical)
+            plan.symlink(other, link_target)
         else:
-            plan.notes.append(f"skills: already unified (canonical {info['canonical']})")
+            plan.notes.append(f"skills: unified with canonical {info['canonical']}; pass --flip-reverse to make {canonical} the real directory")
         return
     if verdict in ("copies-identical", "copies-drifted", "divergent"):
-        source = skills_from or (".agents/skills" if verdict == "copies-identical" else None)
+        source = skills_from or (canonical if verdict == "copies-identical" else None)
         if source is None:
             raise SystemExit(f"skills are {verdict} ({', '.join(info['drifted']) or 'see audit'}); pass --skills-from .claude/skills or .agents/skills")
-        other = ".claude/skills" if source == ".agents/skills" else ".agents/skills"
+        dropped = ".claude/skills" if source == ".agents/skills" else ".agents/skills"
         if verdict == "copies-drifted":
-            plan.notes.append(f"skills: dropping the {other} copies; differing skills: {', '.join(info['drifted'])}")
-        plan.remove(other)
-        if source == ".claude/skills":
-            plan.move(".claude/skills", ".agents/skills")
-        plan.symlink(".claude/skills", "../.agents/skills")
+            plan.notes.append(f"skills: dropping the {dropped} copies; differing skills: {', '.join(info['drifted'])}")
+        plan.remove(dropped)
+        if source != canonical:
+            plan.move(source, canonical)
+        plan.symlink(other, link_target)
         return
-    if verdict == "claude-only":
-        if (plan.repo / ".agents").exists() and not (plan.repo / ".agents").is_dir():
-            raise SystemExit(".agents exists and is not a directory")
-        (plan.repo / ".agents").mkdir(exist_ok=True) if plan.apply else None
-        plan.move(".claude/skills", ".agents/skills")
-        plan.symlink(".claude/skills", "../.agents/skills")
-        return
-    if verdict == "agents-only":
-        if plan.apply:
-            (plan.repo / ".claude").mkdir(exist_ok=True)
-        plan.symlink(".claude/skills", "../.agents/skills")
+    if verdict in ("claude-only", "agents-only"):
+        present = ".claude/skills" if verdict == "claude-only" else ".agents/skills"
+        if present != canonical:
+            plan.move(present, canonical)
+        plan.symlink(other, link_target)
         return
     raise SystemExit(f"unhandled skills verdict {verdict}")
 
@@ -258,7 +257,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skills-from", choices=(".claude/skills", ".agents/skills"))
     parser.add_argument("--instructions-from", choices=("CLAUDE.md", "AGENTS.md"))
     parser.add_argument("--keep-gemini", action="store_true")
-    parser.add_argument("--flip-reverse", action="store_true", help="Also flip compliant reverse symlinks to the forward direction")
+    parser.add_argument("--flip-reverse", action="store_true", help="Also flip compliant reverse symlinks to the chosen direction")
+    parser.add_argument("--skills-canonical", choices=(".agents/skills", ".claude/skills"), default=".agents/skills", help="Which path is the real directory; the other becomes a symlink to it (default .agents/skills; the Mech fleet uses .claude/skills because claw's tooling lists that path with git ls-files)")
     parser.add_argument("--force", action="store_true", help="Apply even when the rewritten paths have uncommitted changes")
     args = parser.parse_args(argv)
 
@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
 
     before = audit.audit_repo(repo)
     plan = Plan(repo, use_git, args.apply)
-    converge_skills(plan, before["skills"], args.skills_from, args.flip_reverse)
+    converge_skills(plan, before["skills"], args.skills_from, args.flip_reverse, args.skills_canonical)
     converge_instructions(plan, before["instructions"], args.instructions_from, args.keep_gemini, args.flip_reverse)
     for note in plan.notes:
         print("NOTE  " + note)

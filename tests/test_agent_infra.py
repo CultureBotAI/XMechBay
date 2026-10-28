@@ -199,6 +199,35 @@ class ConvergeTests(RepoCase):
         self.assertTrue((self.repo / "AGENTS.md").is_file() and not (self.repo / "AGENTS.md").is_symlink())
         self.assertTrue((self.repo / ".agents/skills").is_dir() and not (self.repo / ".agents/skills").is_symlink())
 
+    def test_reverse_canonical_keeps_claude_real_for_fleet_tooling(self):
+        self.write("CLAUDE.md", "# Rules\n")
+        self.write("AGENTS.md", "# Repo\n\nRead CLAUDE.md.\n")
+        self.skill(".claude/skills", "a", "# keep\n")
+        self.skill(".agents/skills", "a", "# stub\n")
+        self.commit()
+        self.assertEqual(self.converge("--apply", "--skills-canonical", ".claude/skills", "--skills-from", ".claude/skills"), 0)
+        result = audit.audit_repo(self.repo)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(os.readlink(self.repo / ".agents/skills"), "../.claude/skills")
+        self.assertFalse((self.repo / ".claude/skills").is_symlink())
+        self.assertEqual((self.repo / ".agents/skills/a/SKILL.md").read_text(), "# keep\n")
+        self.assertEqual(os.readlink(self.repo / "CLAUDE.md"), "AGENTS.md")
+        tracked = subprocess.run(["git", "-C", str(self.repo), "ls-files", "--", ".claude/skills"], capture_output=True, text=True, env=GIT_ENV).stdout.split()
+        self.assertEqual(tracked, [".claude/skills/a/SKILL.md"])
+
+    def test_flip_to_reverse_from_forward(self):
+        self.write("AGENTS.md", "# Repo\n")
+        (self.repo / "CLAUDE.md").symlink_to("AGENTS.md")
+        self.skill(".agents/skills", "a", "# keep\n")
+        (self.repo / ".claude").mkdir()
+        (self.repo / ".claude/skills").symlink_to("../.agents/skills", target_is_directory=True)
+        self.commit()
+        self.assertEqual(self.converge("--apply", "--skills-canonical", ".claude/skills", "--flip-reverse"), 0)
+        self.assertTrue(audit.audit_repo(self.repo)["ok"])
+        self.assertFalse((self.repo / ".claude/skills").is_symlink())
+        self.assertEqual(os.readlink(self.repo / ".agents/skills"), "../.claude/skills")
+        self.assertEqual((self.repo / ".claude/skills/a/SKILL.md").read_text(), "# keep\n")
+
     def test_refuses_on_main(self):
         self.git("switch", "-q", "main")
         self.write("CLAUDE.md", "# Rules\n")

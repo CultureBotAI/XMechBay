@@ -135,3 +135,8 @@ pull request per repository. Merging is the owner's decision.
 - Governance tooling that reads `CLAUDE.md` by name keeps working: a symlink
   reads as the canonical file. Tooling that *writes* into `.claude/skills` also
   keeps working, because writes follow the symlink into `.agents/skills`.
+- Tooling that lists `.claude/skills` with `git ls-files` sees only the symlink
+  entry when that path is a link. A fleet whose hub inventories its members that
+  way keeps `.claude/skills` as the real directory and `.agents/skills` as the
+  symlink (`agent_infra_converge.py --skills-canonical .claude/skills`); the
+  audit reports it as `unified-symlink(reverse)` and OK.
