@@ -143,6 +143,14 @@ pull request per repository. Merging is the owner's decision.
   the symlinked tree. Configuration it reads (for example
   `conf/record_review.yaml`) must name the real directory; CI catches the
   other case with `NotADirectoryError`.
+- Validators that refuse every symlink (a `safe_path` that walks components
+  with `is_symlink()`, an inventory that treats a symlinked input as missing)
+  reject saved records that name `CLAUDE.md` or an `.agents/skills` route.
+  Give them an allowlist of exactly the two entry-point links with their
+  contracted targets (`CLAUDE.md -> AGENTS.md`, `.agents/skills ->
+  .claude/skills` or the forward pair), never a blanket "symlinks inside the
+  repository are fine": the tests that refuse symlinked data files must keep
+  passing.
 - Tooling that lists `.claude/skills` with `git ls-files` sees only the symlink
   entry when that path is a link. A fleet whose hub inventories its members that
   way keeps `.claude/skills` as the real directory and `.agents/skills` as the
