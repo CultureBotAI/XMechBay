@@ -115,6 +115,17 @@ class AuditTests(RepoCase):
         self.assertEqual(found, [self.repo.resolve()])
         self.assertEqual(audit.find_repos(Path(self.temp.name), 2, include_worktrees=True), [self.repo.resolve(), worktree.resolve()])
 
+    def test_broken_links_are_named(self):
+        (self.repo / "CLAUDE.md").symlink_to("AGENTS.md")  # dangling
+        self.skill(".agents/skills", "a")
+        (self.repo / ".claude").mkdir()
+        (self.repo / ".claude/skills").symlink_to("../nowhere", target_is_directory=True)
+        result = audit.audit_repo(self.repo)
+        self.assertEqual(result["instructions"]["verdict"], "broken-link")
+        self.assertEqual(result["skills"]["verdict"], "broken-link")
+        self.assertIn("CLAUDE.md->AGENTS.md", audit.instruction_summary(result["instructions"]))
+        self.assertFalse(result["ok"])
+
     def test_global_common_block_drift(self):
         a = Path(self.temp.name) / "a.md"
         b = Path(self.temp.name) / "b.md"
@@ -235,14 +246,26 @@ class ConvergeTests(RepoCase):
         self.assertEqual(self.converge("--apply"), 2)
         self.assertTrue((self.repo / "CLAUDE.md").is_file())
 
-    def test_refuses_dirty_paths_unless_forced(self):
+    def test_modified_tracked_content_always_refuses_but_untracked_can_be_forced(self):
         self.write("CLAUDE.md", "# Rules\n")
+        self.skill(".claude/skills", "a")
         self.commit()
         self.write("CLAUDE.md", "# Rules edited\n")
         self.assertEqual(self.converge("--apply"), 2)
+        self.assertEqual(self.converge("--apply", "--force"), 2)
         self.assertTrue((self.repo / "CLAUDE.md").is_file())
+        self.write("CLAUDE.md", "# Rules\n")
+        self.write(".claude/skills/a/notes.txt", "scratch\n")
+        self.assertEqual(self.converge("--apply"), 2)
         self.assertEqual(self.converge("--apply", "--force"), 0)
-        self.assertEqual((self.repo / "AGENTS.md").read_text(), "# Rules edited\n")
+        self.assertEqual((self.repo / ".agents/skills/a/notes.txt").read_text(), "scratch\n")
+
+    def test_other_dotdir_changes_do_not_block(self):
+        self.write("CLAUDE.md", "# Rules\n")
+        self.write(".claude/settings.local.json", "{}\n")
+        self.commit()
+        self.write(".claude/settings.local.json", "{\"a\": 1}\n")
+        self.assertEqual(self.converge("--apply"), 0)
 
     def test_no_git_mode_on_plain_directory(self):
         plain = Path(self.temp.name) / "plain"

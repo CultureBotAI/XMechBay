@@ -33,7 +33,7 @@ audit = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(audit)
 
 READ_WORDS = ("read", "follow", "see")
-INSTRUCTION_PATHS = ("AGENTS.md", "CLAUDE.md", "GEMINI.md", ".agents", ".claude")
+INSTRUCTION_PATHS = ("AGENTS.md", "CLAUDE.md", "GEMINI.md", ".agents/skills", ".claude/skills")
 
 
 class Plan:
@@ -148,6 +148,8 @@ def carried_lines(path: Path, other: str) -> list[str]:
             prefix, joined = joined[:2], joined[2:]
         sentences = [s for s in re.split(r"(?<=[.!?])\s+(?=[A-Z`\[])", joined) if s]
         remaining = [s for s in sentences if not (other.lower() in s.lower() and any(w in s.lower() for w in READ_WORDS))]
+        for dropped in (s for s in sentences if s not in remaining):
+            print(f"DROP  from {path.name}: {dropped}")
         if not remaining:
             continue
         if kept:
@@ -259,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-gemini", action="store_true")
     parser.add_argument("--flip-reverse", action="store_true", help="Also flip compliant reverse symlinks to the chosen direction")
     parser.add_argument("--skills-canonical", choices=(".agents/skills", ".claude/skills"), default=".agents/skills", help="Which path is the real directory; the other becomes a symlink to it (default .agents/skills; the Mech fleet uses .claude/skills because claw's tooling lists that path with git ls-files)")
-    parser.add_argument("--force", action="store_true", help="Apply even when the rewritten paths have uncommitted changes")
+    parser.add_argument("--force", action="store_true", help="Apply even when the rewritten paths hold untracked files (modified tracked content always refuses)")
     args = parser.parse_args(argv)
 
     repo = args.repo.resolve()
@@ -270,10 +272,14 @@ def main(argv: list[str] | None = None) -> int:
         print("refusing to apply on main/master; create a topic branch first", file=sys.stderr)
         return 2
 
-    if use_git and args.apply and not args.force:
+    if use_git and args.apply:
         dirty = subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--", *INSTRUCTION_PATHS], capture_output=True, text=True).stdout.strip()
-        if dirty:
-            print("refusing to apply: uncommitted changes under the paths this script rewrites (commit or stash them, or pass --force):\n" + dirty, file=sys.stderr)
+        modified_tracked = [line for line in dirty.splitlines() if not line.startswith("??")]
+        if modified_tracked:
+            print("refusing to apply: modified tracked content under the paths this script rewrites (commit or stash it first):\n" + "\n".join(modified_tracked), file=sys.stderr)
+            return 2
+        if dirty and not args.force:
+            print("refusing to apply: untracked files under the paths this script rewrites (move them, or pass --force to carry them along):\n" + dirty, file=sys.stderr)
             return 2
 
     before = audit.audit_repo(repo)

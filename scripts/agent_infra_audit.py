@@ -80,7 +80,9 @@ def classify_instructions(repo: Path) -> dict:
     kinds = {name: kind_of(repo / name) for name in INSTRUCTION_FILES}
     agents, claude, gemini = (repo / n for n in INSTRUCTION_FILES)
     verdict, canonical = "none", None
-    if kinds["AGENTS.md"] != "missing" and kinds["CLAUDE.md"] != "missing":
+    if any(k.startswith("broken-symlink") for k in (kinds["AGENTS.md"], kinds["CLAUDE.md"])):
+        verdict = "broken-link"
+    elif kinds["AGENTS.md"] != "missing" and kinds["CLAUDE.md"] != "missing":
         if kinds["CLAUDE.md"].startswith("symlink") and same_file(claude, agents):
             verdict, canonical = "unified", "AGENTS.md"
         elif kinds["AGENTS.md"].startswith("symlink") and same_file(agents, claude):
@@ -111,7 +113,9 @@ def classify_skills(repo: Path) -> dict:
     kinds = {d: kind_of(repo / d) for d in SKILL_DIRS}
     names = {d: skill_names(repo / d) for d in SKILL_DIRS}
     drifted: list[str] = []
-    if kinds[".agents/skills"] == "missing" and kinds[".claude/skills"] == "missing":
+    if any(kinds[d].startswith("broken-symlink") for d in SKILL_DIRS):
+        verdict, canonical = "broken-link", None
+    elif kinds[".agents/skills"] == "missing" and kinds[".claude/skills"] == "missing":
         verdict, canonical = "none", None
     elif kinds[".claude/skills"].startswith("symlink") and same_file(claude, agents):
         verdict, canonical = "unified-symlink", ".agents/skills"
@@ -187,6 +191,8 @@ def audit_global(files: list[str]) -> dict:
 
 def instruction_summary(info: dict) -> str:
     text = info["verdict"]
+    if text == "broken-link":
+        text += "(" + ", ".join(f"{n}->{k.split(':', 1)[1]}" for n, k in info["kinds"].items() if k.startswith("broken")) + ")"
     if info["canonical"] and info["verdict"] in ("unified", "pointer"):
         text += f"({info['canonical']})" + ("(reverse)" if info["verdict"] == "unified" and info["canonical"] == "CLAUDE.md" else "")
     if "gemini" in info:
@@ -196,6 +202,8 @@ def instruction_summary(info: dict) -> str:
 
 def skills_summary(info: dict) -> str:
     text = info["verdict"]
+    if text == "broken-link":
+        text += "(" + ", ".join(f"{n}->{k.split(':', 1)[1]}" for n, k in info["kinds"].items() if k.startswith("broken")) + ")"
     if info["verdict"] == "unified-symlink" and info["canonical"] == ".claude/skills":
         text += "(reverse)"
     if info["drifted"]:
