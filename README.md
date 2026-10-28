@@ -14,14 +14,15 @@ data, or a particular organization's deployment.
 |---|---|
 | `mac-orchestration` | Read and control macOS Terminal windows; paste files into an owned tmux session with prompt checks |
 | `session-status` | Read agent process and tmux inventory for an explicitly selected host |
+| `fleet-session-status` | Produce a compact table per configured host, combining Terminal/tmux sessions, reported activity, observation changes and port health |
 | `agy-permissions` | Inspect a supplied permission-policy file without modifying it |
 | `scripts/sync_skill_mirrors.py` | Keep the agent skill directories identical, including hidden and ignored entries |
 | `scripts/check_public_content.py` | Check publishable files and Git history for private-data patterns |
 | `scripts/check_port_pressure.py` | Observe local TCP port pressure and retain private alerts without controlling sessions |
 | `scripts/install_port_pressure_watch.py` | Preview or install a per-user macOS monitor that checks every 60 seconds |
 
-Python 3.10 or later is required for the fleet tools; the standalone port pressure
-monitor also supports Python 3.9. Terminal commands require macOS and Terminal.app;
+Most tools require Python 3.10 or later; the port pressure monitor and fleet session
+tables also support Python 3.9. Terminal commands require macOS and Terminal.app;
 remote commands require SSH access configured by the operator. The tmux path
 requires an existing tmux server on the selected host. Nothing starts remote GUI
 applications, authenticates accounts, or installs host software automatically.
@@ -49,6 +50,27 @@ XMECHBAY_TMUX_SESSION=fleet "$S" -H worker.example.invalid \
 The goal example is a template to inspect before use, not permission to start
 workers or spend usage. Start with one authorized target and verify the resulting
 screen before repeating an operation.
+
+## On-demand session tables
+
+Use [the synthetic host configuration](examples/fleet-hosts.json) as the shape for
+an ignored `.local/fleet-status.json`, containing your own SSH destinations.
+Request either host separately or both at once:
+
+```bash
+bash scripts/fleet-status.sh laptop-a
+bash scripts/fleet-status.sh laptop-b
+bash scripts/fleet-status.sh laptop-a laptop-b
+```
+
+The combined command collects concurrently and prints two separate tables. Each
+shows every observed logical session with its target, model, state, reported
+activity, process age, observation changes, and available listener pressure.
+Use `--all` for all configured hosts, `--list` for host keys, or `--json` for
+structured details. Unknown state, failed collection and stale health evidence
+remain explicit. No session input or model request is sent. See the
+[fleet session status skill](.agents/skills/fleet-session-status/SKILL.md) for
+evidence rules, offline snapshots and cache options.
 
 ## Configure a deployment
 

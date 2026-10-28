@@ -1,0 +1,6 @@
+interface:
+  display_name: "Fleet Session Status"
+  short_description: "Compact session and progress tables for each host"
+  default_prompt: "Use $fleet-session-status to show separate compact status tables for the requested laptops."
+policy:
+  allow_implicit_invocation: true

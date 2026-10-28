@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "hosts": {
+    "laptop-a": {
+      "host": "worker-a.example.invalid",
+      "label": "Laptop A",
+      "python": "/usr/bin/python3"
+    },
+    "laptop-b": {
+      "host": "worker-b.example.invalid",
+      "label": "Laptop B",
+      "python": "/usr/bin/python3"
+    }
+  },
+  "aliases": {
+    "a": "laptop-a",
+    "b": "laptop-b"
+  },
+  "max_health_age_seconds": 120,
+  "state_dir": "fleet-status-state"
+}
