@@ -1,0 +1,38 @@
+Prefix(obo:=<http://purl.obolibrary.org/obo/>)
+Prefix(metpo:=<https://w3id.org/metpo/>)
+Prefix(ex:=<https://example.org/cell-length-pilot/>)
+Prefix(skos:=<http://www.w3.org/2004/02/skos/core#>)
+Ontology(<https://example.org/cell-length-pilot/model>
+ Declaration(Class(obo:OBA_2040145))
+ Declaration(Class(obo:PATO_0000122))
+ Declaration(Class(obo:PATO_0000574))
+ Declaration(Class(obo:PATO_0000460))
+ Declaration(Class(obo:CL_0000000))
+ Declaration(Class(metpo:1000881))
+ Declaration(Class(metpo:1000059))
+ Declaration(ObjectProperty(obo:RO_0000052))
+ Declaration(ObjectProperty(obo:RO_0002573))
+ Declaration(ObjectProperty(obo:BFO_0000051))
+ Declaration(AnnotationProperty(obo:IAO_0000119))
+ Declaration(AnnotationProperty(obo:IAO_0000115))
+ Declaration(AnnotationProperty(skos:closeMatch))
+
+ SubClassOf(metpo:1000881 metpo:1000059)
+ AnnotationAssertion(Annotation(obo:IAO_0000119 obo:OBA_2040145)
+   obo:IAO_0000115 metpo:1000881
+   "A phenotype that inheres in a cell by virtue of its longer dimension when viewed on a plane.")
+ AnnotationAssertion(skos:closeMatch metpo:1000881 obo:OBA_2040145)
+ EquivalentClasses(obo:OBA_2040145 ObjectIntersectionOf(
+   obo:PATO_0000122 ObjectSomeValuesFrom(obo:RO_0000052 obo:CL_0000000)))
+ SubClassOf(obo:PATO_0000574 obo:PATO_0000122)
+
+ Declaration(Class(ex:CellLengthPhenotype))
+ Declaration(Class(ex:RelativeDecreasedCellLengthPhenotype))
+ Declaration(Class(ex:AbnormallyDecreasedCellLengthPhenotype))
+ EquivalentClasses(ex:CellLengthPhenotype ObjectSomeValuesFrom(obo:BFO_0000051 obo:OBA_2040145))
+ EquivalentClasses(ex:RelativeDecreasedCellLengthPhenotype ObjectSomeValuesFrom(obo:BFO_0000051
+   ObjectIntersectionOf(obo:PATO_0000574 ObjectSomeValuesFrom(obo:RO_0000052 obo:CL_0000000))))
+ EquivalentClasses(ex:AbnormallyDecreasedCellLengthPhenotype ObjectSomeValuesFrom(obo:BFO_0000051
+   ObjectIntersectionOf(obo:PATO_0000574 ObjectSomeValuesFrom(obo:RO_0000052 obo:CL_0000000)
+     ObjectSomeValuesFrom(obo:RO_0002573 obo:PATO_0000460))))
+)
