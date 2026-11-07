@@ -121,3 +121,8 @@ Start with one cell-dimension attribute before expanding to growth traits:
 Success means that measurements and comparative phenotypes can be found through
 shared attribute concepts while their experimental and biological scope remains
 recoverable. This proposal changes no scientific data or ontology axioms.
+
+A [worked cell-length pilot](../examples/cell-length/README.md) now supplies a
+published comparator pair, a proposed SSSOM mapping, and executed baseline and
+hypothetical-bridge reasoning checks. The bridge is experimental and is not an
+approved ontology change.

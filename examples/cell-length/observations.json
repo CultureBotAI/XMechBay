@@ -1,0 +1,38 @@
+{
+  "source": "https://doi.org/10.1111/mmi.12905",
+  "source_locator": "Table 1 and its footnote, LB with 0.5% NaCl at 30 degrees C",
+  "organism": "Escherichia coli",
+  "strain_background": "MG1655",
+  "attribute": "METPO:1000881",
+  "candidate_attribute_mapping": "OBA:2040145",
+  "unit_ucum": "um",
+  "conditions": {
+    "medium": "LB containing 0.5% NaCl",
+    "temperature_celsius": 30,
+    "backdilution_od600_approx": 0.02,
+    "measurement_od600_approx": [0.3, 0.5],
+    "phase": "midlog preculture; backdiluted and harvested at the reported OD range",
+    "method": "phase-contrast microscopy and MicrobeTracker"
+  },
+  "sampling": {
+    "reported_cells_per_condition": 600,
+    "reported_n": 3,
+    "caveat": "Preserve reported wording; replicate type and whether 600 cells is total or per replicate are not established here."
+  },
+  "observations": [
+    {"id": "TB28_30C", "strain": "TB28", "role": "study wild-type comparator", "mean": 4.37, "sem": 0.06},
+    {"id": "MT10_30C", "strain": "MT10", "perturbation": "chromosomal ftsL(E88K), called ftsL*", "mean": 3.63, "sem": 0.01}
+  ],
+  "comparison": {
+    "id": "MT10_vs_TB28_30C",
+    "subject_observation": "MT10_30C",
+    "reference_observation": "TB28_30C",
+    "reported_percent_of_reference": 83.1,
+    "reported_p_value": "<0.01",
+    "interpretation": "decreased mean cell length relative to TB28 in this assay",
+    "candidate_summary_concept": "ex:RelativeDecreasedCellLengthPhenotype",
+    "annotation_scope": "Population-summary interpretation, not an OWL assertion about every cell; abnormality not asserted.",
+    "experimental_status": "measured",
+    "statistical_test": "not established in this extraction"
+  }
+}

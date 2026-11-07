@@ -1,0 +1,15 @@
+# mapping_set_id: https://github.com/CultureBotAI/XMechBay/tree/docs/cell-length-worked-example/examples/cell-length
+# mapping_set_description: Agent-proposed discussion candidate; not an approved METPO mapping or an OWL equivalence axiom.
+# license: https://creativecommons.org/licenses/by/4.0/
+# mapping_date: 2026-11-07
+# subject_source: https://w3id.org/metpo/metpo.owl
+# subject_source_version: 800c9d27913158efdf466edf2cd710dbf1ce893f
+# object_source: http://purl.obolibrary.org/obo/oba.owl
+# object_source_version: c08bcfd6061157c3aae6ef854526e941942859c4
+# curie_map:
+#   METPO: https://w3id.org/metpo/
+#   OBA: http://purl.obolibrary.org/obo/OBA_
+#   skos: http://www.w3.org/2004/02/skos/core#
+#   semapv: https://w3id.org/semapv/vocab/
+subject_id	subject_label	predicate_id	object_id	object_label	mapping_justification	comment
+METPO:1000881	cell length	skos:closeMatch	OBA:2040145	cell length	semapv:UnspecifiedMatching	Pending curator review: existing OBA definition-source reference plus source axiom inspection; planar-longer-dimension wording needs review. No human-curation claim or reasoner-proven equality.

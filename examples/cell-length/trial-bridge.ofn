@@ -1,0 +1,7 @@
+Prefix(obo:=<http://purl.obolibrary.org/obo/>)
+Prefix(metpo:=<https://w3id.org/metpo/>)
+Ontology(<https://example.org/cell-length-pilot/hypothetical-bridge>
+ Declaration(Class(metpo:1000881))
+ Declaration(Class(obo:OBA_2040145))
+ EquivalentClasses(metpo:1000881 obo:OBA_2040145)
+)
