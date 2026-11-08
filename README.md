@@ -22,8 +22,10 @@ data, or a particular organization's deployment.
 | `scripts/sync_user_skills.py` | Give every agent's user-level skill directory the same skills through logged symlinks |
 | `scripts/sync_skill_mirrors.py` | Verify the skill trees are one directory, or keep copies identical where symlinks cannot ship |
 | `scripts/check_public_content.py` | Check publishable files and Git history for private-data patterns |
+| `scripts/tmp_state_guard.py` | Copy unpushed, uncommitted or soon-deleted agent work out of `/private/tmp` and the per-user temporary directory before macOS cleans them; `scripts/install_tmp_state_guard.py` schedules it nightly ([guide](docs/tmp-state-guard.md)) |
 
-Python 3.10 or later is required. Terminal commands require macOS and Terminal.app;
+Python 3.10 or later is required; the tmp-state guard and its installer also
+run on Python 3.9, the macOS `/usr/bin/python3`. Terminal commands require macOS and Terminal.app;
 remote commands require SSH access configured by the operator. The tmux path
 requires an existing tmux server on the selected host. Nothing starts remote GUI
 applications, authenticates accounts, or installs host software automatically.
