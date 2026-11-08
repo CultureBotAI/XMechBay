@@ -2,8 +2,9 @@
 """Copy agent work out of macOS-cleaned temporary directories before it is deleted.
 
 Purpose: nightly safety net for session state left in /private/tmp and the
-per-user DARWIN_USER_TEMP_DIR, which macOS deletes once a file has been
-untouched for about four days (/usr/libexec/tmp_cleaner at 00:00 local).
+per-user DARWIN_USER_TEMP_DIR, which macOS deletes once files are a few days
+old (/usr/libexec/tmp_cleaner at 00:00 local, four days; dirhelper at 03:35
+local and at boot, three days).
 tmp-state-guard PR, 2026-11-08.
 Inputs: roots (default /private/tmp and `getconf DARWIN_USER_TEMP_DIR`),
 exclusion globs and size caps; read-only git commands in each repository and
@@ -28,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -44,9 +46,23 @@ EXIT_REFUSED = 2
 STATUS_EXIT = {"ok": 0, "rescued": 10, "unrescued": 20, "incomplete": 30}
 GB = 1000 ** 3
 DAY = 86400
-# tmp_cleaner runs `find -atime +3 -mtime +3 -ctime +3`; find truncates ages to
-# whole days, so "+3" means at least four full days for all three timestamps.
-CLEANER_AGE = 4 * DAY
+# Cleaner models. tmp_cleaner (/private/tmp, 00:00) runs `find -atime +3 -mtime +3
+# -ctime +3`; find truncates ages to whole days, so all three timestamps must be at
+# least four full days old. dirhelper (com.apple.bsd.dirhelper) cleans /var/folders
+# at 03:35 and at boot, deleting files older than CLEAN_FILES_OLDER_THAN_DAYS=3.
+# Which timestamps dirhelper compares is unconfirmed, so the oldest one is assumed
+# to decide, which errs towards copying.
+CLEANERS = {
+    "tmp_cleaner": {"hour": 0, "minute": 0, "age": 4 * DAY, "oldest": False,
+                    "rule": "00:00 local; deleted once atime, mtime and ctime are all at least 4 days old"},
+    "dirhelper": {"hour": 3, "minute": 35, "age": 3 * DAY, "oldest": True,
+                  "rule": "03:35 local and at boot; assumed deleted once any of atime, mtime, ctime is 3 days old"},
+}
+# Names inside a .git directory; an exclusion matching one would corrupt a copied clone.
+GIT_INTERNAL_NAMES = ("objects", "refs", "logs", "hooks", "info", "pack", "packed-refs", "HEAD",
+                      "ORIG_HEAD", "FETCH_HEAD", "index", "config", "modules", "worktrees", "lfs",
+                      "description", "shallow", "commondir", "gitdir", "x.pack", "x.idx", "x.rev", "x.keep",
+                      "COMMIT_EDITMSG", "0a", "1234567890abcdef1234567890abcdef12345678")
 DEFAULT_DEST = "~/agent-state-backups/auto"
 # Regenerable content, matched against file and directory names at any depth:
 # skipped by the scan (reported only as counts) and excluded from every copy.
@@ -71,6 +87,7 @@ end run
 '''
 MAX_LISTED = 20
 RSYNC_TIMEOUT = 6 * 3600
+STALE_REFS = "tmp-state-guard"  # refs/<this>/stale/<stamp>/... in a copy, never in a source
 
 
 class Refusal(Exception):
@@ -131,6 +148,10 @@ def system_cleaned_roots() -> List[str]:
     if tmpdir:
         roots.append(tmpdir)
     return sorted({os.path.realpath(path) for path in roots})
+
+
+def cleaner_for(label: str) -> str:
+    return "dirhelper" if label == "darwin-user-temp" else "tmp_cleaner"
 
 
 def within(path: str, root: str) -> bool:
@@ -200,18 +221,55 @@ def git_environment() -> Dict[str, str]:
     return env
 
 
-def run_command(command: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None,
-                timeout: Optional[float] = None, data: Optional[bytes] = None) -> Tuple[Optional[int], bytes, bytes]:
-    """Run without a controlling terminal so nothing can prompt; (None, ...) on timeout or OSError."""
+RUNNING: List[Tuple[subprocess.Popen, bool]] = []
+
+
+def stop_child(process: subprocess.Popen, own_session: bool) -> None:
     try:
-        result = subprocess.run(command, input=data, stdin=None if data is not None else subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=cwd,
-                                timeout=timeout, start_new_session=True, check=False)
-    except subprocess.TimeoutExpired:
-        return None, b"", b"timed out"
+        if own_session:
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except OSError:
+        pass
+
+
+def stop_children() -> None:
+    for process, own_session in list(RUNNING):
+        stop_child(process, own_session)
+
+
+def run_command(command: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None,
+                timeout: Optional[float] = None, data: Optional[bytes] = None,
+                own_session: bool = False) -> Tuple[Optional[int], bytes, bytes]:
+    """Run a child; (None, ...) on timeout or OSError.
+
+    Children stay in the job's process group, so launchd stops them with the job.
+    own_session=True (git ls-remote) detaches from any terminal so ssh or a
+    credential helper cannot prompt; a timeout or a stop kills its whole group.
+    """
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=cwd,
+                                   start_new_session=own_session)
     except OSError as error:
         return None, b"", str(error).encode()
-    return result.returncode, result.stdout, result.stderr
+    RUNNING.append((process, own_session))
+    try:
+        out, err = process.communicate(data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stop_child(process, own_session)
+        process.communicate()
+        return None, b"", b"timed out"
+    finally:
+        RUNNING.remove((process, own_session))
+    return process.returncode, out, err
+
+
+def terminate(signum, frame) -> None:
+    """SIGTERM (launchd stop, logout) or SIGINT: stop children, then exit."""
+    stop_children()
+    raise SystemExit(128 + signum)
 
 
 def redact_url(url: str) -> str:
@@ -300,11 +358,17 @@ class Scanner:
         self.settings = settings
         self.now = now
         self.times = times
-        self.deadlines = tuple(run - CLEANER_AGE for run in next_cleaner_runs(now))
+        self.use_cleaner("tmp_cleaner")
         self.skipped = {"symlink": 0, "foreign_owner": 0, "other_filesystem": 0, "special": 0}
         self.excluded: Dict[str, int] = {}
         self.hardlinks = set()
         self.uid = os.getuid()
+
+    def use_cleaner(self, name: str) -> None:
+        model = CLEANERS[name]
+        runs = next_cleaner_runs(self.now, model["hour"], model["minute"])
+        self.deadlines = tuple(run - model["age"] for run in runs)
+        self.oldest = model["oldest"]
 
     def exclude(self, name: str, top: bool = False) -> bool:
         pattern = matching_glob(name, self.settings.excludes + (self.settings.top_excludes if top else ()))
@@ -324,7 +388,9 @@ class Scanner:
             self.settings.errors.append("root_unreadable:" + label)
             return entries
         dest_root = os.path.join(self.settings.dest, label)
+        self.use_cleaner(cleaner_for(label))
         for name in names:
+            self.hardlinks = set()  # each entry is copied by its own rsync call
             path = os.path.join(root, name)
             try:
                 info = os.lstat(path)
@@ -362,6 +428,9 @@ class Scanner:
         # EPERM is macOS privacy or sandbox protection (TemporaryItems and service
         # directories in DARWIN_USER_TEMP_DIR): nothing running as this user can
         # read it, so it is reported but does not make the observation incomplete.
+        # ENOENT/ENOTDIR: removed by a live session during the walk; nothing to lose.
+        if error.errno in (errno.ENOENT, errno.ENOTDIR):
+            return
         if error.errno == errno.EPERM:
             owner.protected += 1
         else:
@@ -380,8 +449,6 @@ class Scanner:
             for item in items:
                 try:
                     info = item.stat(follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
                 except OSError as error:
                     self.unreadable(owner, error)
                     continue
@@ -418,13 +485,13 @@ class Scanner:
         owner.own_files += 1
         owner.own_bytes += size
         if info.st_size > 0:  # an empty file holds no work to lose
-            atime, mtime, ctime = self.times(info)
-            newest = max(atime, mtime, ctime)
-            if newest <= self.deadlines[0]:
+            stamps = self.times(info)
+            deciding = min(stamps) if self.oldest else max(stamps)
+            if deciding <= self.deadlines[0]:
                 owner.due_next += 1
-            if newest <= self.deadlines[1]:
+            if deciding <= self.deadlines[1]:
                 owner.due_two += 1
-            owner.newest_change = max(owner.newest_change, mtime)
+            owner.newest_change = max(owner.newest_change, stamps[1])
         copied = None
         if dest_dir:
             try:
@@ -437,12 +504,15 @@ class Scanner:
             owner.transfer_bytes += size
 
 
-def next_cleaner_runs(now: float) -> Tuple[float, float]:
-    """The next two local midnights after now (mktime normalises day overflow and DST)."""
+def next_cleaner_runs(now: float, hour: int = 0, minute: int = 0) -> Tuple[float, float]:
+    """The next two local HH:MM times after now (mktime normalises day overflow and DST)."""
     local = time.localtime(now)
-    first = time.mktime((local.tm_year, local.tm_mon, local.tm_mday + 1, 0, 0, 0, 0, 0, -1))
-    second = time.mktime((local.tm_year, local.tm_mon, local.tm_mday + 2, 0, 0, 0, 0, 0, -1))
-    return first, second
+
+    def at(offset: int) -> float:
+        return time.mktime((local.tm_year, local.tm_mon, local.tm_mday + offset, hour, minute, 0, 0, 0, -1))
+
+    offset = 0 if at(0) > now else 1
+    return at(offset), at(offset + 1)
 
 
 # ---------------------------------------------------------------- git
@@ -455,6 +525,7 @@ class GitInspector:
         self.remote_cache: Dict[str, Tuple[Optional[set], Optional[str]]] = {}
         self.timeouts = 0
         self.regenerable = tuple(settings.excludes) + REGENERABLE_IGNORED
+        self.clone_gitdirs: set = set()  # .git directories of clones found in this scan
 
     def git(self, path: str, *args: str, data: Optional[bytes] = None, config: Tuple[str, ...] = ()):
         env = dict(self.env, GIT_CEILING_DIRECTORIES=os.path.dirname(path))
@@ -486,7 +557,8 @@ class GitInspector:
         if url not in self.remote_cache:
             # Run outside the repository so repository config cannot redirect the transport.
             code, out, _ = run_command([self.settings.git, "-c", "protocol.ext.allow=never", "ls-remote", url],
-                                       env=self.env, cwd="/", timeout=self.settings.remote_timeout)
+                                       env=self.env, cwd="/", timeout=self.settings.remote_timeout,
+                                       own_session=True)
             if code == 0:
                 ids = set()
                 for line in out.decode("utf-8", "replace").splitlines():
@@ -509,23 +581,59 @@ class GitInspector:
             self.finish(entry, errors, 0, 0, 0, [], [])
             return
         dirty, ignored = 0, []
+        # Explicit flags override status.showUntrackedFiles and submodule ignore settings.
         code, out, _ = self.git(entry.path, "status", "--porcelain=v1", "-z", "--ignored",
+                                "--untracked-files=normal", "--ignore-submodules=none",
                                 config=self.filter_overrides(entry.path))
         if code == 0:
             dirty, ignored = self.parse_status(out)
         else:
             errors.append("status failed")
-        stashes, unpushed, unknown = 0, [], []
-        if entry.kind == "clone":
+        stashes, unpushed, unknown, extra = 0, [], [], []
+        full_check = entry.kind == "clone"
+        if entry.kind == "worktree":
+            full_check, extra = self.worktree_commits(entry, errors, info)
+        if full_check:
             code, out, _ = self.git(entry.path, "stash", "list", "--format=%H")
             if code == 0:
                 stashes = len(out.split())
             else:
                 errors.append("stash list failed")
             unpushed, unknown = self.branches(entry, top, errors, info)
-        self.finish(entry, errors, dirty, len(ignored), stashes, unpushed, unknown)
+        self.finish(entry, errors, dirty, len(ignored), stashes, unpushed, unknown, extra)
         if ignored:
             info["ignored_samples"] = ignored[:5]
+
+    def worktree_commits(self, entry: Entry, errors: List[str], info: Dict[str, object]):
+        """Where a .git file's commits live; (run the clone checks?, extra reasons).
+
+        A worktree of a clone found in this scan is covered by that clone, which
+        counts its worktrees' detached HEADs. A git dir inside a scanned or cleaned
+        root (a submodule's .git/modules/<name>, a --separate-git-dir) is as
+        temporary as a clone, so it gets the clone checks. A git dir elsewhere is
+        durable, but commits only on a detached HEAD are reachable from nothing.
+        """
+        code, out, _ = self.git(entry.path, "rev-parse", "--git-common-dir")
+        if code != 0:
+            errors.append("rev-parse --git-common-dir failed")
+            return False, []
+        common = os.path.realpath(os.path.join(entry.path, out.decode("utf-8", "replace").strip()))
+        info["git_dir"] = common
+        if any(within(common, root) for root in self.cleaned):
+            if common in self.clone_gitdirs:
+                return False, []
+            info["git_dir_in_cleaned_root"] = True
+            return True, []
+        if self.git(entry.path, "symbolic-ref", "-q", "HEAD")[0] == 1:
+            code, out, _ = self.git(entry.path, "rev-list", "-n", "1", "HEAD", "--not", "--branches", "--tags",
+                                    "--remotes")
+            if code != 0:
+                errors.append("rev-list failed")
+            elif out.strip():
+                code, head, _ = self.git(entry.path, "rev-parse", "HEAD")
+                info["detached_head"] = head.decode().strip() if code == 0 else None
+                return False, ["detached-commits"]
+        return False, []
 
     def parse_status(self, out: bytes) -> Tuple[int, List[str]]:
         fields = out.split(b"\0")
@@ -559,6 +667,15 @@ class GitInspector:
             code, out, _ = self.git(entry.path, "rev-parse", "-q", "--verify", "HEAD^{commit}")
             if code == 0:
                 tips.setdefault(out.decode().strip(), []).append("(detached HEAD)")
+        # Other worktrees' detached HEADs keep their commits only in this git dir.
+        code, out, _ = self.git(entry.path, "worktree", "list", "--porcelain")
+        for block in out.decode("utf-8", "replace").split("\n\n")[1:] if code == 0 else []:
+            fields = dict((line.split(" ", 1) + [""])[:2] for line in block.splitlines() if line)
+            if "detached" in fields and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", fields.get("HEAD", "")):
+                label = "(detached HEAD of worktree %s)" % os.path.basename(fields.get("worktree", "?"))
+                names = tips.setdefault(fields["HEAD"], [])
+                if label not in names and "(detached HEAD)" not in names:
+                    names.append(label)
         remotes, durable, failures = [], set(), 0
         code, out, _ = self.git(entry.path, "remote")
         names = out.decode("utf-8", "replace").split() if code == 0 else []
@@ -613,10 +730,10 @@ class GitInspector:
         info["branches"] = sum(len(names) for names in tips.values())
         return sorted(unpushed), sorted(unknown)
 
-    def finish(self, entry: Entry, errors, dirty, ignored, stashes, unpushed, unknown) -> None:
+    def finish(self, entry: Entry, errors, dirty, ignored, stashes, unpushed, unknown, extra=()) -> None:
         info = entry.git
         info.update({"uncommitted": dirty, "ignored_entries": ignored})
-        if entry.kind == "clone":
+        if entry.kind == "clone" or info.get("git_dir_in_cleaned_root"):
             info.update({"stashes": stashes, "unpushed_branches": unpushed[:MAX_LISTED],
                          "unpushed_branch_count": len(unpushed),
                          "unverified_branches": unknown[:MAX_LISTED],
@@ -636,6 +753,7 @@ class GitInspector:
             entry.reasons.append("stashes")
         if ignored:
             entry.reasons.append("ignored-files")
+        entry.reasons.extend(extra)
 
 
 # ---------------------------------------------------------------- rescue
@@ -658,8 +776,66 @@ def rsync_entry(entry: Entry, settings: Settings) -> Tuple[Optional[int], str]:
     else:
         command += [entry.path + "/", entry.dest + "/"]
     code, _, err = run_command(command, timeout=RSYNC_TIMEOUT)
-    tail = err.decode("utf-8", "replace").strip().splitlines()[-3:]
-    return code, " | ".join(tail)
+    return code, err.decode("utf-8", "replace")
+
+
+def only_vanished(code: Optional[int], detail: str) -> bool:
+    """rsync 24 means files vanished; openrsync reports that as 23 with ENOENT lines."""
+    if code == 24:
+        return True
+    lines = [line for line in detail.splitlines()
+             if line.strip() and not line.lower().startswith(("rsync error:", "rsync warning:"))]
+    return code == 23 and bool(lines) and all("No such file or directory" in line for line in lines)
+
+
+def read_packed_refs(path: str) -> Dict[str, str]:
+    refs: Dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                parts = line.split()
+                if len(parts) == 2 and not line.startswith(("#", "^")):
+                    refs[parts[1]] = parts[0]
+    except OSError:
+        pass
+    return refs
+
+
+def reconcile_refs(source_git: str, copy_git: str, stamp: str) -> int:
+    """In the copy only: retire loose refs that the source no longer has as loose files.
+
+    rsync never deletes, so once the source packs a ref (git pack-refs, git gc) the
+    copy's stale loose file would shadow the updated packed-refs. A stale ref whose
+    packed value is the same is removed; any other is moved under
+    refs/tmp-state-guard/stale/<stamp>/ so its commits stay reachable. The source
+    is only read.
+    """
+    refs_dir = os.path.join(copy_git, "refs")
+    if not isdir_nofollow(refs_dir) or not isdir_nofollow(source_git):
+        return 0
+    packed = read_packed_refs(os.path.join(source_git, "packed-refs"))
+    changed = 0
+    for directory, names, files in os.walk(refs_dir):
+        rel_dir = os.path.relpath(directory, copy_git)
+        names[:] = [name for name in names if os.path.join(rel_dir, name) != os.path.join("refs", STALE_REFS)]
+        for name in files:
+            rel = os.path.join(rel_dir, name)
+            if os.path.lexists(os.path.join(source_git, rel)):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as stream:
+                    value = stream.read(4096).strip()
+                if packed.get(rel.replace(os.sep, "/")) == value:
+                    os.unlink(path)
+                else:
+                    target = os.path.join(refs_dir, STALE_REFS, "stale", stamp, os.path.relpath(rel, "refs"))
+                    os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+                    os.replace(path, target)
+                changed += 1
+            except OSError:
+                continue
+    return changed
 
 
 def rescue(entries: List[Entry], settings: Settings) -> None:
@@ -684,7 +860,7 @@ def rescue(entries: List[Entry], settings: Settings) -> None:
         except OSError:
             entry.rescue = {"status": "failed", "reason": "free-space-unknown"}
             continue
-        if free - transfer < settings.free_floor:
+        if transfer and free - transfer < settings.free_floor:
             entry.rescue = {"status": "skipped", "reason": "free-disk-floor", "free_bytes": free}
             continue
         if settings.dry_run:
@@ -697,12 +873,21 @@ def rescue(entries: List[Entry], settings: Settings) -> None:
         except OSError:
             code, detail = None, "could not create the destination"
         exists = os.path.lexists(entry.dest)
-        if code in (0, 24) and exists:  # 24: a live session removed files mid-copy
+        vanished = code != 0 and only_vanished(code, detail)
+        if (code == 0 or vanished) and exists:
             entry.rescue = {"status": "rescued" if files else "up-to-date", "rsync_exit": code}
+            if vanished:
+                entry.rescue["vanished_during_copy"] = True
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            retired = sum(reconcile_refs(os.path.join(node.path, ".git"), os.path.join(node.dest, ".git"), stamp)
+                          for node in entry.subtree() if node.kind == "clone")
+            if retired:
+                entry.rescue["stale_refs_retired"] = retired
             budget += transfer
             done.add(id(entry))
         else:
-            entry.rescue = {"status": "failed", "reason": "rsync", "rsync_exit": code, "detail": detail}
+            tail = " | ".join(detail.strip().splitlines()[-3:])
+            entry.rescue = {"status": "failed", "reason": "rsync", "rsync_exit": code, "detail": tail}
 
 
 # ---------------------------------------------------------------- report
@@ -760,7 +945,12 @@ def build_report(settings: Settings, now: float, scanner: Scanner, tops: List[En
         status = "rescued"
     else:
         status = "ok"
-    runs = next_cleaner_runs(now)
+    cleaners = []
+    for label, _ in settings.roots:
+        model = CLEANERS[cleaner_for(label)]
+        runs = next_cleaner_runs(now, model["hour"], model["minute"])
+        cleaners.append({"root": label, "cleaner": cleaner_for(label), "rule": model["rule"],
+                         "next_runs": [iso(run, local=True) for run in runs]})
     return {
         "schema_version": SCHEMA_VERSION, "tool": TOOL, "phase": phase,
         "observed_at": iso(now, precise=True),
@@ -768,8 +958,7 @@ def build_report(settings: Settings, now: float, scanner: Scanner, tops: List[En
         "dry_run": settings.dry_run, "status": status, "exit_code": STATUS_EXIT.get(status),
         "roots": [{"label": label, "path": path} for label, path in settings.roots],
         "dest": settings.dest,
-        "cleaner": {"next_runs": [iso(run, local=True) for run in runs],
-                    "rule": "deleted once atime, mtime and ctime are all at least 4 days old"},
+        "cleaners": cleaners,
         "settings": {"max_depth": settings.max_depth, "recent_days": settings.recent_days,
                      "entry_cap_bytes": settings.entry_cap, "run_cap_bytes": settings.run_cap,
                      "free_floor_bytes": settings.free_floor, "excludes": list(settings.excludes),
@@ -921,16 +1110,31 @@ def observe_and_rescue(settings: Settings, cleaned: List[str], times: Optional[C
         tops.extend(scanner.scan_root(label, root))
     # A remote inside a scanned or cleaned root is as temporary as the clone.
     inspector = GitInspector(settings, sorted(set(cleaned) | {path for _, path in settings.roots}))
+    nodes = [node for top in tops for node in top.subtree()]
+    inspector.clone_gitdirs = {os.path.realpath(os.path.join(node.path, ".git"))
+                               for node in nodes if node.kind == "clone"}
     recent = now - settings.recent_days * DAY
-    at_risk: List[Entry] = []
     for top in tops:
         if top.kind in ("folder", "file") and top.due_two and top.newest_change >= recent:
             top.reasons.append("files-due")
-        for node in top.subtree():
-            if node.kind in ("clone", "worktree"):
-                inspector.inspect(node)
-            if node.reasons:
-                at_risk.append(node)
+    for node in nodes:
+        if node.kind in ("clone", "worktree"):
+            inspector.inspect(node)
+    for node in nodes:
+        # The commits of an at-risk checkout whose git dir sits elsewhere in a root
+        # are copied with the entry that holds that git dir.
+        git_dir = node.git.get("git_dir")
+        if not (node.reasons and node.git.get("git_dir_in_cleaned_root")) or within(git_dir, node.path):
+            continue
+        holders = [other for other in nodes if within(git_dir, other.path)]
+        if holders:
+            holder = max(holders, key=lambda other: len(other.path))
+            if "git-dir-of-at-risk-checkout" not in holder.reasons:
+                holder.reasons.append("git-dir-of-at-risk-checkout")
+        else:
+            node.git.setdefault("errors", []).append("git dir is not inside a scanned entry and is not copied")
+            node.unknown = True
+    at_risk = [node for node in nodes if node.reasons]
     if settings.state_dir:
         persist(settings.state_dir, build_report(settings, now, scanner, tops, at_risk, "observed"),
                 settings.history_limit)
@@ -950,6 +1154,8 @@ def exclude_glob(value: str) -> str:
         raise argparse.ArgumentTypeError("an exclusion is a file-name glob without '/'")
     if fnmatch.fnmatchcase(".git", value):
         raise argparse.ArgumentTypeError("an exclusion must not match .git")
+    if any(fnmatch.fnmatchcase(name, value) for name in GIT_INTERNAL_NAMES):
+        raise argparse.ArgumentTypeError("an exclusion must not match names inside .git (it would corrupt copies)")
     return value
 
 
@@ -1017,6 +1223,15 @@ def settings_from_args(args) -> Settings:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    previous = {signum: signal.signal(signum, terminate) for signum in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        return run(args)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def run(args) -> int:
     settings = settings_from_args(args)
     try:
         cleaned = system_cleaned_roots()

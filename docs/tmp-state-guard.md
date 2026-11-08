@@ -9,7 +9,11 @@ macOS deletes old files from two temporary locations without asking:
   modification and change times are all at least four days old. Empty
   directories older than three days go too.
 - The per-user temporary directory, `getconf DARWIN_USER_TEMP_DIR` (the usual
-  `$TMPDIR`, under `/private/var/folders`), which macOS also cleans.
+  `$TMPDIR`, under `/private/var/folders`, where `mktemp -d` and Python's
+  `tempfile` write by default). `/usr/libexec/dirhelper`, started by
+  `com.apple.bsd.dirhelper` at 03:35 local time **and at every boot**, deletes
+  files older than three days there (`CLEAN_FILES_OLDER_THAN_DAYS=3`). Which
+  timestamps it compares is not documented.
 
 Agent sessions are told not to keep state in either place. The tmp-state guard
 is the safety net for when one does anyway: it runs every evening before the
@@ -26,11 +30,12 @@ One run of `scripts/tmp_state_guard.py`:
    work) is counted and skipped; a link inside a copied entry is copied as a
    link, never followed.
 2. **Classifies git repositories** found within `--max-depth` (default 7). A
-   `.git` directory means a clone; a `.git` file means a worktree (or a
-   submodule), whose commits live in another repository.
-   - A clone is at risk if a local branch tip, or a detached `HEAD`, is not on
-     a remote, if it has uncommitted or untracked changes, or if it has
-     stashes. "On a remote" is checked live with `git ls-remote` against every
+   `.git` directory means a clone; a `.git` file means a worktree, submodule or
+   separate git dir, whose commits live in the git dir it points to.
+   - A clone is at risk if a local branch tip, its detached `HEAD` or the
+     detached `HEAD` of one of its worktrees is not on a remote, if it has
+     uncommitted or untracked changes (whatever `status.showUntrackedFiles`
+     says), or if it has stashes. "On a remote" is checked live with `git ls-remote` against every
      fetch and push URL of every remote, cached per URL: a tip counts as pushed
      if a remote advertises it (branches, tags and pull-request heads all
      count) or if it is an ancestor of an advertised commit that exists
@@ -42,28 +47,51 @@ One run of `scripts/tmp_state_guard.py`:
    - If `ls-remote` fails or times out, the branches it could not clear are
      reported as **unverified**, the entry is marked unknown, and it is still
      copied. An unknown result is never treated as safe.
-   - A worktree is at risk only for uncommitted or untracked changes.
+   - A worktree is at risk for uncommitted or untracked changes. Its commits
+     are judged by where its git dir lives:
+     - in a clone found by the scan: that clone's checks cover them;
+     - elsewhere in a scanned or cleaned root (a submodule's
+       `.git/modules/<name>`, a `--separate-git-dir`): it gets the clone checks
+       too, and the entry holding the git dir is marked
+       `git-dir-of-at-risk-checkout` so the commits are copied with it;
+     - in a durable repository: commits that only a detached `HEAD` reaches
+       (no branch, tag or remote-tracking ref) are reported as
+       `detached-commits` with the commit id. The copy of the worktree does
+       not contain them; they stay in the main repository until git
+       garbage-collects them, so give them a branch there.
    - Clones and worktrees are also at risk for **ignored files** that are not
      regenerable (a `.temp/` of review batches, for example). Ignored names
      such as `build`, `dist`, `*.egg-info`, `*.pyc` and the exclusions below do
      not count.
-3. **Judges other top-level entries** (folders and single files) by the
-   cleaner's own rule: an entry is at risk if it holds a non-empty file that
-   the next one or two cleaner runs would delete (computed from atime, mtime
-   and ctime against the next two local midnights) and its newest file changed
-   within `--recent-days` (default 14). Files inside a repository found in the
-   entry are judged by the git rules instead.
+3. **Judges other top-level entries** (folders and single files) by the rule
+   of the cleaner for that root: an entry is at risk if it holds a non-empty
+   file that the next one or two cleaner runs would delete, and its newest file
+   changed within `--recent-days` (default 14). For `/private/tmp` that is
+   tmp_cleaner at the next two midnights with all three timestamps four days
+   old. For the per-user root (label `darwin-user-temp`) it is dirhelper at the
+   next two 03:35 runs with three days, and because its comparator is
+   unconfirmed the guard assumes the *oldest* of atime, mtime and ctime decides,
+   which errs towards copying. Files inside a repository found in the entry are
+   judged by the git rules instead.
 4. **Excludes** regenerable content everywhere: `pytest-of-*`,
    `pytest-cache-files-*`, `__pycache__`, `.mypy_cache`, `.pytest_cache`,
    `.ruff_cache`, `node_modules`, `.venv`, uv cache directories and
    `node-compile-cache`, plus top-level `com.apple.*` service directories.
    `--exclude GLOB` adds a name glob for any depth, `--exclude-top GLOB` one for
-   top-level names only. Excluded paths appear in the report only as counts.
+   top-level names only. An exclusion that would match a name inside `.git`
+   (`objects`, `logs`, `*.pack`, ...) is refused, because it would corrupt a
+   copied clone. Excluded paths appear in the report only as counts.
 5. **Copies** each at-risk entry with `rsync -aHx`, never `--delete`, into
    `<dest>/<root-label>/<path relative to the root>/` (labels `tmp` and
    `darwin-user-temp`). A later run updates the same copy, so files deleted at
-   the source stay in the copy. An entry inside one already copied in the same
-   run is reported as `covered`. Caps apply per entry (5 GB of content), per run
+   the source stay in the copy. After each copy of a clone, loose refs that the
+   source no longer has as loose files (it packed them, or deleted the branch)
+   are retired in the copy only: removed when the source's `packed-refs` holds
+   the same value, otherwise moved to `refs/tmp-state-guard/stale/<time>/` so
+   their commits stay reachable. Files that vanish while a live session is
+   working (rsync exit 24, or openrsync's 23 with only "No such file or
+   directory" errors) do not fail the copy. An entry inside one already copied
+   in the same run is reported as `covered`. Caps apply per entry (5 GB of content), per run
    (30 GB to transfer) and as a free-space floor on the backup disk (50 GB);
    an entry that would break one is skipped and reported, never copied in part.
    The guard refuses to run if the destination or state directory lies inside
@@ -99,15 +127,16 @@ later and only the standard library; macOS `/usr/bin/python3` is enough.
 | 10 | `rescued` | Something new was copied (in a dry run: would be copied) |
 | 20 | `unrescued` | An at-risk entry was skipped by a cap or its copy failed |
 | 30 | `incomplete` | Part of the observation failed: an unreadable root or directory, a git error, or an unverified remote |
+| 2 | - | Refused: destination or state in a cleaned root, overlapping roots, an insecure state directory, or another run holds the lock |
+
+When several apply, the higher code wins (30, then 20, then 10).
 
 A directory that macOS privacy or sandbox protection hides from the user
 (`EPERM`, for example `TemporaryItems` and some service directories in the
 per-user temporary directory) is listed under `unreadable` and counted as
 `protected_dirs`, but does not make a run incomplete: nothing running as the
-user, an agent included, can read or write it. Any other read error does.
-| 2 | - | Refused: destination or state in a cleaned root, overlapping roots, an insecure state directory, or another run holds the lock |
-
-When several apply, the higher code wins (30, then 20, then 10).
+user, an agent included, can read or write it. A directory that vanishes
+during the scan is ignored. Any other read error makes the run incomplete.
 
 ## Install the nightly job
 
@@ -153,7 +182,8 @@ python3 -m json.tool "$S/latest.json" | less
 Each record in `entries` gives the source path, its kind (`clone`, `worktree`,
 `folder`, `file`), the reasons it is at risk (`unpushed-branches`,
 `unverified-branches`, `uncommitted-changes`, `stashes`, `ignored-files`,
-`files-due`, `git-error`), sizes, git details (unpushed branch names, remote
+`detached-commits`, `git-dir-of-at-risk-checkout`, `files-due`, `git-error`),
+sizes, git details (unpushed branch names, remote
 lookups with credentials redacted) and the rescue outcome (`rescued`,
 `up-to-date`, `would-copy`, `covered`, `skipped` with a reason, or `failed`).
 `unreadable` names each top-level entry the scan could not read completely.
@@ -167,7 +197,14 @@ Restore into a durable location, never back into a temporary directory.
 
 - **Clone:** the copy is a complete repository. Inspect it in place
   (`git -C <copy> status`, `git -C <copy> log --branches --not --remotes`),
-  then push the branches you need or move the copy somewhere permanent.
+  then push the branches you need or move the copy somewhere permanent. Tips
+  the source later moved or deleted are kept as
+  `git -C <copy> for-each-ref refs/tmp-state-guard/`.
+- **Submodule:** its commits are in the superproject's copy, under
+  `.git/modules/<name>`.
+- **Detached commits of a worktree:** `latest.json` gives the commit id and the
+  main repository; run `git -C <main repository> branch rescue/<name> <id>`
+  before git garbage-collects it.
 - **Worktree:** the copy's `.git` file still points at its main repository.
   If that repository still exists, copy the changed files into a fresh
   worktree, or move the copy to a durable path and run
@@ -191,9 +228,13 @@ the release copies and every backup under `~/agent-state-backups/auto/` are kept
 
 - It runs only while the user is logged in: a per-user LaunchAgent does not run
   at the login window, while logged out, or while the Mac is off. If the Mac
-  sleeps through both 21:30 and midnight, launchd runs both jobs on wake in no
+  sleeps through 21:30 and a cleaner run, launchd runs both on wake in no
   guaranteed order; the two-run window gives a day's margin for files, not for
-  that race.
+  that race. dirhelper also runs at every boot, before any login, so a reboot
+  can delete per-user temporary files earlier than predicted.
+- dirhelper's comparator is assumed, not confirmed (see above).
+- Files marked skip-worktree or assume-unchanged in a repository's index are not
+  reported as changed.
 - It cannot rescue anything created and deleted between two runs, and the
   copy is not an atomic snapshot of a directory that a live session is writing.
 - An entry above the per-entry cap is never copied until the cap is raised;
@@ -209,6 +250,9 @@ the release copies and every backup under `~/agent-state-backups/auto/` are kept
 - The non-git rule copies whatever qualifies, including caches an application
   keeps in the per-user temporary directory; add `--exclude-top` names for those.
 - macOS 15 and later ship `openrsync` as `/usr/bin/rsync`; older releases ship
-  rsync 2.6.9. The guard uses only options both support (`-aHx`, `--exclude`).
+  rsync 2.6.9. The guard uses only options both support (`-aHx`, `--exclude`);
+  rsync 2.6.9 has not been exercised.
+- Stopping the job (logout, `launchctl bootout`) stops its git and rsync
+  children with it; a copy interrupted that way is completed by the next run.
 - Other locations are not watched: `/var/tmp`, caches under `~/Library`, and
   other users' files.

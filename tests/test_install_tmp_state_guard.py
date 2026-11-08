@@ -126,6 +126,16 @@ class InstallationTests(unittest.TestCase):
 
     @patch.object(INSTALL, "wait_for_report", side_effect=RuntimeError("no fresh observation"))
     @patch.object(INSTALL, "launchctl")
+    def test_rollback_restores_the_old_plist_even_if_bootout_fails(self, launchctl, wait_for_report):
+        path, previous = self.old_install()
+        launchctl.side_effect = [True, True, True, True, RuntimeError("bootout failed"), True]
+        with self.assertRaisesRegex(RuntimeError, "no fresh observation"):
+            INSTALL.install(self.plan, self.content, 501)
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertEqual(launchctl.call_args_list[-1].args, ("bootstrap", "gui/501", str(path)))
+
+    @patch.object(INSTALL, "wait_for_report", side_effect=RuntimeError("no fresh observation"))
+    @patch.object(INSTALL, "launchctl")
     def test_failed_first_install_leaves_no_plist(self, launchctl, wait_for_report):
         launchctl.side_effect = [True, False, True, True]
         with self.assertRaises(RuntimeError):

@@ -479,9 +479,11 @@ class RescueLimitTests(GuardCase):
         (session / "__pycache__" / "x.pyc").write_bytes(b"\0\1")
         os.link(session / "notes.txt", session / "hardlink.txt")
         (self.root / "link").symlink_to(main, target_is_directory=True)
-        time.sleep(0.05)
         before = snapshot(self.root, self.outside, self.remotes)
-        code, report = self.run_guard()
+        # Hashing the files for the snapshot may move their atime (Linux relatime);
+        # this test is about the source staying unchanged, so judge age by mtime.
+        with mock.patch.object(GUARD, "file_times", lambda info: (info.st_mtime,) * 3):
+            code, report = self.run_guard()
         self.assertEqual(code, 10)
         self.assertEqual(report["at_risk"]["entries"], 4)
         self.assertEqual(snapshot(self.root, self.outside, self.remotes), before)
@@ -527,6 +529,174 @@ class ReportTests(GuardCase):
         self.assertIsNone(GUARD.local_remote_path("ext::sh -c true", "/base"))
         self.assertEqual(GUARD.local_remote_path("../remote.git", "/base/repo"), os.path.realpath("/base/remote.git"))
         self.assertEqual(GUARD.local_remote_path("file:///base/r.git", "/x"), os.path.realpath("/base/r.git"))
+
+
+class ReviewRegressionTests(GuardCase):
+    """One test per finding of the PR #54 review (issues #55-#66)."""
+
+    def test_fresh_atime_alone_keeps_a_file_alive(self):  # 55
+        folder = self.root / "read-recently"
+        folder.mkdir()
+        target = folder / "notes.txt"
+        target.write_text("still read\n")
+        os.utime(target, (time.time(), time.time() - 5 * DAY))
+        code, report = self.run_guard()
+        self.assertEqual((code, report["entries"]), (0, []))
+
+    def test_detached_commit_in_worktree_of_durable_repo_is_reported(self):  # 56
+        main = self.clone("main-repo", self.bare(), where=self.outside)
+        git(main, "worktree", "add", "-q", "--detach", str(self.root / "review"))
+        self.commit(self.root / "review", "review.txt", "only on a detached HEAD\n")
+        code, report = self.run_guard()
+        record = self.entry(report, self.root / "review")
+        self.assertEqual(record["reasons"], ["detached-commits"])
+        self.assertEqual(record["git"]["detached_head"], git(self.root / "review", "rev-parse", "HEAD").decode().strip())
+        self.assertEqual(code, 10)
+
+    def test_clone_counts_its_worktrees_detached_heads(self):  # 56
+        repo = self.clone("clone", self.bare())
+        git(repo, "worktree", "add", "-q", "--detach", str(self.outside / "elsewhere"))
+        self.commit(self.outside / "elsewhere", "w.txt", "w\n")
+        code, report = self.run_guard()
+        record = self.entry(report, repo)
+        self.assertEqual(record["git"]["unpushed_branches"], ["(detached HEAD of worktree elsewhere)"])
+        self.assertEqual(code, 10)
+
+    def test_unpushed_submodule_commit_is_copied_with_its_superproject(self):  # 57
+        sub_remote = self.bare("sub.git")
+        self.clone("seed", sub_remote, where=self.outside)
+        sup = self.clone("super", self.bare("super.git"))
+        git(sup, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_remote), "sub")
+        git(sup, "commit", "-q", "-m", "add submodule")
+        self.commit(sup / "sub", "sub.txt", "unpushed in the submodule\n")
+        git(sup, "add", "sub")
+        git(sup, "commit", "-q", "-m", "record submodule")
+        git(sup, "push", "-q", "origin", "main")
+        lost = git(sup / "sub", "rev-parse", "HEAD").decode().strip()
+        code, report = self.run_guard()
+        record = self.entry(report, sup / "sub")
+        self.assertEqual(record["reasons"], ["unpushed-branches"])
+        self.assertTrue(record["git"]["git_dir_in_cleaned_root"])
+        holder = self.entry(report, sup)
+        self.assertEqual(holder["reasons"], ["git-dir-of-at-risk-checkout"])
+        self.assertEqual(holder["rescue"]["status"], "rescued")
+        self.assertEqual(record["rescue"], {"status": "covered", "by": str(sup)})
+        modules = self.copy_of(sup) / ".git" / "modules" / "sub"
+        subprocess.run(["git", "--git-dir", str(modules), "cat-file", "-e", lost], check=True)
+        self.assertEqual(code, 10)
+
+    def test_per_user_temp_root_uses_the_dirhelper_model(self):  # 58
+        now = time.mktime((2026, 11, 8, 21, 30, 0, 0, 0, -1))
+        first, second = GUARD.next_cleaner_runs(now, 3, 35)
+        self.assertEqual(time.localtime(first)[:5], (2026, 11, 9, 3, 35))
+        self.assertEqual(time.localtime(second)[:5], (2026, 11, 10, 3, 35))
+        early = time.mktime((2026, 11, 8, 1, 0, 0, 0, 0, -1))
+        self.assertEqual(time.localtime(GUARD.next_cleaner_runs(early, 3, 35)[0])[:5], (2026, 11, 8, 3, 35))
+        other = self.base / "user-temp"
+        for root in (self.root, other):
+            folder = root / "work"
+            folder.mkdir(parents=True)
+            (folder / "f.txt").write_text("written days ago, read today\n")
+            os.utime(folder / "f.txt", (time.time(), time.time() - 5 * DAY))
+        code, report = self.run_guard("--root", "darwin-user-temp=" + str(other))
+        self.assertEqual([record["path"] for record in report["entries"]], [str(other / "work")])
+        self.assertEqual([item["cleaner"] for item in report["cleaners"]], ["tmp_cleaner", "dirhelper"])
+        self.assertEqual(code, 10)
+
+    def test_untracked_files_are_seen_despite_config(self):  # 59
+        repo = self.clone("hides-untracked", self.bare())
+        git(repo, "config", "status.showUntrackedFiles", "no")
+        (repo / "notes.md").write_text("new work\n")
+        code, report = self.run_guard()
+        self.assertEqual(self.entry(report, repo)["reasons"], ["uncommitted-changes"])
+        self.assertEqual(code, 10)
+
+    def test_copy_follows_packed_refs_and_keeps_retired_tips(self):  # 60
+        repo = self.clone("packs-refs")
+        git(repo, "branch", "side")
+        self.assertEqual(self.run_guard()[0], 10)
+        old = git(repo, "rev-parse", "main").decode().strip()
+        self.commit(repo, "c.txt", "C\n")
+        new = git(repo, "rev-parse", "main").decode().strip()
+        git(repo, "branch", "-q", "-D", "side")
+        git(repo, "pack-refs", "--all")
+        before = snapshot(self.root)
+        code, report = self.run_guard()
+        self.assertEqual(snapshot(self.root), before)
+        copy = self.copy_of(repo)
+        self.assertEqual(git(copy, "rev-parse", "main").decode().strip(), new)
+        retired = git(copy, "for-each-ref", "--format=%(refname) %(objectname)", "refs/tmp-state-guard").decode()
+        self.assertEqual(sorted(line.split("/")[-1] for line in retired.splitlines()), ["main " + old, "side " + old])
+        self.assertEqual(self.entry(report, repo)["rescue"]["stale_refs_retired"], 2)
+
+    def fake_rsync(self, message):
+        script = self.base / "fake-rsync"
+        script.write_text('#!/bin/sh\nfor a; do last=$a; done\nmkdir -p "$last"\necho "%s" >&2\n'
+                          'echo "rsync error: some files could not be transferred (code 23)" >&2\nexit 23\n' % message)
+        script.chmod(0o755)
+        return str(script)
+
+    def test_files_vanishing_mid_copy_count_as_rescued(self):  # 61
+        folder = self.folder("live", 5)
+        fake = self.fake_rsync("rsync: stat: /live/gone.tmp: No such file or directory")
+        code, report = self.run_guard("--rsync", fake)
+        rescue = self.entry(report, folder)["rescue"]
+        self.assertEqual((rescue["status"], rescue["vanished_during_copy"]), ("rescued", True))
+        self.assertEqual(code, 10)
+        fake = self.fake_rsync("rsync: open: /live/secret: Permission denied")
+        code, report = self.run_guard("--rsync", fake)
+        self.assertEqual((self.entry(report, folder)["rescue"]["status"], code), ("failed", 20))
+
+    def test_directory_vanishing_during_the_walk_is_not_an_error(self):  # 62
+        gone = self.folder("busy", 0.1) / "build-tmp"
+        gone.mkdir()
+        real_scandir = os.scandir
+
+        def scandir(path):
+            if str(path) == str(gone):
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+            return real_scandir(path)
+
+        with mock.patch.object(GUARD.os, "scandir", scandir):
+            code, report = self.run_guard()
+        self.assertEqual((code, report["errors"], report["unreadable"]), (0, [], []))
+
+    def test_hard_links_count_in_every_entry_that_copies_them(self):  # 63
+        first = self.folder("a", 5, content="x" * 1000)
+        second = self.root / "b"
+        second.mkdir()
+        os.link(first / "notes.txt", second / "notes.txt")
+        code, report = self.run_guard()
+        self.assertEqual([self.entry(report, path)["bytes"] for path in (first, second)], [1000, 1000])
+
+    def test_free_disk_floor_does_not_block_up_to_date_copies(self):  # 64
+        repo = self.clone("unpushed")
+        self.assertEqual(self.run_guard()[0], 10)
+        code, report = self.run_guard("--free-floor-gb", "1000000000")
+        self.assertEqual((code, self.entry(report, repo)["rescue"]["status"]), (0, "up-to-date"))
+
+    def test_children_are_stopped_on_timeout_and_on_request(self):  # 65
+        started = time.monotonic()
+        code, _, err = GUARD.run_command(["sh", "-c", "sleep 30 & sleep 30"], timeout=0.5, own_session=True)
+        self.assertEqual((code, err), (None, b"timed out"))
+        self.assertLess(time.monotonic() - started, 10)
+        import threading
+        result = []
+        worker = threading.Thread(target=lambda: result.append(GUARD.run_command(["sleep", "30"])))
+        worker.start()
+        deadline = time.monotonic() + 5
+        while not GUARD.RUNNING and time.monotonic() < deadline:
+            time.sleep(0.01)
+        GUARD.stop_children()
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertNotEqual(result[0][0], 0)
+
+    def test_exclusions_matching_git_internals_are_rejected(self):  # 66
+        for pattern in ("logs", "*.pack", "objects", "[0-9a-f][0-9a-f]"):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                GUARD.parse_args(["--exclude", pattern])
+        self.assertEqual(GUARD.parse_args(["--exclude", "big-data"]).exclude, ["big-data"])
 
 
 if __name__ == "__main__":

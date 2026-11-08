@@ -2,8 +2,8 @@
 """Install the tmp-state guard as a private, per-user macOS LaunchAgent.
 
 Purpose: run scripts/tmp_state_guard.py every evening (21:30 local, before
-tmp_cleaner's 00:00 run) so agent work left in /private/tmp or the per-user
-temporary directory is copied out first. tmp-state-guard PR, 2026-11-08.
+tmp_cleaner's 00:00 and dirhelper's 03:35 runs) so agent work left in
+/private/tmp or the per-user temporary directory is copied out first. tmp-state-guard PR, 2026-11-08.
 Inputs: the bundled tmp_state_guard.py and explicit --install/--uninstall.
 Outputs: an immutable release copy named by its source hash, a backed-up
 LaunchAgent plist and a private 0700 state directory, all under
@@ -234,12 +234,19 @@ def install(plan, content, uid, wait=600):
         report = wait_for_report(state, started, wait)
     except Exception:
         # Preserve the old configuration and restore its previous loaded state.
+        # Each step runs even if an earlier one fails, so the old plist is never lost.
         if new_loaded:
-            launchctl("bootout", target)
+            try:
+                launchctl("bootout", target)
+            except (RuntimeError, OSError, subprocess.TimeoutExpired):
+                pass
         if previous is not None:
             atomic_write(plist_path, previous)
             if loaded:
-                launchctl("bootstrap", domain, str(plist_path))
+                try:
+                    launchctl("bootstrap", domain, str(plist_path))
+                except (RuntimeError, OSError, subprocess.TimeoutExpired):
+                    pass
         elif plist_path.exists():
             plist_path.unlink()
         raise
