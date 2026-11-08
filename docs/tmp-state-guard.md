@@ -99,6 +99,12 @@ later and only the standard library; macOS `/usr/bin/python3` is enough.
 | 10 | `rescued` | Something new was copied (in a dry run: would be copied) |
 | 20 | `unrescued` | An at-risk entry was skipped by a cap or its copy failed |
 | 30 | `incomplete` | Part of the observation failed: an unreadable root or directory, a git error, or an unverified remote |
+
+A directory that macOS privacy or sandbox protection hides from the user
+(`EPERM`, for example `TemporaryItems` and some service directories in the
+per-user temporary directory) is listed under `unreadable` and counted as
+`protected_dirs`, but does not make a run incomplete: nothing running as the
+user, an agent included, can read or write it. Any other read error does.
 | 2 | - | Refused: destination or state in a cleaned root, overlapping roots, an insecure state directory, or another run holds the lock |
 
 When several apply, the higher code wins (30, then 20, then 10).
@@ -150,6 +156,7 @@ Each record in `entries` gives the source path, its kind (`clone`, `worktree`,
 `files-due`, `git-error`), sizes, git details (unpushed branch names, remote
 lookups with credentials redacted) and the rescue outcome (`rescued`,
 `up-to-date`, `would-copy`, `covered`, `skipped` with a reason, or `failed`).
+`unreadable` names each top-level entry the scan could not read completely.
 Reject a report older than a day rather than assume the job is still running.
 
 ## Restore from a copy

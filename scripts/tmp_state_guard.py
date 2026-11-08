@@ -20,6 +20,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -249,6 +250,7 @@ class Entry:
     transfer_files: int = 0
     transfer_bytes: int = 0
     walk_errors: int = 0
+    protected: int = 0
     reasons: List[str] = field(default_factory=list)
     unknown: bool = False
     git: Dict[str, object] = field(default_factory=dict)
@@ -355,6 +357,16 @@ class Scanner:
             entries.append(entry)
         return entries
 
+    @staticmethod
+    def unreadable(owner: Entry, error: OSError) -> None:
+        # EPERM is macOS privacy or sandbox protection (TemporaryItems and service
+        # directories in DARWIN_USER_TEMP_DIR): nothing running as this user can
+        # read it, so it is reported but does not make the observation incomplete.
+        if error.errno == errno.EPERM:
+            owner.protected += 1
+        else:
+            owner.walk_errors += 1
+
     def walk(self, top: Entry, device: int, root: str) -> None:
         stack = [(top.path, top, top.depth, top.dest if isdir_nofollow(top.dest) else None)]
         while stack:
@@ -362,16 +374,16 @@ class Scanner:
             try:
                 with os.scandir(directory) as iterator:
                     items = list(iterator)
-            except OSError:
-                owner.walk_errors += 1
+            except OSError as error:
+                self.unreadable(owner, error)
                 continue
             for item in items:
                 try:
                     info = item.stat(follow_symlinks=False)
                 except FileNotFoundError:
                     continue
-                except OSError:
-                    owner.walk_errors += 1
+                except OSError as error:
+                    self.unreadable(owner, error)
                     continue
                 if stat.S_ISLNK(info.st_mode):
                     continue  # rsync copies the link itself; its target is never read
@@ -706,7 +718,8 @@ def entry_record(entry: Entry) -> Dict[str, object]:
         "reasons": entry.reasons, "unknown": entry.unknown,
         "files": entry.total("own_files"), "bytes": entry.total("own_bytes"),
         "transfer_files": entry.total("transfer_files"), "transfer_bytes": entry.total("transfer_bytes"),
-        "walk_errors": entry.total("walk_errors"), "dest": entry.dest, "rescue": entry.rescue,
+        "unreadable_dirs": entry.total("walk_errors"), "protected_dirs": entry.total("protected"),
+        "dest": entry.dest, "rescue": entry.rescue,
     }
     if entry.kind in ("folder", "file"):
         record.update({"due_next_run": entry.due_next, "due_within_two_runs": entry.due_two,
@@ -762,12 +775,18 @@ def build_report(settings: Settings, now: float, scanner: Scanner, tops: List[En
                      "free_floor_bytes": settings.free_floor, "excludes": list(settings.excludes),
                      "top_level_excludes": list(settings.top_excludes)},
         "inventory": {"top_level_entries": len(tops), "by_kind": kinds},
-        "skipped": dict(scanner.skipped, excluded=dict(sorted(scanner.excluded.items()))),
+        "skipped": dict(scanner.skipped, protected_dirs=sum(node.protected for node in nodes),
+                        excluded=dict(sorted(scanner.excluded.items()))),
         "at_risk": {"entries": len(at_risk), "by_kind": risk_kinds, "unknown": len(unknown),
                     "bytes": sum(node.total("own_bytes") for node in uncovered),
                     "transfer_bytes": sum(node.total("transfer_bytes") for node in uncovered),
                     "outcomes": outcomes},
         "entries": [entry_record(node) for node in at_risk],
+        # Where the walk could not read: the reason a run is incomplete, or
+        # privacy-protected directories that are only reported.
+        "unreadable": [{"path": top.path, "unreadable_dirs": top.total("walk_errors"),
+                        "protected_dirs": top.total("protected")}
+                       for top in tops if top.total("walk_errors") or top.total("protected")][:MAX_LISTED],
         "errors": errors,
         "notification": {"status": "disabled"},
     }
@@ -793,9 +812,10 @@ def summary_text(report: Dict[str, object]) -> str:
     lines.append("%s %s of %s in at-risk entries" % (verb, human_bytes(risk["transfer_bytes"]),
                                                      human_bytes(risk["bytes"])))
     skipped = report["skipped"]
-    lines.append("skipped top-level: %d symlinks, %d other owners, %d other filesystems; excluded paths: %d"
-                 % (skipped["symlink"], skipped["foreign_owner"], skipped["other_filesystem"],
-                    sum(skipped["excluded"].values())))
+    lines.append("skipped top-level: %d symlinks, %d other owners, %d other filesystems; excluded paths: %d; "
+                 "privacy-protected dirs: %d" % (skipped["symlink"], skipped["foreign_owner"],
+                                                 skipped["other_filesystem"], sum(skipped["excluded"].values()),
+                                                 skipped["protected_dirs"]))
     for record in report["entries"][:MAX_LISTED]:
         rescue = record["rescue"]
         state = str(rescue.get("status", "pending"))
@@ -805,6 +825,9 @@ def summary_text(report: Dict[str, object]) -> str:
                                                 record["path"], ", ".join(record["reasons"])))
     if len(report["entries"]) > MAX_LISTED:
         lines.append("  ... %d more in latest.json" % (len(report["entries"]) - MAX_LISTED))
+    for record in report["unreadable"]:
+        lines.append("unreadable: %s (%d unreadable, %d privacy-protected)"
+                     % (record["path"], record["unreadable_dirs"], record["protected_dirs"]))
     for error in report["errors"]:
         lines.append("error: " + error)
     lines.append("copies: " + str(report["dest"]))

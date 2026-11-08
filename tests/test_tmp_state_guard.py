@@ -7,6 +7,7 @@ synthetic root stands in for /private/tmp. Runs under unittest and pytest.
 """
 
 import contextlib
+import errno
 import hashlib
 import importlib.util
 import io
@@ -353,6 +354,32 @@ class FolderAndSkipTests(GuardCase):
         copy = self.copy_of(session)
         self.assertEqual(sorted(os.listdir(copy)), ["com.apple.inner", "notes.txt"])
         self.assertEqual(code, 10)
+
+    def test_unreadable_directories_are_named_and_only_eperm_is_tolerated(self):
+        protected = self.folder("service", 0.1) / "inner"
+        locked = self.folder("locked", 0.1) / "inner"
+        protected.mkdir()
+        locked.mkdir()
+        real_scandir = os.scandir
+
+        def scandir(path):
+            if str(path) == str(protected):
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+            if str(path) == str(locked):
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_scandir(path)
+
+        with mock.patch.object(GUARD.os, "scandir", scandir):
+            code, report = self.run_guard()
+        self.assertEqual((code, report["status"]), (30, "incomplete"))
+        self.assertEqual(report["errors"], ["walk_errors:1"])
+        self.assertEqual(report["unreadable"], [
+            {"path": str(self.root / "locked"), "unreadable_dirs": 1, "protected_dirs": 0},
+            {"path": str(self.root / "service"), "unreadable_dirs": 0, "protected_dirs": 1}])
+        shutil.rmtree(self.root / "locked")
+        with mock.patch.object(GUARD.os, "scandir", scandir):
+            code, report = self.run_guard()
+        self.assertEqual((code, report["skipped"]["protected_dirs"]), (0, 1))
 
     def test_bad_exclusions_are_rejected(self):
         for pattern in ("a/b", ".*", "+ keep"):
