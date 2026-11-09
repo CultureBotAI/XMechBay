@@ -18,3 +18,7 @@ User confirmed Codex is sole coordinator; Claude sends no further fleet input. R
 Consider MIM #1279, the three re-pin drafts and claw #1050 individually for merge after review and exact-head rechecks. Some first mergeability queries returned UNKNOWN; no merge readiness inferred from that. #1050 deployment and recovery need separately reviewed controls and approval. No new coordinator source review of those PRs was performed in this round.
 
 Continue C observation, resolve PTM question from rollout JSONL, and follow up guard #67/#68. The fleet-coordinator skill was not present at its expected path in fetched origin/main `84aad8a`; Claude's skill work was not duplicated.
+
+## Intel NPM chemistry assignment
+
+User explicitly requested Intel claw file the five chemistry blocker groups in NPM, post implementation plans as issue comments, and queue them as NPM's next work if busy. Delivered `goals/claw-intel-npm-chemistry-issues-plans-20261109.txt` (2,917 bytes) to idle T121 through the guarded mac-term paste. Post-send screen showed the full closing instructions, claw's acknowledgment to verify evidence/queue and canary one issue+comment, and Working. No prompt override used. Issue URLs, posted plans, queue persistence and downstream NPM acceptance are pending claw's report; dispatch to claw is verified, downstream completion is not yet claimed.
