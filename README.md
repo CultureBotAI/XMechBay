@@ -14,6 +14,7 @@ data, or a particular organization's deployment.
 |---|---|
 | `mac-orchestration` | Read and control macOS Terminal windows; paste files into an owned tmux session with prompt checks |
 | `session-status` | Read agent process and tmux inventory for an explicitly selected host |
+| `fleet-coordinator` | Coordinate several worker sessions as the single coordinator: claims, briefs, verified reports, records, per-action approvals, one-at-a-time merges and handoff; `scripts/serial_merge_queue.sh` merges an approved PR list through a merge queue one PR at a time |
 | `agy-permissions` | Inspect a supplied permission-policy file without modifying it |
 | `agent-infra-unify` | Audit and converge a repository's instruction files and skill trees to the layout every agent reads |
 | `scripts/agent_infra_audit.py` | Report, per checkout or user-level file set, whether Claude Code, Codex and Antigravity read the same instructions and skills |
