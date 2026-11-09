@@ -26,3 +26,11 @@ User explicitly requested Intel claw file the five chemistry blocker groups in N
 ## NPM #1242 review, merge and cleanup authorization
 
 User explicitly authorized adversarial review, finding issues, fixes, merge and branch/worktree deletion for NPM #1242. Sent `goals/claw-intel-npm-1242-review-merge-cleanup-20261109.txt` through guarded paste to idle Intel T121. Readback confirmed acknowledgment and Working. Scope is only this PR and its branch/worktree, preserving evidence and live processes; no chemistry implementation or workflow-boundary repair implied. Final report requested at claw `workspace/reports/npm-1242-review-merge-20261109/`.
+
+## NPM #1242 completion, 2026-11-09 06:22Z
+
+Fresh adversarial review filed NPM #1243 (proposed priority incorrectly attributed to the user). Corrected head `6aa002210f79e7de8e6418caf71583f3a30b94e5` passed re-review and required head/merge-group checks. One label setup job needed retry after HTTP 504; tests had not run on that failed attempt. PR #1242 merged at 06:15:02Z as `001dcd3f712b5e53c7bf7baaf3311aab503579df`; #1243 closed. Coordinator independently queried merged state and issue closure.
+
+Claw preserved 13 ignored roots, 18,244 entries / 294,631,804 logical bytes, with post-cleanup hash verification. Bundle and recovery ref preserve the reviewed tip. A cleanup preflight expected the wrong bundle ref label; it stopped before mutation and was corrected/reviewed with the exact tip and hash gates retained. Cleanup receipt and final readback report no remaining scoped blockers.
+
+Independently verified on Intel: `/Users/marcin/agent-work/claw/npm-chemistry-queue-20261108` absent; registration absent; local feature ref absent. Live `git ls-remote --heads` verified remote branch `chore/chemistry-blocker-next-tasks-20261108` absent. Live NPM and claw checkouts remain clean at prior heads; no NPM dispatch or workflow-boundary repair. Durable receipts: Intel claw `workspace/reports/npm-1242-review-merge-20261109/{cleanup-result.json,closeout-verification.json}`. All five chemistry issues and #1055/#1056 remain open as intended.
