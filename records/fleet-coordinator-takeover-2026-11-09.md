@@ -22,3 +22,7 @@ Continue C observation, resolve PTM question from rollout JSONL, and follow up g
 ## Intel NPM chemistry assignment
 
 User explicitly requested Intel claw file the five chemistry blocker groups in NPM, post implementation plans as issue comments, and queue them as NPM's next work if busy. Delivered `goals/claw-intel-npm-chemistry-issues-plans-20261109.txt` (2,917 bytes) to idle T121 through the guarded mac-term paste. Post-send screen showed the full closing instructions, claw's acknowledgment to verify evidence/queue and canary one issue+comment, and Working. No prompt override used. Issue URLs, posted plans, queue persistence and downstream NPM acceptance are pending claw's report; dispatch to claw is verified, downstream completion is not yet claimed.
+
+## NPM #1242 review, merge and cleanup authorization
+
+User explicitly authorized adversarial review, finding issues, fixes, merge and branch/worktree deletion for NPM #1242. Sent `goals/claw-intel-npm-1242-review-merge-cleanup-20261109.txt` through guarded paste to idle Intel T121. Readback confirmed acknowledgment and Working. Scope is only this PR and its branch/worktree, preserving evidence and live processes; no chemistry implementation or workflow-boundary repair implied. Final report requested at claw `workspace/reports/npm-1242-review-merge-20261109/`.
