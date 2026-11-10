@@ -5,9 +5,9 @@ Purpose: Prompt interactively (via getpass, so keys never appear in shell histor
   or terminal scrollback) for Wiley, Springer (Open Access, Meta, LifeScience Meta),
   CORE, CAS Common Chemistry, and optional Elsevier API keys; write
   ~/.config/lbnl-tdm.env (mode 0600) with backup; idempotently source
-  ~/.config/lbnl-tdm.env from ~/.bashrc and ~/.zshrc (with .bak-lbnl-tdm-20261108
-  backups); and run a 1-request live canary per configured API without ever
-  printing secret values.
+  ~/.config/lbnl-tdm.env from ~/.zshenv, ~/.zshrc, ~/.bashrc, and ~/.bash_profile
+  (with .bak-lbnl-tdm-20261108 backups); and run a 1-request live canary per
+  configured API without ever printing secret values.
 Inputs: Interactive hidden prompts (or existing ~/.config/lbnl-tdm.env values).
 Outputs: ~/.config/lbnl-tdm.env (0600) + shell RC source blocks + masked status/canary report.
 Serves: LBNL Library Services, Publisher TDM & CAS Common Chemistry API onboarding (2026-11-09).
@@ -21,10 +21,15 @@ import getpass
 import os
 import re
 import shutil
+import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
-import requests
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None  # type: ignore[assignment]
 
 HOME = Path.home()
 ENV_FILE = HOME / ".config" / "lbnl-tdm.env"
@@ -77,6 +82,16 @@ KEY_SPECS = [
 ]
 
 
+class _ExactHeader(str):
+    """Preserve exact HTTP header casing through urllib.request's .capitalize() and .title() calls."""
+
+    def capitalize(self) -> _ExactHeader:
+        return self
+
+    def title(self) -> _ExactHeader:
+        return self
+
+
 def _parse_env_file(path: Path) -> dict[str, str]:
     vals: dict[str, str] = {}
     if not path.is_file():
@@ -105,10 +120,12 @@ def load_existing(path: Path) -> dict[str, str]:
         vals["CAS_COMMON_CHEMISTRY_API_KEY"] = vals["CAS_API_KEY"]
 
     if not vals.get("SPRINGER_LIFESCIENCE_API_KEY"):
-        vals["SPRINGER_LIFESCIENCE_API_KEY"] = (
+        ls_fallback = (
             bak_vals.get("SPRINGER_LIFESCIENCE_API_KEY")
             or vals.get("SPRINGER_META_API_KEY", "")
         )
+        if ls_fallback:
+            vals["SPRINGER_LIFESCIENCE_API_KEY"] = ls_fallback
     return vals
 
 
@@ -175,7 +192,7 @@ def ensure_rc_sourced(rc_path: Path, create_if_missing: bool = False) -> tuple[b
 
 
 def sync_all_shell_rcs() -> None:
-    # Note: ~/.zshenv is sourced by ALL zsh invocations (including non-interactive
+    # ~/.zshenv is sourced by ALL zsh invocations (including non-interactive
     # `zsh -c` subshells spawned by already-running Codex/Claude sessions on M5).
     for rc_name, create in ((".zshenv", True), (".zshrc", False), (".bashrc", False), (".bash_profile", False)):
         rc_path = HOME / rc_name
@@ -189,18 +206,39 @@ def sync_all_shell_rcs() -> None:
 
 def _probe(url: str, headers: dict[str, str] | None = None) -> tuple[bool, str]:
     req_headers = {"User-Agent": "CommunityMech-fulltext/1.0", **(headers or {})}
+    if _requests is not None:
+        try:
+            with _requests.get(url, headers=req_headers, timeout=20, stream=True) as resp:
+                chunk = next(resp.iter_content(chunk_size=4096), b"")
+                if 200 <= resp.status_code < 300:
+                    return True, f"HTTP {resp.status_code} ({len(chunk)} bytes read)"
+                err_body = chunk.decode("utf-8", errors="ignore").strip()
+                err_body = re.sub(r"api_key=[^&\s\"']+", "api_key=***", err_body)
+                err_body = re.sub(r"\s+", " ", err_body)[:160]
+                amzn_err = resp.headers.get("x-amzn-ErrorType") or resp.headers.get("WWW-Authenticate") or ""
+                extra = f" [{amzn_err}]" if amzn_err else ""
+                detail = f" — {err_body}" if err_body else ""
+                return False, f"HTTP {resp.status_code} ({resp.reason}){extra}{detail}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    exact_headers = {_ExactHeader(k): v for k, v in req_headers.items()}
+    req = urllib.request.Request(url, headers=exact_headers)
     try:
-        with requests.get(url, headers=req_headers, timeout=20, stream=True) as resp:
-            chunk = next(resp.iter_content(chunk_size=4096), b"")
-            if 200 <= resp.status_code < 300:
-                return True, f"HTTP {resp.status_code} ({len(chunk)} bytes read)"
-            err_body = chunk.decode("utf-8", errors="ignore").strip()
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read(4096)
+            return True, f"HTTP {resp.status} ({len(body)} bytes read)"
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            err_body = e.read(512).decode("utf-8", errors="ignore").strip()
             err_body = re.sub(r"api_key=[^&\s\"']+", "api_key=***", err_body)
             err_body = re.sub(r"\s+", " ", err_body)[:160]
-            amzn_err = resp.headers.get("x-amzn-ErrorType") or resp.headers.get("WWW-Authenticate") or ""
-            extra = f" [{amzn_err}]" if amzn_err else ""
-            detail = f" — {err_body}" if err_body else ""
-            return False, f"HTTP {resp.status_code} ({resp.reason}){extra}{detail}"
+            if err_body:
+                detail = f" — {err_body}"
+        except Exception:
+            pass
+        return False, f"HTTP {e.code} ({e.reason}){detail}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 

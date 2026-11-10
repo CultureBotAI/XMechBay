@@ -7,14 +7,14 @@ Purpose: Query the CAS Common Chemistry Direct API (`https://commonchemistry.cas
   across MediaIngredientMech, AntibioticMech, NaturalProductMech, and PathwayMech, and emit a
   residual batch file for compounds requiring full 165M-substance CAS SciFinder lookup.
 Inputs:
-  - `/Users/marcin/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/mim_chemicals.tsv`
-  - `/Users/marcin/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/antibioticmech_chemicals.tsv`
-  - `/Users/marcin/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/naturalproductmech_chemicals.tsv`
-  - `/Users/marcin/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/pathwaymech_chemicals.tsv`
+  - `~/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/mim_chemicals.tsv`
+  - `~/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/antibioticmech_chemicals.tsv`
+  - `~/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/naturalproductmech_chemicals.tsv`
+  - `~/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/pathwaymech_chemicals.tsv`
 Outputs:
-  - SQLite cache: `/Users/marcin/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/cas_common_chemistry_cache.sqlite`
-  - Enriched TSV: `/Users/marcin/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/cas_common_chemistry_enriched.tsv`
-  - Residual TSV: `/Users/marcin/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/scifinder_residual_batch.tsv`
+  - SQLite cache: `~/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/cas_common_chemistry_cache.sqlite`
+  - Enriched TSV: `~/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/cas_common_chemistry_enriched.tsv`
+  - Residual TSV: `~/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois/scifinder_residual_batch.tsv`
 Serves: Mech chemical structure & CAS-RN enrichment workflow (2026-11-09).
 Date: 2026-11-09
 """
@@ -29,14 +29,26 @@ import os
 import re
 import sqlite3
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
-import requests
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None  # type: ignore[assignment]
 
-BASE_DIR = Path(
-    "/Users/marcin/Documents/VIMSS/ontology/Mechs/XMechBay/.temp/mech-chemicals-and-acs-dois"
+BASE_DIR = (
+    Path.home()
+    / "Documents"
+    / "VIMSS"
+    / "ontology"
+    / "Mechs"
+    / "XMechBay"
+    / ".temp"
+    / "mech-chemicals-and-acs-dois"
 )
 CACHE_DB = BASE_DIR / "cas_common_chemistry_cache.sqlite"
 ENRICHED_TSV = BASE_DIR / "cas_common_chemistry_enriched.tsv"
@@ -47,6 +59,16 @@ CAS_API_BASE = "https://commonchemistry.cas.org/direct-api"
 CAS_ORIGIN = "https://commonchemistry.cas.org/api-overview"
 CAS_RN_RE = re.compile(r"^\d{2,7}-\d{2}-\d$")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+class _ExactHeader(str):
+    """Preserve exact HTTP header casing through urllib.request's .capitalize() and .title() calls."""
+
+    def capitalize(self) -> _ExactHeader:
+        return self
+
+    def title(self) -> _ExactHeader:
+        return self
 
 
 def load_cas_key() -> str:
@@ -85,15 +107,15 @@ class CasCommonChemistryClient:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.cache_path))
         self._init_db()
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "accept": "application/json",
-                "x-origin": CAS_ORIGIN,
-                "X-API-KEY": self.api_key,
-                "User-Agent": "XMechBay-CASCommonChemistry/1.0",
-            }
-        )
+        self.headers = {
+            "accept": "application/json",
+            "x-origin": CAS_ORIGIN,
+            "X-API-KEY": self.api_key,
+            "User-Agent": "XMechBay-CASCommonChemistry/1.0",
+        }
+        self.session = _requests.Session() if _requests is not None else None
+        if self.session is not None:
+            self.session.headers.update(self.headers)
         self.network_calls = 0
         self.cache_hits = 0
 
@@ -132,6 +154,29 @@ class CasCommonChemistryClient:
         )
         self.conn.commit()
 
+    def _http_get_json(self, url: str) -> tuple[int, dict[str, Any]]:
+        if self.session is not None:
+            resp = self.session.get(url, timeout=20)
+            try:
+                payload = resp.json() if resp.text else {}
+            except Exception:
+                payload = {"raw_error": resp.text[:300]}
+            return resp.status_code, payload
+
+        exact_hdrs = {_ExactHeader(k): v for k, v in self.headers.items()}
+        req = urllib.request.Request(url, headers=exact_hdrs)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+                return resp.status, (json.loads(raw) if raw else {})
+        except urllib.error.HTTPError as e:
+            raw = e.read(512).decode("utf-8", errors="ignore")
+            try:
+                payload = json.loads(raw) if raw else {}
+            except Exception:
+                payload = {"raw_error": raw[:300]}
+            return e.code, payload
+
     def detail(self, cas_rn: str) -> tuple[int, dict[str, Any]]:
         cas_rn = cas_rn.strip()
         cached = self._get_cached("detail", cas_rn)
@@ -140,15 +185,11 @@ class CasCommonChemistryClient:
         if self.network_calls > 0 and self.delay_s > 0:
             time.sleep(self.delay_s)
         url = f"{CAS_API_BASE}/detail?cas_rn={urllib.parse.quote(cas_rn)}"
-        resp = self.session.get(url, timeout=20)
+        status_code, payload = self._http_get_json(url)
         self.network_calls += 1
-        try:
-            payload = resp.json() if resp.text else {}
-        except Exception:
-            payload = {"raw_error": resp.text[:300]}
-        if resp.status_code in (200, 404):
-            self._put_cached("detail", cas_rn, resp.status_code, payload)
-        return resp.status_code, payload
+        if status_code in (200, 404):
+            self._put_cached("detail", cas_rn, status_code, payload)
+        return status_code, payload
 
     def search(self, query: str) -> tuple[int, dict[str, Any]]:
         query = query.strip()
@@ -158,15 +199,11 @@ class CasCommonChemistryClient:
         if self.network_calls > 0 and self.delay_s > 0:
             time.sleep(self.delay_s)
         url = f"{CAS_API_BASE}/search?q={urllib.parse.quote(query)}"
-        resp = self.session.get(url, timeout=20)
+        status_code, payload = self._http_get_json(url)
         self.network_calls += 1
-        try:
-            payload = resp.json() if resp.text else {}
-        except Exception:
-            payload = {"raw_error": resp.text[:300]}
-        if resp.status_code in (200, 404):
-            self._put_cached("search", query, resp.status_code, payload)
-        return resp.status_code, payload
+        if status_code in (200, 404):
+            self._put_cached("search", query, status_code, payload)
+        return status_code, payload
 
 
 def load_targets(group: str) -> list[dict[str, str]]:
