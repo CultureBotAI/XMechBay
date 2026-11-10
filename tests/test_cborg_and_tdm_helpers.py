@@ -21,6 +21,7 @@ def _load_module(name: str, rel_path: str):
 
 allow_mcp = _load_module("allow_cborg_mcp_tools", "scripts/adhoc/allow_cborg_mcp_tools.py")
 setup_tdm = _load_module("setup_lbnl_tdm_keys", "scripts/adhoc/setup_lbnl_tdm_keys.py")
+query_cas = _load_module("query_cas_common_chemistry", "scripts/adhoc/query_cas_common_chemistry.py")
 public_gate = _load_module("check_public_content", "scripts/check_public_content.py")
 
 
@@ -29,9 +30,11 @@ class CborgMcpHelperTests(unittest.TestCase):
         rel_paths = [
             "docs/lbnl-tdm-and-cborg-mcp.md",
             "scripts/adhoc/allow_cborg_mcp_tools.py",
+            "scripts/adhoc/compile_mech_chemicals_and_acs_dois.py",
             "scripts/adhoc/configure_cborg_tavily.sh",
             "scripts/adhoc/enable_cborg_mcp.py",
             "scripts/adhoc/probe_cborg_tavily.py",
+            "scripts/adhoc/query_cas_common_chemistry.py",
             "scripts/adhoc/rename_agy_session_and_tab.py",
             "scripts/adhoc/setup_lbnl_tdm_keys.py",
             "tests/test_cborg_and_tdm_helpers.py",
@@ -85,6 +88,34 @@ class LbnlTdmSetupHelperTests(unittest.TestCase):
             self.assertIsNotNone(bak1)
             changed2, _ = setup_tdm.ensure_rc_sourced(rc_path)
             self.assertFalse(changed2)
+
+    def test_exact_header_preserves_casing_and_cas_format_row_strips_prefix(self):
+        hdr = setup_tdm._ExactHeader("X-API-KEY")
+        self.assertEqual(hdr.capitalize(), "X-API-KEY")
+        self.assertEqual(hdr.title(), "X-API-KEY")
+
+        row = query_cas.format_enriched_row(
+            {
+                "group": "mim_cas_fallbacks",
+                "mech": "MediaIngredientMech",
+                "identifier": "cas:68399-81-5",
+                "name": "TAPSO",
+            },
+            {
+                "rn": "68399-81-5",
+                "name": "TAPSO",
+                "molecularFormula": "C<sub>7</sub>H<sub>17</sub>NO<sub>7</sub>S",
+                "molecularMass": "259.28",
+                "canonicalSmile": "O=S(=O)(O)CC(O)CNC(CO)(CO)CO",
+                "inchi": "InChI=1S/C7H17NO7S/...",
+                "inchiKey": "InChIKey=RZQXOGQSPBYUKH-UHFFFAOYSA-N",
+                "experimentalProperties": [{"name": "Density", "property": "1.03691 g/cm³"}],
+                "synonyms": ["TAPSO"],
+            },
+            "detail(cas_rn=68399-81-5)",
+        )
+        self.assertEqual(row["molecular_formula"], "C7H17NO7S")
+        self.assertEqual(row["inchikey"], "RZQXOGQSPBYUKH-UHFFFAOYSA-N")
 
 
 if __name__ == "__main__":
