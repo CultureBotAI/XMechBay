@@ -38,3 +38,9 @@ Independently verified on Intel: `/Users/marcin/agent-work/claw/npm-chemistry-qu
 ## NPM boundary preparation and acceptance audit authorized
 
 User authorized claw to prepare the boundary-reconciliation fix and audit NPM #1055/#1056. Sent `goals/claw-intel-npm-boundary-audit-20261109.txt` (3,325 bytes) to idle Intel T121 through guarded paste. Scope: current evidence audit, bounded correction PRs if needed, tested/reviewed stage3-to4 reconciliation implementation preserving the separate two-PR chelator goal, and a non-executable operator-record draft/application plan. Merges, deployment, application, issue closure and live stage advance remain separate decisions. No prompt override used.
+
+## Intel port pressure, November 9 PST / November 10 UTC
+
+User requested resolution/prevention. Sample 2026-11-10T00:02:21Z: 12,293 distinct ports / 16,384 (75.03%); Community PID79186 has4,013 listeners, Habitat PID14279 has2,652. T331 has a merge-monitor timer; T337 has active QC. Neither is verified idle, so no fallback restart attempted. Prior manual fallback threshold is exceeded, but the idle gate still applies.
+
+Read full combined-supervisor-canary deployment report: restart guard never enabled because boundary-only enforcement, effective approvals rebind and executable/model identity were unsupported. Sent `goals/claw-intel-port-pressure-recovery-prevention-20261109.txt` to idle T121; post-send screen shows accepted text and Working. Claw will assess safe checkpoints and prepare reviewed prevention PR(s), preserving completed NPM boundary work. No merge/deployment/new restart authority given; existing Community/Habitat idle fallback remains owned by XMechBay. No signals, timer cancellations, OS configuration changes or Mech inputs occurred.
