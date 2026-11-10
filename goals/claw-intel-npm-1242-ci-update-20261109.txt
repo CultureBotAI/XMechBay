@@ -1,0 +1,1 @@
+Coordinator read-only update: GitHub now reports run 42569743245 SUCCESS/completed and PR #1242 CLEAN at corrected head 6aa002210f79e7de8e6418caf71583f3a30b94e5. Your screen still says qc is running. Please refresh exact-head checks (do not rely on a saved snapshot), then continue the already authorized merge and cleanup once verified. No new scope.

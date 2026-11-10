@@ -1,0 +1,14 @@
+From XMechBay, explicit user request: have Intel claw create issues in CultureBotAI/NaturalProductMech for the following reported chemistry blockers, then post an implementation plan as a comment on each issue. If NPM is busy, put this work in its durable queue and ask it to address these issues next. This authorizes those issue creations, plan comments and scoped NPM queue/dispatch; no mentions.
+
+Candidates from NPM T342's screen (verify, do not present as freshly established facts):
+1. Pre-pseudomonine CHEBI:196949: reported RDKit kekulization failure involving the upstream aromatic imidazole SMILES.
+2. Tenuazonic acid CHEBI:9440: reported keto-enol tautomer versus existing tenuazonic-acid.yaml / BGC0002158; duplicate/identity boundary.
+3. Pre-putrebactin CHEBI:50431 and CHEBI:229777: reported zwitterion/full InChIKey collision.
+4. Iron-containing CHEBI:60481, CHEBI:64492, CHEBI:77867: distinguish metal complex from free ligand; preserve oxidation/protonation and source identity.
+5. Staphylopine CHEBI:139535, pseudopaline CHEBI:138309, chalkophomycin CHEBI:231668, and pyridine-2,6-bis(thiocarboxylic acid) (PDTC): reportedly absent from pinned data/raw/chebi_structures.tsv and data/raw/mibig_compounds.tsv.
+
+Search existing open/closed issues and current source/report evidence first; reuse exact existing issues rather than duplicate. Start with five issue groups; split only for independently actionable fixes. Each issue should identify exact source pins, affected records, observed versus unverified claims, reproduction, scientific identity risks and acceptance criteria. Post a concrete implementation-plan comment on each: code/data paths, evidence needed, ordered steps, tests/negative controls, dependencies and PR boundaries. Use gh --body-file, no mentions or email disclosure. Canary one issue+plan end-to-end and read back both before the remainder.
+
+Inspect NPM's real current state and existing queue. Preserve active work. Queue these issues as the next requested work and verify persisted priority/issue IDs. At a safe boundary, use the existing guarded supervisor/queue path to ask NPM to address them; verify native acceptance, not just transport success. Do not type through prompts, clear a draft, blindly replay a goal, bypass closure gates, or invent a queue mechanism. If workflow reconciliation blocks dispatch, preserve the queue and report that specific blocker. Keep C4S3/#1055/#1056 and the separate completed chelator goal correctly attributed; this request does not authorize closing those issues or rewriting historical receipts.
+
+Implementation should follow normal branch/PR/review discipline; merges, deployment, signals and workflow-boundary repair remain separate decisions. Save report in durable claw workspace with issue/comment links, queue location and readback, dispatch acceptance or reason held, and proposed next order. Return its path when finished.
