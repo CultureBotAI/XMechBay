@@ -120,7 +120,7 @@ def scan_blob(data: bytes, location: str, max_bytes: int, extra: list[re.Pattern
     return findings
 
 
-def scan_repository(root: Path, max_bytes: int, extra: list[re.Pattern[str]], worktree_all: bool = False) -> tuple[set[Finding], dict[str, int]]:
+def scan_repository(root: Path, max_bytes: int, extra: list[re.Pattern[str]], worktree_all: bool = False, refs: list[str] | None = None) -> tuple[set[Finding], dict[str, int]]:
     findings: set[Finding] = set()
     tracked = [os.fsdecode(path) for path in git(root, "ls-files", "-z").split(b"\0") if path]
     counts = {"tracked_files": len(tracked), "index_blobs": 0, "additional_worktree_files": 0, "commits": 0, "history_blobs": 0, "other_ref_objects": 0}
@@ -167,7 +167,8 @@ def scan_repository(root: Path, max_bytes: int, extra: list[re.Pattern[str]], wo
                 findings.update(scan_path(path, location, extra))
                 data = os.readlink(candidate).encode() if candidate.is_symlink() else candidate.read_bytes()
                 findings.update(scan_blob(data, location, max_bytes, extra))
-    commits = git(root, "rev-list", "--all").decode().splitlines()
+    rev_args = [*refs, "--tags"] if refs else ["--all"]
+    commits = git(root, "rev-list", *rev_args).decode().splitlines()
     counts["commits"] = len(commits)
     seen_blobs: set[str] = set()
     seen_paths: set[tuple[str, str]] = set()
@@ -194,7 +195,8 @@ def scan_repository(root: Path, max_bytes: int, extra: list[re.Pattern[str]], wo
     # Git permits refs and annotated tags to target blobs, trees or other tags.
     # These objects need an explicit walk; commit traversal alone misses them.
     pending: list[tuple[str, str]] = []
-    for raw_ref in git(root, "for-each-ref", "--format=%(refname)%00%(objecttype)%00%(objectname)").splitlines():
+    ref_patterns = [*(r for r in refs if r.startswith("refs/")), "refs/tags"] if refs else []
+    for raw_ref in git(root, "for-each-ref", "--format=%(refname)%00%(objecttype)%00%(objectname)", *ref_patterns).splitlines():
         raw_name, raw_kind, raw_oid = raw_ref.split(b"\0")
         name = os.fsdecode(raw_name)
         findings.update(scan_text(name, "ref:" + safe_location(name, extra), extra))
@@ -239,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     parser.add_argument("--deny-patterns", type=Path, help="Private external UTF-8 regex file, one pattern per line; must be outside repository")
     parser.add_argument("--worktree-all", action="store_true", help="Also scan hidden, untracked and ignored worktree files, excluding Git's internal directory")
+    parser.add_argument("--ref", action="append", dest="refs", help="Specific Git ref or revision to scan (repeatable; defaults to --all when omitted)")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     if args.max_bytes < 1:
@@ -253,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, re.error):
             parser.error("cannot read or compile external deny patterns (values withheld)")
     try:
-        findings, counts = scan_repository(root, args.max_bytes, extra, args.worktree_all)
+        findings, counts = scan_repository(root, args.max_bytes, extra, args.worktree_all, args.refs)
     except (OSError, RuntimeError, UnicodeError):
         print("Publication check could not complete; no clean result is available.", file=sys.stderr)
         return 2
