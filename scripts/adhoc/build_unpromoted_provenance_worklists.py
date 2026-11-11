@@ -21,9 +21,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+SI_SUFFIX_RE = re.compile(r"\.s00\d+$", re.IGNORECASE)
 
 DEFAULT_BASE_DIR = (
     Path.home()
@@ -78,8 +81,9 @@ def classify_unpromoted_row(row: dict[str, str]) -> tuple[str, str] | None:
 
 def enrich_worklist_row(row: dict[str, str], tier: str, subcohort: str) -> dict[str, str]:
     """Build an enriched worklist row with ACS Figshare SI URL and CLI command."""
-    doi = (row.get("doi") or "").strip()
-    si_url = f"https://doi.org/{doi}.s001" if doi.startswith("10.1021/") else ""
+    raw_doi = (row.get("doi") or "").strip()
+    doi = SI_SUFFIX_RE.sub("", raw_doi)
+    si_url = f"https://doi.org/{doi}.s001" if doi.lower().startswith("10.1021/") else ""
     cli = f"uv run kg-microbe-sources acs-si --doi {doi}"
     return {
         "doi": doi,

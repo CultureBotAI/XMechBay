@@ -26,4 +26,4 @@ jobs:
       - name: Check shell syntax
         run: bash -n .agents/skills/mac-orchestration/scripts/mac-term.sh
       - name: Check publishable content and history
-        run: python3 scripts/check_public_content.py
+        run: python3 scripts/check_public_content.py --ref HEAD --ref refs/remotes/origin/main
