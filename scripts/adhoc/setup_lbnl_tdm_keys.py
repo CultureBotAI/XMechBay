@@ -316,6 +316,65 @@ def run_canaries(values: dict[str, str], zotero_dir: str) -> None:
     else:
         print("  [CAS_COMMON_CHEMISTRY_API]   SKIP (unset)")
 
+    elsevier_key = values.get("ELSEVIER_API_KEY", "")
+    if elsevier_key:
+        ok, msg = verify_elsevier_canary(elsevier_key)
+        print(f"  [ELSEVIER_API_KEY]           {'OK' if ok else 'WARN'} — {msg}")
+    else:
+        print("  [ELSEVIER_API_KEY]           SKIP (unset)")
+
+
+def verify_elsevier_canary(elsevier_key: str) -> tuple[bool, str]:
+    """Run a 1-request Elsevier Article Retrieval API canary without exposing the key."""
+    if not elsevier_key:
+        return False, "ELSEVIER_API_KEY is unset"
+    enc_doi = urllib.parse.quote("10.1016/j.cell.2019.01.029", safe="/")
+    return _probe(
+        f"https://api.elsevier.com/content/article/doi/{enc_doi}?httpAccept=text/xml",
+        headers={
+            "X-ELS-APIKey": elsevier_key,
+            "Accept": "text/xml",
+        },
+    )
+
+
+def ingest_acs_tdm_feed(feed_dir: Path, master_tsv: Path | None = None) -> dict[str, int]:
+    """Scan an ACS TDM XML/PDF feed directory and match files against 10.1021/* DOIs."""
+    if not feed_dir.is_dir():
+        raise FileNotFoundError(f"ACS TDM feed directory does not exist: {feed_dir}")
+    doi_re = re.compile(r"10\.1021/[A-Za-z0-9._;()/-]+", re.IGNORECASE)
+    known_dois: set[str] = set()
+    if master_tsv is not None and master_tsv.is_file():
+        for line in master_tsv.read_text(encoding="utf-8", errors="ignore").splitlines()[1:]:
+            parts = line.split("\t")
+            if parts and parts[0].strip():
+                known_dois.add(parts[0].strip().lower())
+
+    xml_files = 0
+    pdf_files = 0
+    matched_dois: set[str] = set()
+    for p in sorted(feed_dir.rglob("*")):
+        if not p.is_file():
+            continue
+        suf = p.suffix.lower()
+        if suf in {".xml", ".nxml"}:
+            xml_files += 1
+        elif suf == ".pdf":
+            pdf_files += 1
+        else:
+            continue
+        stem_norm = p.stem.replace("_", "/")
+        for candidate in (stem_norm, p.read_text(encoding="utf-8", errors="ignore")[:8192] if suf in {".xml", ".nxml"} else ""):
+            for m in doi_re.finditer(candidate):
+                d = m.group(0).rstrip(".,;:)]}>'\"`*").lower()
+                if not known_dois or d in known_dois:
+                    matched_dois.add(d)
+    return {
+        "xml_files": xml_files,
+        "pdf_files": pdf_files,
+        "matched_dois": len(matched_dois),
+    }
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -334,10 +393,42 @@ def main() -> int:
         action="store_true",
         help="Skip live 1-request API canary checks",
     )
+    parser.add_argument(
+        "--verify-elsevier",
+        action="store_true",
+        help="Verify ELSEVIER_API_KEY via a 1-request ScienceDirect TDM canary",
+    )
+    parser.add_argument(
+        "--ingest-acs-tdm-feed",
+        type=Path,
+        default=None,
+        help="Validate and index an ACS TDM XML/PDF feed directory against acs_dois_master.tsv",
+    )
     args = parser.parse_args()
 
     existing = load_existing(ENV_FILE)
     zotero_dir = existing.get("ZOTERO_DATA_DIR") or str(HOME / "Zotero")
+
+    if args.ingest_acs_tdm_feed is not None:
+        default_master = (
+            HOME
+            / "Documents"
+            / "VIMSS"
+            / "ontology"
+            / "Mechs"
+            / "XMechBay"
+            / ".temp"
+            / "mech-chemicals-and-acs-dois"
+            / "acs_dois_master.tsv"
+        )
+        stats = ingest_acs_tdm_feed(args.ingest_acs_tdm_feed, default_master)
+        print(f"ACS TDM feed summary: {stats}")
+        return 0
+
+    if args.verify_elsevier:
+        ok, msg = verify_elsevier_canary(existing.get("ELSEVIER_API_KEY", ""))
+        print(f"[ELSEVIER_API_KEY] {'OK' if ok else 'WARN'} — {msg}")
+        return 0 if ok else 1
 
     if not args.check_only:
         print("=== LBNL Library, TDM & CAS API Key Setup ===")
