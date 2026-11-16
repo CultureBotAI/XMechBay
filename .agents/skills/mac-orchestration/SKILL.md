@@ -14,14 +14,15 @@ sending input. Resolve `scripts/mac-term.sh` relative to this skill directory.
 `--host HOST` (or `-H HOST`) accepts an explicit bare SSH hostname. `local` is
 the default. `MAC_TERM_HOST` can supply the same value. There are no built-in
 machine names or account assignments; SSH user selection belongs in the user's
-private SSH configuration. Remote access uses batch mode and a connection timeout.
+private SSH configuration. Remote access uses batch mode, a connection timeout,
+and SSH keepalives.
 
 `XMECHBAY_TMUX_SESSION` names the one session this tool may control; the default
 is `fleet`. Session names may contain letters, digits, underscores and hyphens.
 Each named window must have exactly one pane. Other sessions, pane selectors and
 ambiguous windows are refused. The tool never creates a tmux session.
 
-Refusal and explicit-override metadata is saved under the repository's ignored
+Refusal, unknown-outcome and explicit-override metadata is saved under the repository's ignored
 `.local/records/` directory. `XMECHBAY_RECORDS_DIR` can select a different private
 directory. Logs contain host, target, command, state, timestamp, and any override
 reason; they exclude screen contents and input text. Keep logs and real host
@@ -49,9 +50,21 @@ target, and expires after one attempted input. It cannot authorize another promp
 or a later Enter. Do not guess an answer to an approval or question.
 
 File paste uses private staging files and bracketed paste, then separately guards
-Enter. tmux paste validates session ownership, uses a unique buffer, and removes
-both the buffer and staged file on completion or failure. No prompt text is
+Enter. tmux paste validates session ownership, uses a unique buffer, and attempts
+to remove both the buffer and staged file on completion or failure. No prompt text is
 constructed as shell code.
+
+Each local command, SSH command and SCP copy has a 120-second transport deadline.
+`wait-file` allows its requested wait plus 120 seconds; each cleanup attempt has a
+15-second deadline. These limits apply per call, not to the whole operation.
+Cleanup failure produces a warning without replacing the operation's result;
+temporary files or buffers may remain on an unreachable host.
+
+A command timeout or SSH disconnect leaves its outcome unknown: the command may
+already have taken effect. An unreadable screen after input likewise cannot prove
+that the input failed. Neither condition triggers an automatic retry or later
+input. Read the target screen and establish what happened before retrying. An SCP
+failure occurs before input and is reported as such.
 
 The helper requires Terminal to be running already and refuses to launch it.
 `open DIRECTORY [COMMAND]` creates a new window in that existing app; use it only

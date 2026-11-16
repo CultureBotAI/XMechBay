@@ -83,18 +83,48 @@ def status_state(screen):
     return ""  # Unknown or drafted text: preserve the screen detail, never guess idle.
 
 
+# Bound each local/remote subprocess, including a connected but unresponsive SSH
+# session. These are per-call limits, not a deadline for an entire operation.
+RUN_TIMEOUT = 120
+SCP_TIMEOUT = 120
+CLEANUP_TIMEOUT = 15
+SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+               "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2"]
+
+
+class OutcomeUnknown(RuntimeError):
+    """An operation may have taken effect but cannot be confirmed."""
+
+
+class TransportTimeout(OutcomeUnknown):
+    """The transport exceeded its deadline."""
+
+
+class ScreenUnreadable(Refused):
+    """The next input cannot be authorized because the screen is unavailable."""
+
+
 class Transport:
     def __init__(self, host):
         self.host = "" if host == "local" else host
         if self.host and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", self.host):
             raise ValueError("host must be a bare hostname")
 
-    def run(self, args, input=None):
+    def run(self, args, input=None, timeout=RUN_TIMEOUT):
         command = list(args)
         if self.host:
-            command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                       self.host, shlex.join(command)]
-        result = subprocess.run(command, input=input, text=True, capture_output=True)
+            command = ["ssh", *SSH_OPTIONS, self.host, shlex.join(command)]
+        try:
+            result = subprocess.run(command, input=input, text=True, capture_output=True,
+                                    timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # The command may have executed. Suppress the original exception,
+            # whose arguments/output may contain private prompt text.
+            raise TransportTimeout(f"{args[0]} timed out after {timeout}s; outcome unknown; "
+                                   "read the screen before retrying") from None
+        if self.host and result.returncode == 255:
+            raise OutcomeUnknown("SSH connection failed (exit 255); outcome unknown; "
+                                 "read the screen before retrying")
         if result.returncode:
             # Do not echo arguments or stderr: either can contain prompt text.
             raise RuntimeError(f"{args[0]} failed with exit {result.returncode}")
@@ -103,6 +133,13 @@ class Transport:
     def apple(self, script, *args):
         return self.run(["osascript", "-", *map(str, args)], input=script)
 
+    def cleanup(self, args):
+        """Attempt bounded cleanup without replacing the operation's result."""
+        try:
+            self.run(args, timeout=CLEANUP_TIMEOUT)
+        except (OSError, RuntimeError):
+            print("mac-term: warning: temporary resource cleanup did not complete", file=sys.stderr)
+
     def need_terminal(self):
         if not re.search(r"/Terminal\.app/Contents/MacOS/Terminal$",
                          self.run(["ps", "-axo", "comm="]), re.M):
@@ -110,7 +147,7 @@ class Transport:
 
     @contextmanager
     def prompt_file(self, source):
-        """Use a private unique staging directory and remove it on every exit."""
+        """Use a private staging directory and attempt cleanup on every exit."""
         # Validate the exact staged bytes so edits to the source cannot race SCP.
         data = source.read_bytes()
         validate_prompt(data)
@@ -126,14 +163,17 @@ class Transport:
                 raise Refused("unexpected remote staging directory")
             target = folder + "/prompt.txt"
             try:
-                result = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o",
-                                         "ConnectTimeout=10", str(local),
-                                         f"{self.host}:{target}"], capture_output=True)
+                try:
+                    result = subprocess.run(["scp", "-q", *SSH_OPTIONS, str(local),
+                                             f"{self.host}:{target}"], capture_output=True,
+                                            timeout=SCP_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    raise TransportTimeout(f"scp timed out after {SCP_TIMEOUT}s; no input sent") from None
                 if result.returncode:
                     raise RuntimeError("scp failed; no input sent")
                 yield target
             finally:
-                self.run(["rm", "-rf", "--", folder])
+                self.cleanup(["rm", "-rf", "--", folder])
 
 
 SCREEN_SCRIPT = '''on run argv
@@ -321,7 +361,7 @@ class Controller:
         with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def screen(self, target, tmux=False):
+    def screen(self, target, tmux=False, after_input=False):
         try:
             if tmux:
                 session = self.transport.run(["tmux", "display-message", "-p", "-t", target, "#{session_name}"]).strip()
@@ -335,11 +375,15 @@ class Controller:
                 raise Refused("screen is empty or unreadable")
             return screen
         except (RuntimeError, OSError) as exc:
-            self.record(target, "refused", ["screen-unavailable"])
-            raise Refused("cannot read target screen; no further input sent") from exc
+            self.record(target, "outcome-unknown" if after_input else "refused", ["screen-unavailable"])
+            if after_input:
+                raise OutcomeUnknown("input was attempted but the screen could not be read; "
+                                     "outcome unknown; no further input sent; "
+                                     "read the screen before retrying") from None
+            raise ScreenUnreadable("cannot read target screen; no further input sent") from exc
 
-    def guard(self, target, tmux=False, consume=False):
-        screen = self.screen(target, tmux)
+    def guard(self, target, tmux=False, consume=False, after_input=False):
+        screen = self.screen(target, tmux, after_input=after_input)
         states = prompt_states(screen)
         if re.search(r"Select Model|Select Reasoning", screen):
             states.append("QUESTION")
@@ -365,11 +409,12 @@ class Controller:
             self.override_available = False
         return screen
 
-    def send(self, target, text):
-        self.guard(target, consume=True)
+    def send(self, target, text, after_input=False):
+        # Compound paste calls this after delivering text but before Enter.
+        self.guard(target, consume=True, after_input=after_input)
         self.transport.apple(SEND_SCRIPT, target, text)
         time.sleep(0.8)
-        return self.screen(target)
+        return self.screen(target, after_input=True)
 
     def resolve_pane(self, window):
         if window.startswith(self.session + ":"):
@@ -390,24 +435,22 @@ class Controller:
         with self.transport.prompt_file(source) as path:
             if tmux:
                 buffer = "xmechbay-" + uuid.uuid4().hex
-                loaded = False
                 try:
                     self.transport.run(["tmux", "load-buffer", "-b", buffer, path])
-                    loaded = True
                     self.guard(target, True, consume=True)
                     self.transport.run(["tmux", "paste-buffer", "-p", "-b", buffer, "-t", target])
                     time.sleep(0.8)
-                    self.guard(target, True, consume=True)
+                    self.guard(target, True, consume=True, after_input=True)
                     self.transport.run(["tmux", "send-keys", "-t", target, "Enter"])
                     time.sleep(0.8)
-                    return self.screen(target, True)
+                    return self.screen(target, True, after_input=True)
                 finally:
-                    if loaded:
-                        self.transport.run(["tmux", "delete-buffer", "-b", buffer])
+                    # A timed-out load may still have created this unique buffer.
+                    self.transport.cleanup(["tmux", "delete-buffer", "-b", buffer])
             self.guard(target, consume=True)
             self.transport.apple(PASTE_SCRIPT, target, path)
             time.sleep(0.8)
-            return self.send(target, "")
+            return self.send(target, "", after_input=True)
 
 
 KEYS = {"enter": "", "esc": "\x1b", "ctrlc": "\x03", "ctrld": "\x04",
@@ -460,7 +503,8 @@ def auxiliary_command(args, transport, control, parser):
         seconds = values[1] if len(values) == 2 else "1800"
         if not seconds.isdigit() or not 1 <= int(seconds) <= 86400:
             parser.error("wait-file timeout must be 1..86400 seconds")
-        print(transport.run(["sh", "-c", WAIT_FILE_SCRIPT, "xmechbay", values[0], seconds]).strip())
+        print(transport.run(["sh", "-c", WAIT_FILE_SCRIPT, "xmechbay", values[0], seconds],
+                            timeout=int(seconds) + RUN_TIMEOUT).strip())
         return True
     if command == "open":
         if not 1 <= len(values) <= 2 or any(char in values[0] for char in "\r\n\0"):

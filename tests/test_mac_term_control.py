@@ -56,7 +56,7 @@ class FakeTransport:
         self.events.append(("apple-input", script, *args))
         return ""
 
-    def run(self, args, input=None):
+    def run(self, args, input=None, timeout=None):
         self.events.append(tuple(args))
         if self.failure and args[:2] == self.failure:
             raise RuntimeError("synthetic failure")
@@ -67,6 +67,9 @@ class FakeTransport:
         if args[:2] == ["tmux", "capture-pane"]:
             return self.screen()
         return ""
+
+    def cleanup(self, args):
+        control.Transport.cleanup(self, args)
 
     @contextmanager
     def prompt_file(self, source):
@@ -456,6 +459,243 @@ class AuxiliaryCommandTests(unittest.TestCase):
                         control.main(["cascade", "--w", "600", "--h", "400", "--dry-run"])
         apple.assert_called_once_with(control.ALL_WINDOWS_SCRIPT)
         self.assertIn("would move 123", output.getvalue())
+
+
+class DeadlineTests(unittest.TestCase):
+    """Synthetic subprocess and screen failures; never contact a live target."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.source = Path(self.temp.name) / "prompt.txt"
+        self.source.write_text("/goal synthetic task", encoding="utf-8")
+        sleeping = patch.object(control.time, "sleep")
+        sleeping.start()
+        self.addCleanup(sleeping.stop)
+
+    def controller(self, transport):
+        return control.Controller(transport, "paste", records=Path(self.temp.name), session="fleet")
+
+    def test_local_and_remote_commands_have_deadlines(self):
+        for host in ("local", "worker.example.invalid"):
+            with self.subTest(host=host):
+                with patch.object(control.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 0, "ok", "")) as run:
+                    self.assertEqual(control.Transport(host).run(["true"]), "ok")
+                    self.assertEqual(run.call_args.kwargs.get("timeout"), 120)
+                    if host != "local":
+                        argv = run.call_args.args[0]
+                        for option in ("BatchMode=yes", "ConnectTimeout=10",
+                                       "ServerAliveInterval=15", "ServerAliveCountMax=2"):
+                            self.assertIn(option, argv)
+
+    def test_timeout_is_unknown_and_does_not_disclose_payload(self):
+        for host in ("local", "worker.example.invalid"):
+            with self.subTest(host=host):
+                error = subprocess.TimeoutExpired(["osascript", "synthetic-private-input"], 120,
+                                                  output="synthetic-private-output", stderr="synthetic-private-error")
+                with patch.object(control.subprocess, "run", side_effect=error):
+                    with self.assertRaises(RuntimeError) as raised:
+                        control.Transport(host).apple("synthetic-private-script", "123", "synthetic-private-input")
+                self.assertIsInstance(raised.exception, control.TransportTimeout)
+                self.assertNotIsInstance(raised.exception, control.Refused)
+                self.assertIn("outcome unknown", str(raised.exception))
+                self.assertNotIn("synthetic-private", str(raised.exception))
+                self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_ssh_disconnect_is_unknown_but_local_exit_is_not(self):
+        with patch.object(control.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 255, "private-output", "private-error")):
+            with self.assertRaises(RuntimeError) as remote:
+                control.Transport("worker.example.invalid").run(["tmux", "send-keys", "private-input"])
+            with self.assertRaises(RuntimeError) as local:
+                control.Transport("local").run(["tmux", "send-keys", "private-input"])
+        self.assertIsInstance(remote.exception, control.OutcomeUnknown)
+        self.assertNotIsInstance(local.exception, control.OutcomeUnknown)
+        self.assertNotIn("private-", str(remote.exception))
+        self.assertNotIn("private-", str(local.exception))
+
+    def test_cleanup_is_bounded_and_warning_omits_exception_and_arguments(self):
+        transport = control.Transport("worker.example.invalid")
+        with patch.object(transport, "run", side_effect=OSError("synthetic-private-error")) as run:
+            with redirect_stderr(io.StringIO()) as warning:
+                transport.cleanup(["rm", "-rf", "--", "synthetic-private-path"])
+        self.assertEqual(run.call_args.kwargs, {"timeout": 15})
+        self.assertIn("cleanup", warning.getvalue())
+        self.assertNotIn("synthetic-private", warning.getvalue())
+
+    def test_scp_is_bounded_and_cleanup_cannot_mask_primary_failure(self):
+        transport = control.Transport("worker.example.invalid")
+        primary = RuntimeError("synthetic primary failure")
+        with patch.object(transport, "run",
+                          side_effect=["/tmp/xmechbay-mac-term.ABCD\n", OSError("private cleanup")]) as run:
+            with patch.object(control.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as scp:
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(RuntimeError) as raised:
+                        with transport.prompt_file(self.source):
+                            raise primary
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(scp.call_args.kwargs.get("timeout"), 120)
+        self.assertIn("ServerAliveInterval=15", scp.call_args.args[0])
+        self.assertEqual(run.call_args.kwargs, {"timeout": 15})
+
+    def test_scp_timeout_never_yields_and_still_cleans(self):
+        transport = control.Transport("worker.example.invalid")
+        with patch.object(transport, "run", side_effect=["/tmp/xmechbay-mac-term.ABCD\n", ""]) as run:
+            with patch.object(control.subprocess, "run",
+                              side_effect=subprocess.TimeoutExpired(["scp", "private-path"], 120)):
+                with self.assertRaises(RuntimeError) as raised:
+                    with transport.prompt_file(self.source):
+                        self.fail("a failed copy must not reach the input step")
+        self.assertIsInstance(raised.exception, control.TransportTimeout)
+        self.assertIn("no input sent", str(raised.exception))
+        self.assertNotIn("private-path", str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
+        self.assertEqual(run.call_args.args[0][:3], ["rm", "-rf", "--"])
+        self.assertEqual(run.call_args.kwargs, {"timeout": 15})
+
+    def test_wait_file_deadline_includes_requested_wait(self):
+        for values, timeout in (([], 1920), (["1"], 121), (["86400"], 86520)):
+            with self.subTest(values=values):
+                with patch.object(control.Transport, "run", return_value="ready") as run:
+                    with redirect_stdout(io.StringIO()):
+                        control.main(["-H", "local", "wait-file", "synthetic-output", *values])
+                self.assertEqual(run.call_args.kwargs.get("timeout"), timeout)
+
+    def test_unreadable_screen_before_input_remains_refusal(self):
+        fake = FakeTransport([RuntimeError("synthetic screen error")])
+        with self.assertRaises(control.Refused):
+            self.controller(fake).send("123", "synthetic command")
+        self.assertFalse(any(event[0] == "apple-input" for event in fake.events))
+
+    def test_unreadable_screen_after_send_is_unknown(self):
+        for screen in ("", RuntimeError("synthetic screen error")):
+            with self.subTest(screen=type(screen).__name__):
+                fake = FakeTransport([IDLE, screen])
+                with self.assertRaises(RuntimeError) as raised:
+                    self.controller(fake).send("123", "synthetic command")
+                self.assertIsInstance(raised.exception, control.OutcomeUnknown)
+                self.assertNotIsInstance(raised.exception, control.Refused)
+                self.assertEqual(sum(event[0] == "apple-input" for event in fake.events), 1)
+
+    def test_unreadable_screen_after_paste_stops_before_enter(self):
+        for tmux in (False, True):
+            with self.subTest(tmux=tmux):
+                fake = FakeTransport([IDLE, IDLE, RuntimeError("synthetic screen error")])
+                with self.assertRaises(RuntimeError) as raised:
+                    self.controller(fake).paste("sample-project" if tmux else "123", self.source, tmux)
+                self.assertIsInstance(raised.exception, control.OutcomeUnknown)
+                self.assertNotIsInstance(raised.exception, control.Refused)
+                if tmux:
+                    self.assertFalse(any(event[:2] == ("tmux", "send-keys") for event in fake.events))
+                    self.assertTrue(any(event[:2] == ("tmux", "delete-buffer") for event in fake.events))
+                else:
+                    self.assertEqual(sum(event[0] == "apple-input" for event in fake.events), 1)
+                self.assertEqual(fake.events[-1], ("cleanup",))
+
+    def test_unreadable_screen_after_paste_enter_is_unknown(self):
+        for tmux in (False, True):
+            with self.subTest(tmux=tmux):
+                fake = FakeTransport([IDLE, IDLE, IDLE, ""])
+                with self.assertRaises(RuntimeError) as raised:
+                    self.controller(fake).paste("sample-project" if tmux else "123", self.source, tmux)
+                self.assertIsInstance(raised.exception, control.OutcomeUnknown)
+                if tmux:
+                    self.assertEqual(sum(event[:2] == ("tmux", "send-keys") for event in fake.events), 1)
+                else:
+                    self.assertEqual(sum(event[0] == "apple-input" for event in fake.events), 2)
+                self.assertEqual(fake.events[-1], ("cleanup",))
+
+    def test_screen_failure_receipt_matches_input_phase_without_private_content(self):
+        cases = [
+            ("send", False, 0), ("send", False, 1),
+            ("paste", False, 1), ("paste", False, 2), ("paste", False, 3),
+            ("paste", True, 1), ("paste", True, 2), ("paste", True, 3),
+        ]
+        for index, (operation, tmux, successful_reads) in enumerate(cases):
+            with self.subTest(operation=operation, tmux=tmux, successful_reads=successful_reads):
+                fake = FakeTransport([IDLE] * successful_reads + [RuntimeError("synthetic-private-screen")])
+                controller = self.controller(fake)
+                after_input = successful_reads >= (1 if operation == "send" else 2)
+                expected = control.OutcomeUnknown if after_input else control.Refused
+                with self.assertRaises(expected):
+                    if operation == "send":
+                        controller.send("123", "synthetic-private-command")
+                    else:
+                        controller.paste("sample-project" if tmux else "123", self.source, tmux)
+                raw = next(Path(self.temp.name).glob("mac-term-guard-*.jsonl")).read_text(encoding="utf-8")
+                rows = [json.loads(line) for line in raw.splitlines()]
+                self.assertEqual(len(rows), index + 1)
+                self.assertEqual(rows[-1]["event"], "outcome-unknown" if after_input else "refused")
+                self.assertEqual(rows[-1]["states"], ["screen-unavailable"])
+                self.assertEqual(rows[-1]["target"], "%7" if tmux else "123")
+                self.assertEqual(set(rows[-1]), {"time", "host", "target", "command", "event", "states"})
+                self.assertNotIn("synthetic-private", raw)
+                self.assertNotIn("/goal", raw)
+
+    def test_timed_out_buffer_load_still_cleans_without_pasting(self):
+        fake = FakeTransport()
+        original = fake.run
+
+        def run(args, **kwargs):
+            if args[:2] == ["tmux", "load-buffer"]:
+                fake.events.append(tuple(args))
+                raise control.TransportTimeout("synthetic timeout")
+            return original(args, **kwargs)
+
+        with patch.object(fake, "run", side_effect=run):
+            with self.assertRaises(RuntimeError) as raised:
+                self.controller(fake).paste("sample-project", self.source, True)
+        self.assertIsInstance(raised.exception, control.TransportTimeout)
+        self.assertFalse(any(event[:2] == ("tmux", "paste-buffer") for event in fake.events))
+        self.assertTrue(any(event[:2] == ("tmux", "delete-buffer") for event in fake.events))
+        self.assertEqual(fake.events[-1], ("cleanup",))
+
+    def test_timeout_during_paste_and_failed_cleanup_preserve_original_outcome(self):
+        fake = FakeTransport()
+        original = fake.run
+        primary = control.TransportTimeout("synthetic paste timeout")
+
+        def run(args, **kwargs):
+            if args[:2] == ["tmux", "paste-buffer"]:
+                raise primary
+            if args[:2] == ["tmux", "delete-buffer"]:
+                raise OSError("synthetic-private-error")
+            return original(args, **kwargs)
+
+        with patch.object(fake, "run", side_effect=run):
+            with redirect_stderr(io.StringIO()) as warning:
+                with self.assertRaises(RuntimeError) as raised:
+                    self.controller(fake).paste("sample-project", self.source, True)
+        self.assertIs(raised.exception, primary)
+        self.assertNotIn("synthetic-private-error", warning.getvalue())
+        self.assertFalse(any(event[:2] == ("tmux", "send-keys") for event in fake.events))
+        self.assertEqual(fake.events[-1], ("cleanup",))
+
+    def test_cleanup_failure_does_not_change_verified_success(self):
+        fake = FakeTransport()
+        fake.failure = ["tmux", "delete-buffer"]
+        with redirect_stderr(io.StringIO()) as warning:
+            screen = self.controller(fake).paste("sample-project", self.source, True)
+        self.assertEqual(screen, IDLE)
+        self.assertIn("cleanup", warning.getvalue())
+        self.assertEqual(fake.events[-1], ("cleanup",))
+
+    def test_key_sequence_stops_after_input_timeout(self):
+        fake = FakeTransport()
+        original = fake.apple
+
+        def apple(script, *args):
+            if script == control.SEND_SCRIPT:
+                fake.events.append(("apple-input", script, *args))
+                raise control.TransportTimeout("synthetic timeout")
+            return original(script, *args)
+
+        with patch.object(control, "Transport", return_value=fake):
+            with patch.object(fake, "apple", side_effect=apple):
+                with self.assertRaises(control.TransportTimeout):
+                    control.main(["-H", "local", "key", "123", "enter", "enter"])
+        self.assertEqual(sum(event[0] == "apple-input" for event in fake.events), 1)
 
 
 class ConfigurationTests(unittest.TestCase):
