@@ -47,18 +47,18 @@ findings first; the backlog rows can be long.
 | Owner | Gets | Examples |
 |---|---|---|
 | **user** | Decisions only the user can make | merges, human prompts across any role (approval, question, sign-in, trust, update), unsent composer drafts on claws/MechBay, usage limits, supervisor (`claw`/`mechbay`) or non-Mech stalls, starting a missing claw, dormant Mechs |
-| **claw** (role-routed or explicit owner) | Mech work, read-only closure review, or host-local hygiene | `discovery_supervisor`: bounded discovery/add-record work in `discover` lane; `stewardship_supervisor`: stalls, pauses, failing PRs, PR/issue backlog batching in `steward` lane; `infrastructure_supervisor`: systemic CI cohorts and pinned bootstrap Mechs (`infra` lane); `closure_steward`: read-only diff review of unapproved green PRs and stale-draft triage; `fleet_maintainer`: reachable same-host and multi-host session/storage hygiene |
-| **XMechBay maintenance** | Coordinator-owned observability, unreachable hosts, and unmaintained hosts | unreachable hosts (`reachable: false`), failed resource probes, and host observability/resource/durability/hygiene findings on hosts without a live `fleet_maintainer` claw |
+| **claw** (role-routed or explicit owner) | Mech work, read-only closure review, or host-local hygiene | `discovery_supervisor`: bounded discovery/add-record work in `discover` lane; `stewardship_supervisor`: stalls, pauses, failing PRs, PR/issue backlog batching in `steward` lane; `infrastructure_supervisor`: systemic CI cohorts (`infra` lane) and pinned bootstrap Mechs (`pinned` lane); `closure_steward`: read-only diff review of unapproved green PRs and stale-draft triage; `fleet_maintainer`: reachable same-host session/storage hygiene |
+| **XMechBay maintenance** | Coordinator-owned observability, cross-host hygiene, unreachable hosts, and unmaintained hosts | unreachable hosts (`reachable: false`), failed resource probes, Coordinator GitHub query failures, cross-host duplicate-loop hygiene, and host observability/resource/durability/hygiene findings on hosts without a live `fleet_maintainer` claw |
 
 A Mech's primary writer claw is resolved in this order:
-1. `mech_owner` in the config;
-2. a claw whose `mechs` list explicitly names the Mech;
+1. `mech_owner` in the config (must reference a supervisor/writer claw);
+2. a supervisor/writer claw whose `mechs` list explicitly names the Mech (`pinned` lane);
 3. when any claw declares `roles` (see [`docs/claw-roles.md`](../../../docs/claw-roles.md)),
-   the Mech's observed backlog lane:
-   - `infra` (`>= pr_ci_cohort_min` and `>= pr_ci_cohort_ratio` failing PRs) -> `infrastructure_supervisor` (falling back to `stewardship_supervisor` / `cycle_supervisor`);
-   - `steward` (`open_prs >= pr_backlog_warn`, any failing check, or `open_issues >= issue_steward_warn`) -> `stewardship_supervisor` (or `cycle_supervisor`);
-   - `discover` (healthy queue below those thresholds) -> `discovery_supervisor` (or `cycle_supervisor`);
-   - `unknown` (`--no-issues` or query error) -> host-matched `stewardship_supervisor` / `cycle_supervisor` (never triggers blind discovery);
+   the Mech's observed backlog lane (preferring live matching role claws before offline fallbacks):
+   - `infra` (`>= pr_ci_cohort_min` and `>= pr_ci_cohort_ratio` failing PRs) -> `infrastructure_supervisor` (when `accept_infra_cohorts` is enabled; falls back to `stewardship_supervisor` / `cycle_supervisor`);
+   - `steward` (`open_prs >= pr_backlog_warn`, any failing check, `open_prs > len(prs)`, or `open_issues >= issue_steward_warn`) -> `stewardship_supervisor` (or `cycle_supervisor`);
+   - `discover` (healthy queue below those thresholds with all open PRs observed) -> `discovery_supervisor` (or `cycle_supervisor`);
+   - `unknown` (`--no-issues` or query error) -> `stewardship_supervisor` / `cycle_supervisor` (never triggers blind discovery);
 4. otherwise a catch-all supervisor claw (`"mechs": ["*"]`) on the host running
    the Mech's busiest loop.
 
@@ -130,10 +130,12 @@ explicit yes/no approval in the current conversation.
    dispatch, naming the claws.
 2. Confirm each target. `DISPATCH.md` lists the live claw candidates and
    resolves one only when it is unambiguous and controllable:
-   - more than one claw session on the host, or a `target_hint` that does not
-     match exactly one candidate, leaves it unresolved. Set `target_hint` (a
-     terminal id such as `2725` or `T2725/1`, a tty, or a tmux window name)
-     only after reading the screens and confirming which claw owns the Mechs;
+   - more than one matching claw session on the host, or a `target_hint` that
+     does not match exactly one candidate, leaves it unresolved. Set
+     `target_hint` (a terminal id such as `10` or `T10/1`, a tty, or a tmux
+     session/window selector such as `claw-primary:steward`) or per-claw
+     `tmux_session` only after reading the screens and confirming which claw
+     owns the Mechs;
    - a claw session with an unsent composer draft (`human_block_kind: "draft"`),
      a human prompt (`APPROVAL`, `QUESTION`, `SIGN-IN`, `TRUST-PROMPT`,
      `UPDATE-PROMPT`), or `Goal hit usage limits` is left unresolved so pasting
@@ -176,14 +178,18 @@ ignored `.local/fleet-ops.json` (or set `XMECHBAY_FLEET_OPS_CONFIG`):
   `display_name` and `github`), `repos` for additions or overrides.
 - `hosts.<key>.watch`: extra directories to size on that host, such as a
   campaign's `.temp`. A watched path whose name contains a Mech is routed to
-  that Mech's claw.
+  that Mech's claw when it runs on the same host, or to the host's maintenance
+  owner otherwise.
 - `claws.<key>`: `host`, `label`, `repo` (the claw checkout's basename),
   `mechs` (explicit Mech names, `["*"]` for catch-all supervisors, or `[]` for
   non-catch-all role claws), optional `roles` (`discovery_supervisor`,
   `stewardship_supervisor`, `infrastructure_supervisor`, `closure_steward`,
-  `fleet_maintainer`, `cycle_supervisor`), `brief_dir` on that host, optional
-  `target_hint`, and optional `tmux_session` (when one host runs multiple
-  controller-owned tmux sessions).
+  `fleet_maintainer`, `cycle_supervisor`), optional `accept_infra_cohorts`
+  (boolean controlling whether an `infrastructure_supervisor` receives systemic
+  `infra` cohorts), optional `closure_mechs` (Mech scope override when a claw
+  combines a supervisor role with `closure_steward`), `brief_dir` on that host,
+  optional `target_hint`, and optional `tmux_session` (when one host runs
+  multiple controller-owned tmux sessions).
 - `mech_owner`: explicit Mech-to-claw ownership overrides.
 - `hosts.<key>.tmux_session`: default controller-owned tmux session on that host.
 - `infra_repos`: map of infrastructure repositories (`xmechbay`, `claw`) checked

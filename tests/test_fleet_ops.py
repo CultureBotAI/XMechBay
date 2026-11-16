@@ -976,8 +976,8 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
     def test_two_fleet_four_claw_workload_routing_and_plan_resolution(self):
         cfg = config(
             hosts={
-                "laptop-a": {"tmux_session": "claw-primary"},
-                "laptop-b": {},
+                "laptop-a": {"tmux_session": "claw-primary", "watch": ["~/work/DiscoverMech/.temp"]},
+                "laptop-b": {"watch": ["~/work/HighPrMech/.temp"]},
             },
             claws={
                 "io-discovery": {
@@ -985,7 +985,7 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
                     "label": "IO discovery supervisor",
                     "repo": "sample-claw",
                     "mechs": ["*"],
-                    "target_hint": "8540",
+                    "target_hint": "T10/1",
                     "roles": ["discovery_supervisor"],
                 },
                 "compute-steward": {
@@ -993,7 +993,6 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
                     "label": "Compute stewardship supervisor",
                     "repo": "sample-claw",
                     "mechs": ["*"],
-                    "target_hint": "2457",
                     "tmux_session": "claw-primary",
                     "roles": ["stewardship_supervisor"],
                 },
@@ -1002,7 +1001,6 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
                     "label": "Compute infrastructure supervisor",
                     "repo": "sample-claw",
                     "mechs": ["BootstrapMech"],
-                    "target_hint": "2725",
                     "tmux_session": "claw-secondary",
                     "roles": ["infrastructure_supervisor"],
                 },
@@ -1011,7 +1009,7 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
                     "label": "IO closure steward and maintainer",
                     "repo": "sample-claw",
                     "mechs": [],
-                    "target_hint": "121",
+                    "target_hint": "T20/1",
                     "roles": ["closure_steward", "fleet_maintainer"],
                 },
             },
@@ -1031,26 +1029,32 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
                 "CohortFailMech", "BootstrapMech", "UnobservedMech",
             ],
             "sessions": [
-                session("laptop-a", "claw", "sample-claw", "idle", repo="sample-claw", target="T2457/1",
-                        tmux="claw-primary", window="steward", tty="ttys010"),
-                session("laptop-a", "claw", "sample-claw", "idle", repo="sample-claw", target="T2725/1",
-                        tmux="claw-secondary", window="infra", tty="ttys011"),
-                session("laptop-b", "claw", "sample-claw", "idle", repo="sample-claw", target="T8540/1", tty="ttys019"),
-                session("laptop-b", "claw", "sample-claw", "idle", repo="sample-claw", target="T121/1", tty="ttys037"),
+                session("laptop-a", "claw", "sample-claw", "idle", repo="sample-claw", target="%1",
+                        tmux="claw-primary", window="primary", tty="ttys001"),
+                session("laptop-a", "claw", "sample-claw", "idle", repo="sample-claw", target="%2",
+                        tmux="claw-secondary", window="primary", tty="ttys002"),
+                session("laptop-b", "claw", "sample-claw", "idle", repo="sample-claw", target="T10/1", tty="ttys003"),
+                session("laptop-b", "claw", "sample-claw", "idle", repo="sample-claw", target="T20/1", tty="ttys004"),
                 session("laptop-a", "mech", "DiscoverMech", "idle", target="T101/1"),
                 session("laptop-b", "mech", "DiscoverMech", "idle", target="T102/1"),
                 session("laptop-a", "mech", "HighPrMech", "Goal stalled", target="T103/1"),
                 session("laptop-a", "mech", "HighIssueMech", "Working", target="T104/1"),
                 session("laptop-b", "mech", "SingleFailMech", "Working", target="T105/1"),
                 session("laptop-a", "mech", "CohortFailMech", "Goal stalled", target="T106/1"),
-                session("laptop-b", "mech", "BootstrapMech", "Goal stalled", target="T107/1"),
-                session("laptop-a", "mech", "UnobservedMech", "idle", target="T108/1"),
+                session("laptop-b", "mech", "BootstrapMech", "idle", target="T107/1"),
+                session("laptop-b", "mech", "UnobservedMech", "idle", target="T108/1"),
             ],
         }
         resources = {
-            "laptop-a": healthy_host(swap={"total_gib": 32.0, "used_gib": 30.0}),
-            "laptop-b": healthy_host(swap={"total_gib": 24.0, "used_gib": 22.0},
-                                     codex_sessions={"path": "~/.codex/sessions", "exists": True, "gib": 75.0}),
+            "laptop-a": healthy_host(
+                swap={"total_gib": 32.0, "used_gib": 30.0},
+                watched=[{"path": "~/work/DiscoverMech/.temp", "exists": True, "gib": 150.0}],
+            ),
+            "laptop-b": healthy_host(
+                swap={"total_gib": 24.0, "used_gib": 22.0},
+                codex_sessions={"path": "~/.codex/sessions", "exists": True, "gib": 75.0},
+                watched=[{"path": "~/work/HighPrMech/.temp", "exists": True, "gib": 160.0}],
+            ),
             "workstation-local": {"error": "probe timeout"},
         }
         cohort_prs = [{"number": n, "title": f"Fail {n}", "draft": True, "updated_at": "2026-11-14T00:00:00Z",
@@ -1070,30 +1074,35 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
                 ],
             },
             "HighPrMech": {"repo": "example-org/HighPrMech", "open_issues": 20, "open_prs": 40, "prs": []},
-            "HighIssueMech": {"repo": "example-org/HighIssueMech", "open_issues": 150, "open_prs": 4, "prs": []},
+            "HighIssueMech": {"repo": "example-org/HighIssueMech", "open_issues": 150, "open_prs": None, "prs": []},
             "SingleFailMech": {
                 "repo": "example-org/SingleFailMech",
                 "open_issues": 10,
-                "open_prs": 8,
+                "open_prs": 1,
                 "prs": [{"number": 21, "title": "Broken", "draft": False, "updated_at": "2026-11-15T00:00:00Z",
                          "mergeable": "MERGEABLE", "review": None, "checks": "FAILURE"}],
             },
             "CohortFailMech": {"repo": "example-org/CohortFailMech", "open_issues": 12, "open_prs": 10, "prs": cohort_prs},
-            "BootstrapMech": {"repo": "example-org/BootstrapMech", "open_issues": 0, "open_prs": 1, "prs": []},
+            "BootstrapMech": {"repo": "example-org/BootstrapMech", "open_issues": 0, "open_prs": 0, "prs": []},
             "UnobservedMech": {"repo": "example-org/UnobservedMech", "error": "gh timeout"},
         }
 
         findings = OPS.analyze(payload, resources, issues, cfg)
+        self.assertNotIn("_live_claws", cfg)
         by_title = {f["title"]: f for f in findings}
 
         self.assertEqual(by_title["DiscoverMech: no session is working"]["owner"], {"kind": "claw", "key": "io-discovery"})
         self.assertIn("source discovery", by_title["DiscoverMech: no session is working"]["action"])
         self.assertEqual(by_title["HighPrMech on laptop-a: goal stalled"]["owner"], {"kind": "claw", "key": "compute-steward"})
-        self.assertEqual(by_title["HighIssueMech: 150 open issues, 4 open PRs"]["owner"], {"kind": "claw", "key": "compute-steward"})
+        self.assertEqual(by_title["HighIssueMech: 150 open issues, 0 open PRs"]["owner"], {"kind": "claw", "key": "compute-steward"})
         self.assertEqual(by_title["SingleFailMech: 1 PRs with failing checks"]["owner"], {"kind": "claw", "key": "compute-steward"})
         self.assertEqual(by_title["CohortFailMech: 8 PRs with failing checks"]["owner"], {"kind": "claw", "key": "compute-infra"})
         self.assertEqual(by_title["CohortFailMech on laptop-a: goal stalled"]["owner"], {"kind": "claw", "key": "compute-infra"})
-        self.assertEqual(by_title["BootstrapMech on laptop-b: goal stalled"]["owner"], {"kind": "claw", "key": "compute-infra"})
+        # Pinned BootstrapMech routes to compute-infra and never receives discovery-lane action text when idle
+        self.assertEqual(by_title["BootstrapMech: no session is working"]["owner"], {"kind": "claw", "key": "compute-infra"})
+        self.assertNotIn("source discovery", by_title["BootstrapMech: no session is working"]["action"])
+        self.assertEqual(by_title["BootstrapMech: no session is working"]["evidence"]["mode"], "pinned")
+        # UnobservedMech on laptop-b (where io-discovery runs) still routes to compute-steward, never blind discovery
         self.assertEqual(by_title["UnobservedMech: no session is working"]["owner"], {"kind": "claw", "key": "compute-steward"})
 
         self.assertEqual(by_title["DiscoverMech: 2 PRs mergeable with green checks"]["owner"], {"kind": "user", "key": "merges"})
@@ -1104,10 +1113,13 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
         self.assertEqual(by_title["DiscoverMech: 1 draft PRs untouched for 14+ days"]["owner"],
                          {"kind": "claw", "key": "io-closure-cleanup"})
 
-        # Reachable laptop-b & fleet-wide hygiene route to io-closure-cleanup; laptop-a & unreachable stay on XMechBay
+        # Host-local laptop-b hygiene routes to io-closure-cleanup; coordinator/cross-host & laptop-a stay on XMechBay
         self.assertEqual(by_title["laptop-b: swap 22.0 of 24.0 GiB in use"]["owner"], {"kind": "claw", "key": "io-closure-cleanup"})
         self.assertEqual(by_title["laptop-b: 75.0 GiB of Codex session logs"]["owner"], {"kind": "claw", "key": "io-closure-cleanup"})
-        self.assertEqual(by_title["1 Mechs have live sessions on multiple hosts"]["owner"], {"kind": "claw", "key": "io-closure-cleanup"})
+        self.assertEqual(by_title["laptop-b: 160.0 GiB in a watched path"]["owner"], {"kind": "claw", "key": "io-closure-cleanup"})
+        self.assertEqual(by_title["laptop-a: 150.0 GiB in a watched path"]["owner"], {"kind": "xmechbay", "key": "maintenance"})
+        self.assertEqual(by_title["1 Mechs have live sessions on multiple hosts"]["owner"], {"kind": "xmechbay", "key": "maintenance"})
+        self.assertEqual(by_title["UnobservedMech: GitHub query failed"]["owner"], {"kind": "xmechbay", "key": "maintenance"})
         self.assertEqual(by_title["laptop-a: swap 30.0 of 32.0 GiB in use"]["owner"], {"kind": "xmechbay", "key": "maintenance"})
         self.assertEqual(by_title["workstation-local: session collection unreachable"]["owner"], {"kind": "xmechbay", "key": "maintenance"})
         self.assertEqual(by_title["workstation-local: resource probe failed"]["owner"], {"kind": "xmechbay", "key": "maintenance"})
@@ -1131,13 +1143,99 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
             dispatch = (run / "plan/DISPATCH.md").read_text()
             self.assertIn("XMECHBAY_TMUX_SESSION=claw-primary", dispatch)
             self.assertIn("XMECHBAY_TMUX_SESSION=claw-secondary", dispatch)
+            self.assertIn("fleet-ops/compute-steward/run-two-fleet/brief.md", dispatch)
+            self.assertIn("fleet-ops/compute-infra/run-two-fleet/brief.md", dispatch)
             self.assertIn("## Role boundaries", (run / "plan/briefs/io-discovery.md").read_text())
             self.assertIn("Never merge, push to another session's branch", (run / "plan/briefs/io-closure-cleanup.md").read_text())
+
+    def test_sibling_claw_death_role_fallbacks_closure_scoping_and_cohort_guards(self):
+        cfg = config(
+            infra_repos={"xmechbay": "example-org/XMechBay", "claw": "example-org/claw"},
+            claws={
+                "compute-steward": {
+                    "host": "laptop-a", "repo": "sample-claw", "mechs": ["*"],
+                    "tmux_session": "claw-primary", "roles": ["stewardship_supervisor"],
+                },
+                "compute-infra": {
+                    "host": "laptop-a", "repo": "sample-claw", "mechs": ["BootstrapMech"],
+                    "tmux_session": "claw-secondary", "roles": ["infrastructure_supervisor"],
+                },
+                "io-discovery": {
+                    "host": "laptop-b", "repo": "sample-claw", "mechs": ["*"],
+                    "target_hint": "T10/1", "roles": ["discovery_supervisor"],
+                },
+                "io-closure": {
+                    "host": "laptop-b", "repo": "sample-claw", "mechs": ["ScopedMech"],
+                    "target_hint": "T20/1", "roles": ["closure_steward"],
+                },
+            },
+            mech_owner={"ScopedMech": "io-closure"},  # invalid non-writer mech_owner must warn and fall back
+            thresholds={"pr_backlog_warn": 200},
+        )
+        # claw-secondary and T20/1 are absent while siblings claw-primary and T10/1 stay alive
+        partial_payload = {
+            "hosts": [{"key": "laptop-a", "reachable": True, "errors": [], "health": {"status": "ok", "process_status": "ok"}}],
+            "sessions": [
+                session("laptop-a", "claw", "sample-claw", "idle", repo="sample-claw", target="%1",
+                        tmux="claw-primary", window="primary", tty="ttys001"),
+                session("laptop-b", "claw", "sample-claw", "idle", repo="sample-claw", target="T10/1", tty="ttys003"),
+                session("laptop-a", "mech", "CohortFailMech", "Goal stalled", target="T101/1"),
+                session("laptop-b", "mech", "ScopedMech", "idle", target="T102/1"),
+            ],
+        }
+        cohort_prs = [{"number": n, "title": f"Fail {n}", "draft": True, "updated_at": "2026-11-14T00:00:00Z",
+                       "mergeable": "UNKNOWN", "review": None, "checks": "FAILURE"} for n in range(1, 7)]
+        green_100 = [{"number": n, "title": f"Green {n}", "draft": False, "updated_at": "2026-11-15T00:00:00Z",
+                      "mergeable": "MERGEABLE", "review": None, "checks": "SUCCESS"} for n in range(1, 101)]
+        issues = {
+            "CohortFailMech": {"repo": "example-org/CohortFailMech", "open_issues": 2, "open_prs": 6, "prs": cohort_prs},
+            "ScopedMech": {"repo": "example-org/ScopedMech", "open_issues": 1, "open_prs": 1, "prs": green_100[:1]},
+            "TruncatedMech": {"repo": "example-org/TruncatedMech", "open_issues": 1, "open_prs": 120, "prs": green_100},
+        }
+        live = OPS.live_claws(partial_payload["sessions"], cfg)
+        self.assertEqual(live, {"compute-steward", "io-discovery"})
+        self.assertEqual(OPS.mech_mode("TruncatedMech", issues["TruncatedMech"], cfg["thresholds"]), "steward")
+
+        findings = OPS.analyze(partial_payload, {}, issues, cfg)
+        by_title = {f["title"]: f for f in findings}
+        # Missing sibling claws are flagged even though another claw runs on the same host
+        self.assertIn("claw compute-infra has no live session on laptop-a", by_title)
+        self.assertIn("claw io-closure has no live session on laptop-b", by_title)
+        # Dead compute-infra falls back to live compute-steward for CohortFailMech
+        self.assertEqual(by_title["CohortFailMech: 6 PRs with failing checks"]["owner"], {"kind": "claw", "key": "compute-steward"})
+        # Non-writer io-closure never captures writer ownership or pinned lane of ScopedMech
+        self.assertIn("mech_owner assigns ScopedMech to non-writer claw 'io-closure'", by_title)
+        self.assertEqual(OPS.mech_lane_label("ScopedMech", cfg, issues=issues), "discover")
+        self.assertEqual(by_title["ScopedMech: no session is working"]["owner"], {"kind": "claw", "key": "io-discovery"})
+
+        recs = OPS.synthesize_recommendations(partial_payload, {}, issues, findings, cfg, source_mode="disabled")
+        by_rule = {r["rule"]: r for r in recs}
+        self.assertEqual(by_rule["R-CLAW-DISPATCH"]["evidence"]["dead_claws"], ["compute-infra", "io-closure"])
+
+        # Combined supervisor + closure_steward reviews green PRs fleet-wide unless closure_mechs narrows it;
+        # accept_infra_cohorts=False keeps cohorts on stewardship_supervisor
+        combined_cfg = config(
+            claws={
+                "steward": {"host": "h1", "repo": "claw", "mechs": ["*"], "roles": ["stewardship_supervisor"]},
+                "infra-closure": {
+                    "host": "h2", "repo": "claw", "mechs": ["BootstrapMech"], "accept_infra_cohorts": False,
+                    "roles": ["infrastructure_supervisor", "closure_steward"],
+                },
+            },
+            mech_owner={},
+        )
+        live_both = {"steward", "infra-closure"}
+        self.assertEqual(OPS.claw_for_mech("CohortFailMech", {}, combined_cfg, live_both, issues=issues), "steward")
+        self.assertEqual(OPS.claw_for_mech("BootstrapMech", {}, combined_cfg, live_both, issues=issues), "infra-closure")
+        self.assertEqual(OPS.closure_claw_for_mech("ScopedMech", combined_cfg, live=live_both), "infra-closure")
 
     def test_role_config_validation_and_dead_role_claw_fallback(self):
         cfg = config(
             claws={
-                "bad-claw": {"host": "h1", "mechs": "not-a-list", "roles": ["unknown_role", ""], "tmux_session": "  "},
+                "bad-claw": {
+                    "host": "h1", "mechs": "not-a-list", "closure_mechs": [""],
+                    "accept_infra_cohorts": "false", "roles": ["unknown_role", ""], "tmux_session": "bad:name",
+                },
                 "dup-1": {"host": "h1", "mechs": ["*"], "roles": ["discovery_supervisor"]},
                 "dup-2": {"host": "h1", "mechs": ["*"], "roles": ["discovery_supervisor"]},
                 "offline-closure": {"host": "h2", "repo": "claw-off", "mechs": [], "roles": ["closure_steward", "fleet_maintainer"]},
@@ -1165,9 +1263,11 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
         findings = OPS.analyze(payload, {}, issues, cfg)
         by_title = {f["title"]: f for f in findings}
         self.assertIn("claw 'bad-claw' mechs must be a list of non-empty strings", by_title)
+        self.assertIn("claw 'bad-claw' closure_mechs must be a list of non-empty strings", by_title)
+        self.assertIn("claw 'bad-claw' accept_infra_cohorts must be a boolean", by_title)
         self.assertIn("claw 'bad-claw' roles must be a list of non-empty strings", by_title)
         self.assertIn("claw 'bad-claw' names unknown role 'unknown_role'", by_title)
-        self.assertIn("claw 'bad-claw' tmux_session must be a non-empty string", by_title)
+        self.assertIn("claw 'bad-claw' tmux_session must be a valid session name", by_title)
         self.assertIn("host 'h1' assigns role 'discovery_supervisor' to multiple claws (dup-1, dup-2)", by_title)
         # Dead offline-closure claw does not capture h2 maintenance, green PR review, or stale drafts
         self.assertEqual(by_title["h2: session collection partial (tmux_probe_failed)"]["owner"], {"kind": "xmechbay", "key": "maintenance"})
