@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "command(git status --short)",
+      "command(regex:python3 -c [\\s\\S]+)",
+      "read_file(examples/demo-repo)"
+    ],
+    "ask": [
+      "command(regex:git push .+)",
+      "unsandboxed(regex:python3 .+)"
+    ],
+    "deny": [
+      "read_file(.local/credentials)",
+      "write_file(.local/credentials)"
+    ]
+  }
+}

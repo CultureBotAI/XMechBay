@@ -1,0 +1,17 @@
+# Local deployment configuration and operational evidence never belong in Git.
+.local/
+.env
+.env.*
+!.env.example
+records/
+goals/
+hosts/
+*.log
+*.out
+*.bundle
+*.bak
+*.bak-*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store

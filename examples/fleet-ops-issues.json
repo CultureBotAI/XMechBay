@@ -1,0 +1,7 @@
+{
+  "SampleMech": {"repo": "example-org/SampleMech", "open_issues": 41, "open_prs": 30, "prs": [
+    {"number": 101, "title": "Add example records", "draft": false, "updated_at": "2026-01-14T10:00:00Z", "mergeable": "MERGEABLE", "review": null, "checks": "SUCCESS"},
+    {"number": 102, "title": "Repair example export", "draft": false, "updated_at": "2026-01-14T11:00:00Z", "mergeable": "MERGEABLE", "review": null, "checks": "FAILURE"},
+    {"number": 90, "title": "Old exploratory draft", "draft": true, "updated_at": "2025-11-01T09:00:00Z", "mergeable": "CONFLICTING", "review": null, "checks": null}]},
+  "OtherMech": {"repo": "example-org/OtherMech", "open_issues": 3, "open_prs": 0, "prs": []}
+}

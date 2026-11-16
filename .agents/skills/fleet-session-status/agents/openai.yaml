@@ -1,0 +1,6 @@
+interface:
+  display_name: "Fleet Session Status"
+  short_description: "Local HTML symbol dashboard and host session tables"
+  default_prompt: "Use $fleet-session-status to refresh the local MechBay HTML dashboard or show compact status tables for the requested Macs."
+policy:
+  allow_implicit_invocation: true

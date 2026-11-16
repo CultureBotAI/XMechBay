@@ -1,0 +1,1820 @@
+#!/usr/bin/env python3
+"""Fleet operations: observe the whole Mech fleet and delegate work to its claws.
+
+`observe` gathers three read-only views and ranks what needs attention:
+  * sessions  - every agent session on every configured Mac, reusing the
+                fleet-session-status collector (or a running dashboard, or a file);
+  * resources - disk, swap, load, temporary-root growth, tmp-state guard health,
+                Time Machine local snapshots and transcript retention per host
+                (host_resources_probe.py, run locally or piped over SSH);
+  * backlog   - open issues and pull requests of every Mech repository (GitHub
+                GraphQL in batches of three repositories, newest 100 PRs each; the
+                repository list comes from the claw fleet manifest and/or the config).
+Each finding gets a severity, a category and an owner: the user (merge
+decisions, human prompts, usage), the claw responsible for the Mech, or
+XMechBay maintenance (host resources and durability).
+
+`plan` turns a run's findings into one brief per claw, a short goal (under 1000
+characters) that points the claw at its brief, a list of user decisions, a
+maintenance list, and the exact guarded commands to stage and paste each goal.
+It sends nothing: dispatch is a separate, approved step (see SKILL.md).
+
+`recommend` synthesizes a run's sessions, resources, backlog and findings into
+systemic infrastructure, supervision, workflow and capacity conclusions, checks
+open GitHub issues across XMechBay, claw and affected Mech repositories to avoid
+duplicates, and writes RECOMMENDATIONS.md, ISSUE_DRAFTS.md and
+recommendations.json under <run>/recommendations/ without creating issues.
+
+Inputs: a private config (default .local/fleet-ops.json; see
+examples/fleet-ops.json). Outputs: a run directory (default
+.local/fleet-ops/runs/<UTC>/) holding sessions.json, resources.json,
+issues.json, findings.json and REPORT.md, plus plan/ and recommendations/.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[3]  # <root>/.agents/skills/fleet-ops/scripts
+STATUS_SCRIPTS = ROOT / ".agents/skills/fleet-session-status/scripts"
+PROBE = HERE / "host_resources_probe.py"
+GOAL_LIMIT = 1000
+
+DEFAULT_THRESHOLDS = {
+    "disk_critical_gib": 50,      # near the tmp-state guard's 50 GB (46.6 GiB) backup floor
+    "disk_warn_gib": 100,
+    "swap_warn_ratio": 0.8,
+    "swap_warn_min_gib": 4,
+    "tmp_root_warn_gib": 10,
+    "watch_warn_gib": 100,
+    "codex_sessions_warn_gib": 40,
+    "guard_stale_hours": 36,
+    "idle_sessions_warn": 12,
+    "non_working_sessions_warn": 20,
+    "blind_sessions_warn": 2,
+    "achieved_goal_age_hours": 12,
+    "pr_stale_days": 14,
+    "pr_backlog_warn": 25,
+    "pr_ci_cohort_min": 5,
+    "pr_ci_cohort_ratio": 0.5,
+}
+DEFAULT_INFRA_REPOS = {
+    "xmechbay": "CultureBotAI/XMechBay",
+    "claw": "CultureBotAI/culturebotai-claw",
+}
+SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
+PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2}
+HUMAN_PROMPTS = ("APPROVAL", "QUESTION", "SIGN-IN", "TRUST-PROMPT", "UPDATE-PROMPT")
+ACTIVE_STATES = ("Pursuing goal", "Working", "Goal stalled", "Goal paused", "Goal hit usage limits") + HUMAN_PROMPTS
+REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+MACOS_ROOT_SYMLINKS = {Path("/tmp"), Path("/var"), Path("/etc")}
+GENERIC_HOST_TOKENS = {
+    "local", "localhost", "fleet", "main", "host", "hosts", "mac", "work", "ssh", "tmux", "claw", "mech", "mechs",
+    "worker", "workers", "server", "servers", "session", "sessions", "status", "report", "agent", "agents",
+    "python", "github", "default", "example", "invalid",
+}
+CREDENTIAL_TOKEN_RE = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{16,})\b"
+)
+PRIVATE_KEY_HEADER_RE = re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----")
+CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"(?im)((?:^|(?<=[\s,;|{(\[]))[\"']?(?:api_key|access_token|refresh_token|client_secret|password)[\"']?\s*[:=]\s*[\"']?)([A-Za-z0-9_+/=-]{16,})"
+)
+EMAIL_OR_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_])@*(?P<email>[A-Za-z0-9_][\w.+-]*@(?:[\w-]+\.)+[A-Za-z]{2,})(?![.-]?[A-Za-z0-9_])"
+)
+LOCAL_HOSTNAME_RE = re.compile(r"(?i)\b[A-Za-z0-9][A-Za-z0-9.-]*\.local\b(?![.-]?[A-Za-z0-9])")
+PRIVATE_IP_RE = re.compile(
+    r"(?<!\d)(?<!\d\.)(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?!(?:\.\d|\d))"
+)
+UNIX_LOCAL_PATH_RE = re.compile(
+    r"(?i)(?:~[A-Za-z0-9_.-]*/|/(?:Users|home|Volumes)/|/private/var/(?:folders|tmp)/|/var/(?:folders|tmp)/|/private/tmp/|/tmp/)[^\s)\]>\"'`,;]*[^\s)\]>\"'`,;.:]"
+)
+WIN_LOCAL_PATH_RE = re.compile(
+    r"(?i)\b[A-Z]:[\\/](?:Users|Documents and Settings)[\\/][^\s)\]>\"'`,;]*[^\s)\]>\"'`,;.:]"
+)
+
+
+def is_valid_repo_slug(repo: object) -> bool:
+    return isinstance(repo, str) and bool(REPO_SLUG_RE.fullmatch(repo)) and ".." not in repo
+
+
+# --------------------------------------------------------------------------- config
+
+def load_config(path: Path) -> dict:
+    config = json.loads(Path(path).read_text())
+    if not isinstance(config, dict) or config.get("schema_version") != 1:
+        raise SystemExit("fleet-ops config must be a JSON object with schema_version 1")
+    config["_dir"] = str(Path(path).resolve().parent)
+    sections = {}
+    for key in ("thresholds", "infra_repos", "claws", "hosts", "mech_owner", "repos"):
+        raw = config.get(key)
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise SystemExit(f"fleet-ops config {key!r} must be a JSON object")
+        sections[key] = raw
+    for key, val in sections["infra_repos"].items():
+        if key not in DEFAULT_INFRA_REPOS:
+            raise SystemExit(f"infra_repos key must be one of {sorted(DEFAULT_INFRA_REPOS)}, got {key!r}")
+        if not is_valid_repo_slug(val):
+            raise SystemExit(f"infra_repos[{key!r}] must be OWNER/REPO, got {val!r}")
+    for section_name in ("claws", "hosts"):
+        cleaned_section = {}
+        for subkey, subval in sections[section_name].items():
+            if subval is None:
+                subval = {}
+            if not isinstance(subval, dict):
+                raise SystemExit(f"fleet-ops config {section_name}[{subkey!r}] must be a JSON object")
+            cleaned_section[subkey] = dict(subval)
+        sections[section_name] = cleaned_section
+    config["thresholds"] = {**DEFAULT_THRESHOLDS, **sections["thresholds"]}
+    config["infra_repos"] = {**DEFAULT_INFRA_REPOS, **sections["infra_repos"]}
+    config["claws"] = sections["claws"]
+    config["hosts"] = sections["hosts"]
+    for key in ("mech_owner", "repos"):
+        config[key] = dict(sections[key])
+    return config
+
+
+def resolve_path(config: dict, value: str | None) -> Path | None:
+    if not value:
+        return None
+    path = Path(os.path.expanduser(value))
+    return path if path.is_absolute() else Path(config["_dir"]) / path
+
+
+def manifest_repos(text: str) -> dict:
+    """Map display_name -> owner/repo from the claw fleet manifest's `mechs:` section (no YAML dependency)."""
+    repos, name, in_mechs = {}, None, False
+    for line in text.splitlines():
+        if re.match(r"^\S", line):
+            in_mechs = line.startswith("mechs:")
+            continue
+        if not in_mechs:
+            continue
+        if re.match(r"^  [A-Za-z0-9_-]+:\s*$", line):
+            name = None
+        match = re.match(r"^    (display_name|github):\s*(\S+)\s*$", line)
+        if match and match.group(1) == "display_name":
+            name = match.group(2)
+        elif match and name:
+            repos[name] = match.group(2)
+    return repos
+
+
+def fleet_repos(config: dict) -> dict:
+    repos = {}
+    manifest = resolve_path(config, config.get("fleet_manifest"))
+    if manifest and manifest.exists():
+        repos.update(manifest_repos(manifest.read_text()))
+    repos.update(config.get("repos", {}))
+    return repos
+
+
+# --------------------------------------------------------------------------- collection
+
+def collect_sessions(args, config: dict) -> dict:
+    if args.status_json:
+        return json.loads(Path(args.status_json).read_text())
+    if args.dashboard_url:
+        with urllib.request.urlopen(args.dashboard_url.rstrip("/") + "/api/status", timeout=120) as response:
+            return json.loads(response.read().decode())
+    sys.path.insert(0, str(STATUS_SCRIPTS))
+    import fleet_dashboard  # noqa: E402  (sibling skill; shares its collector)
+    status_config = None if args.snapshot else resolve_path(config, config.get("fleet_status_config"))
+    reports, meta = fleet_dashboard.collect_dashboard_reports(
+        config_path=status_config, snapshot_path=args.snapshot)
+    return fleet_dashboard.build_dashboard_payload(reports, mode=meta["mode"], role_overrides=meta["role_overrides"])
+
+
+def status_hosts(config: dict) -> dict:
+    path = resolve_path(config, config.get("fleet_status_config"))
+    if not path or not path.exists():
+        return {}
+    raw = json.loads(path.read_text())
+    hosts = raw.get("hosts") if isinstance(raw, dict) else None
+    return hosts if isinstance(hosts, dict) else {}
+
+
+def probe_host(key: str, host_cfg: dict, watch: list, timeout: int = 1800) -> dict:
+    args = []
+    for item in watch:
+        args += ["--watch", item]
+    python = host_cfg.get("python", "/usr/bin/python3")
+    if host_cfg.get("transport") == "local":
+        cmd = [python, str(PROBE)] + args
+        stdin = None
+    else:
+        destination = host_cfg.get("host")
+        if not destination:
+            return {"error": "no ssh host configured"}
+        # The remote command is parsed by the remote shell: quote every word (no expansion, UTF-8 kept).
+        remote = " ".join(shlex.quote(word) for word in [python, "-"] + args)
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", destination, remote]
+        stdin = PROBE.open()
+    try:
+        proc = subprocess.run(cmd, stdin=stdin, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"error": "probe timeout"}
+    finally:
+        if stdin:
+            stdin.close()
+    if proc.returncode != 0:
+        return {"error": f"probe exit {proc.returncode}: {proc.stderr.strip()[-300:]}"}
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return {"error": "probe output is not JSON: " + proc.stdout.strip()[:120]}
+
+
+def collect_resources(config: dict, host_keys: list) -> dict:
+    hosts = status_hosts(config)
+    out = {}
+    for key in host_keys:
+        if key not in hosts:
+            out[key] = {"error": "host missing from fleet-status config"}
+            continue
+        out[key] = probe_host(key, hosts[key], config["hosts"].get(key, {}).get("watch", []))
+    return out
+
+
+ISSUES_QUERY_PART = """
+  r{i}: repository(owner: "{owner}", name: "{name}") {{
+    nameWithOwner
+    issues(states: OPEN) {{ totalCount }}
+    pullRequests(states: OPEN, first: 100, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+      totalCount
+      nodes {{ number title isDraft updatedAt mergeable reviewDecision
+               commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }}
+    }}
+  }}"""
+
+
+def graphql(chunk: list) -> tuple:
+    parts = []
+    for i, (_, full) in enumerate(chunk):
+        owner_name, _, name = full.partition("/")
+        parts.append(ISSUES_QUERY_PART.format(i=i, owner=owner_name, name=name))
+    query = "query {" + "".join(parts) + "\n}"
+    try:
+        proc = subprocess.run(["gh", "api", "graphql", "-f", f"query={query}"], capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return {}, "gh timeout"
+    try:
+        return json.loads(proc.stdout or "{}").get("data") or {}, (proc.stderr or "no data").strip()[-200:]
+    except ValueError:
+        return {}, (proc.stderr or proc.stdout or "unparseable response").strip()[-200:]
+
+
+def collect_issues(repos: dict, batch: int = 3) -> dict:
+    """Open issue counts and open PRs per repository via `gh api graphql`; a failed batch is retried repo by repo."""
+    out, items = {}, sorted(repos.items())
+    for start in range(0, len(items), batch):
+        chunk = items[start:start + batch]
+        data, error = graphql(chunk)
+        errors = {i: error for i in range(len(chunk))}
+        if not data and len(chunk) > 1:
+            for i, single in enumerate(chunk):
+                single_data, single_error = graphql([single])
+                if single_data.get("r0"):
+                    data[f"r{i}"] = single_data["r0"]
+                else:
+                    errors[i] = single_error  # each repository keeps its own error text
+        for i, (mech, full) in enumerate(chunk):
+            repo = data.get(f"r{i}")
+            if not repo:
+                out[mech] = {"repo": full, "error": errors[i]}
+                continue
+            prs = []
+            for node in repo["pullRequests"]["nodes"]:
+                commits = node.get("commits", {}).get("nodes") or [{}]
+                rollup = ((commits[-1].get("commit") or {}).get("statusCheckRollup") or {}).get("state")
+                prs.append({"number": node["number"], "title": node["title"], "draft": node["isDraft"],
+                            "updated_at": node["updatedAt"], "mergeable": node["mergeable"],
+                            "review": node["reviewDecision"], "checks": rollup})
+            out[mech] = {"repo": full, "open_issues": repo["issues"]["totalCount"],
+                         "open_prs": repo["pullRequests"]["totalCount"], "prs": prs}
+    return out
+
+
+# --------------------------------------------------------------------------- ownership
+
+def mech_sessions(sessions: list | None) -> dict:
+    by_mech = defaultdict(list)
+    for row in (sessions or []):
+        if not isinstance(row, dict):
+            continue
+        proj = row.get("project_label")
+        if row.get("role") == "mech" and not row.get("stale_cached") and isinstance(proj, str) and proj:
+            by_mech[proj].append(row)
+    return by_mech
+
+
+def claw_for_mech(mech: str, by_mech: dict, config: dict, live: set | None = None) -> str | None:
+    """Explicit owner, then a claw listing the Mech, then a catch-all claw on the host of its busiest loop.
+
+    Only configured claws are returned (an unknown `mech_owner` value is ignored; config_findings reports it),
+    and among catch-all candidates a claw with a live session (`live`) is preferred."""
+    claws = config["claws"]
+    explicit = config["mech_owner"].get(mech)
+    if explicit in claws:
+        return explicit
+    for key, claw in sorted(claws.items()):
+        if isinstance(claw, dict) and mech in (claw.get("mechs") or []):
+            return key
+    rows = by_mech.get(mech, [])
+    ranked = sorted(rows, key=lambda r: (not str(r.get("status", "")).startswith(ACTIVE_STATES), str(r.get("host_key") or "")))
+    candidates = []
+    for row in ranked:
+        row_host = row.get("host_key")
+        if not isinstance(row_host, str) or not row_host:
+            continue
+        for key, claw in sorted(claws.items()):
+            if (isinstance(claw, dict) and isinstance(claw.get("host"), str) and claw["host"] == row_host
+                    and "*" in (claw.get("mechs") or ["*"]) and key not in candidates):
+                candidates.append(key)
+    if live is not None:
+        alive = [key for key in candidates if key in live]
+        if alive:
+            return alive[0]
+    return candidates[0] if candidates else None
+
+
+def live_claws(sessions: list | None, config: dict) -> set:
+    return {key for key, claw in config["claws"].items() if claw_targets({"sessions": sessions or []}, claw)}
+
+
+def owner(kind: str, key: str | None = None) -> dict:
+    return {"kind": kind, "key": key}
+
+
+def mech_owner(mech: str, by_mech: dict, config: dict) -> dict:
+    key = claw_for_mech(mech, by_mech, config, config.get("_live_claws"))
+    return owner("claw", key) if key else owner("user", "unassigned-mech")
+
+
+def config_findings(config: dict) -> list:
+    """Configuration errors that would misroute work."""
+    out = []
+    for mech, key in sorted(config["mech_owner"].items()):
+        if key not in config["claws"]:
+            out.append(finding("warning", "observation", f"mech_owner names unknown claw {key!r} for {mech}",
+                               "Fix the config; the Mech falls back to the default ownership rules.", owner("user", "config"), mech=mech))
+    for key, claw in sorted(config["claws"].items()):
+        if not isinstance(claw, dict) or not claw.get("host"):
+            out.append(finding("warning", "observation", f"claw {key!r} has no host", "Set its host in the config.", owner("user", "config")))
+    return out
+
+
+# --------------------------------------------------------------------------- rules
+
+def finding(severity, category, title, action, owner_, host=None, mech=None, evidence=None):
+    return {"severity": severity, "category": category, "host": host, "mech": mech, "owner": owner_,
+            "title": title, "evidence": evidence or {}, "action": action}
+
+
+def parse_time(value: str) -> datetime:
+    """ISO timestamp as an aware datetime; a timestamp without a zone is taken as UTC."""
+    stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def mech_in_path(path: str, mechs) -> str | None:
+    """The Mech named by a component of the path (case-insensitive); the longest name wins."""
+    parts = {part.lower() for part in Path(path).parts}
+    hits = [m for m in mechs if m and m.lower() in parts]
+    return max(hits, key=len) if hits else None
+
+
+def resource_findings(resources: dict, config: dict, by_mech: dict, mechs=()) -> list:
+    t, out = config["thresholds"], []
+    maint = owner("xmechbay", "maintenance")
+    for host, r in sorted(resources.items()):
+        if r.get("error"):
+            out.append(finding("warning", "observation", f"{host}: resource probe failed", "Fix SSH/probe access; treat the host as unobserved.", maint, host, evidence={"error": r["error"]}))
+            continue
+        free = (r.get("disk") or {}).get("free_gib")
+        tmp = {root["path"]: root for root in r.get("tmp_roots", [])}
+        if free is None:
+            out.append(finding("warning", "observation", f"{host}: free space unknown", "Check df on the host; treat disk as unobserved.", maint, host))
+        elif free < t["disk_warn_gib"]:
+            sev = "critical" if free < t["disk_critical_gib"] else "warning"
+            out.append(finding(sev, "resources", f"{host}: {free} GiB free on the data volume",
+                               "Run a read-only space review (fleet-repo-crud-cleanup / disk-usage-report), then delete only approved, verified-regenerable items; pause disk-heavy jobs (KG builds, full-corpus validations) on this host.",
+                               maint, host, evidence={"disk": r["disk"], "tmp_roots": [{"path": p, "gib": v.get("gib"), "top": v.get("children", [])[:3]} for p, v in tmp.items()],
+                                                       "watched": r.get("watched", []), "local_snapshots": r.get("local_snapshots")}))
+            if r.get("local_snapshots"):
+                out.append(finding("info", "resources", f"{host}: {r['local_snapshots']} Time Machine local snapshots",
+                                   "Deleting files frees space only as these snapshots expire (about 24 h); verify recovery the next day, not right after deletion.", maint, host))
+        swap = r.get("swap") or {}
+        if swap.get("total_gib") and swap.get("used_gib") is not None:
+            if swap["used_gib"] >= t["swap_warn_min_gib"] and swap["used_gib"] / swap["total_gib"] >= t["swap_warn_ratio"]:
+                out.append(finding("warning", "resources", f"{host}: swap {swap['used_gib']} of {swap['total_gib']} GiB in use",
+                                   "Swap files live on the same disk. Find the memory-heavy job; restart long-lived idle sessions only at an owned idle checkpoint (graceful exit protocol).", maint, host, evidence={"swap": swap, "memory_gib": r.get("memory_gib")}))
+        sized = [(p, root, "tmp_root_warn_gib") for p, root in tmp.items()] + [(w.get("path"), w, "watch_warn_gib") for w in r.get("watched", [])]
+        codex = r.get("codex_sessions") or {}
+        if codex.get("exists", True):
+            sized.append((codex.get("path", "~/.codex/sessions"), codex, "codex_sessions_warn_gib"))
+        for path, item, limit in sized:
+            gib = item.get("gib")
+            if gib is None:
+                if item.get("exists", True):  # a du timeout is unknown, never zero
+                    out.append(finding("warning", "observation", f"{host}: size of {path} unknown ({item.get('error', 'not measured')})",
+                                       "Measure it with a longer timeout; a directory too big to size in time is itself suspect.", maint, host, evidence={"path": path}))
+                continue
+            if gib < t[limit]:
+                continue
+            if limit == "tmp_root_warn_gib":
+                out.append(finding("warning", "hygiene", f"{host}: {gib} GiB in {path}",
+                                   "Temporary roots are purged by macOS and hold only scratch: point test basetemps and work dirs at a repository .temp/ or ~/agent-work, then remove verified scratch.", maint, host, evidence={"top": item.get("children", [])}))
+            elif limit == "watch_warn_gib":
+                mech = mech_in_path(path, set(by_mech) | set(mechs))
+                out.append(finding("warning", "resources", f"{host}: {gib} GiB in a watched path",
+                                   "Ask the owning session for a retention inventory (what it still needs), then archive or delete with approval.",
+                                   mech_owner(mech, by_mech, config) if mech else maint, host, mech, evidence={"path": path}))
+            else:
+                out.append(finding("info", "resources", f"{host}: {gib} GiB of Codex session logs",
+                                   "Archive closed rollouts older than 14 days into verified per-day tar.zst files, then remove the originals with approval.", maint, host))
+        guard = r.get("guard") or {}
+        if not guard.get("installed"):
+            out.append(finding("warning", "durability", f"{host}: tmp-state guard not installed",
+                               "Install it (scripts/install_tmp_state_guard.py --install --notify) so agent work left in temporary roots is copied before macOS purges it.", maint, host))
+        elif not guard.get("status"):
+            out.append(finding("warning", "durability", f"{host}: tmp-state guard installed but has no report",
+                               "Check the LaunchAgent (launchctl print) and launchd-stderr.log; the guard may never have run.", maint, host))
+        else:
+            skipped, failed = guard.get("skipped") or {}, guard.get("failed") or 0
+            if skipped or failed or guard.get("exit_code") == 20 or guard.get("status") == "unrescued":
+                out.append(finding("critical", "durability", f"{host}: tmp-state guard left at-risk work unrescued (skipped {sum(skipped.values())}, failed {failed})",
+                                   "Unrescued work in temporary roots can be purged at the next cleaner run; free space above the guard floor or rescue the entries by hand.", maint, host, evidence={"skipped": skipped, "failed": failed}))
+            elif guard.get("exit_code") == 30 or guard.get("status") == "incomplete":
+                out.append(finding("info", "durability", f"{host}: tmp-state guard run incomplete ({guard.get('unknown', 0)} unknown entries)",
+                                   "Read latest.json for the unknown entries and check whether their source directories still exist.", maint, host))
+            finished = guard.get("finished_at")
+            if finished:
+                age_h = (datetime.now(timezone.utc) - parse_time(finished)).total_seconds() / 3600
+                if age_h > t["guard_stale_hours"]:
+                    out.append(finding("warning", "durability", f"{host}: tmp-state guard report is {age_h:.0f} h old",
+                                       "Check the LaunchAgent (launchctl print) and launchd-stderr.log.", maint, host))
+        retention = r.get("claude_cleanup_period_days") or {}
+        short = {k: (v if isinstance(v, int) else "default 30") for k, v in retention.items()
+                 if v in (None, "absent") or (isinstance(v, int) and v < 365)}
+        if short:
+            days = ", ".join(f"{k}: {v} days" for k, v in sorted(short.items()))
+            out.append(finding("warning", "durability", f"{host}: Claude Code deletes old transcripts ({days})",
+                               "Archive transcripts, then raise cleanupPeriodDays (back up settings.json first).", maint, host, evidence=retention))
+    return out
+
+
+def has_composer_draft(row: dict) -> bool:
+    return row.get("human_block_kind") == "draft" or "draft" in (row.get("flags") or ())
+
+
+def is_blind_process_row(row: dict) -> bool:
+    target = str(row.get("target_short") or "")
+    return (row.get("transport") == "process" or target.startswith("P")) and not row.get("tmux_session")
+
+
+def is_live_host_observation(payload: dict, host: dict) -> bool:
+    return payload.get("mode") != "snapshot" and not bool(host.get("snapshot_stale"))
+
+
+def parked_achieved_seconds(row: dict) -> float:
+    """Seconds a session screen has remained unchanged at Goal achieved (-1 when unknown or freshly changed)."""
+    wait = row.get("wait_seconds")
+    if isinstance(wait, (int, float)) and not isinstance(wait, bool):
+        return float(wait)
+    delta = row.get("delta")
+    if isinstance(delta, dict) and delta.get("kind") == "unchanged":
+        sec = delta.get("seconds")
+        if isinstance(sec, (int, float)) and not isinstance(sec, bool):
+            return float(sec)
+    return -1.0
+
+
+def host_observation_findings(payload: dict, config: dict) -> list:
+    t, out = config["thresholds"], []
+    maint = owner("xmechbay", "maintenance")
+    raw_hosts = [h for h in (payload.get("hosts") or []) if isinstance(h, dict)]
+    for host in sorted(raw_hosts, key=lambda h: str(h.get("key") or "")):
+        key = host.get("key")
+        if not isinstance(key, str) or not key:
+            continue
+        if host.get("reachable") is False:
+            out.append(finding("critical", "observation", f"{key}: session collection unreachable",
+                               "Restore SSH or local probe access; cached rows are not live state.", maint, key,
+                               evidence={"errors": host.get("errors") or [], "last_reachable": host.get("last_reachable")}))
+            continue
+        errors = list(host.get("errors") or [])
+        inv = host.get("inventory_state")
+        if errors or inv == "partial":
+            codes = ", ".join(str(e) for e in (errors or [inv]))
+            out.append(finding("warning", "observation", f"{key}: session collection partial ({codes})",
+                               "Inspect collector errors (tmux server/named sockets, Terminal window readability, process argv discovery); blind sessions cannot be supervised safely.",
+                               maint, key, evidence={"errors": errors, "inventory_state": inv, "screens": host.get("screens_text")}))
+        health = host.get("health")
+        if isinstance(health, dict) and health:
+            h_status, p_status = health.get("status"), health.get("process_status")
+            if h_status in ("critical", "warning") or p_status in ("critical", "warning"):
+                sev = "critical" if "critical" in (h_status, p_status) else "warning"
+                occ = f"{health.get('occupancy_pct')}%" if health.get("occupancy_pct") is not None else "?"
+                out.append(finding(sev, "resources", f"{key}: port-watch health {sev} (TCP {occ}, process {p_status})",
+                                   "Inspect high-listener processes from the port-watch report and restart runaway listeners at an owned idle checkpoint.",
+                                   maint, key, evidence=health))
+            elif h_status in (None, "unknown"):
+                out.append(finding("warning", "observation", f"{key}: port-watch health report missing or unknown",
+                                   "Install or repair the ephemeral-port watch LaunchAgent on this host so TCP port pressure is observed.",
+                                   maint, key, evidence=health))
+            elif h_status == "stale" and is_live_host_observation(payload, host):
+                out.append(finding("warning", "observation", f"{key}: port-watch health report is stale",
+                                   "Check the ephemeral-port watch LaunchAgent on this host; its health report has stopped updating.",
+                                   maint, key, evidence=health))
+    by_blind = defaultdict(list)
+    for row in (payload.get("sessions") or []):
+        if not isinstance(row, dict):
+            continue
+        hk = row.get("host_key")
+        if isinstance(hk, str) and hk and not row.get("stale_cached") and is_blind_process_row(row):
+            by_blind[hk].append(row)
+    for key, rows in sorted(by_blind.items()):
+        if len(rows) >= t["blind_sessions_warn"]:
+            out.append(finding("warning", "observation", f"{key}: {len(rows)} agent sessions have no readable screen",
+                               "Launch worker loops inside an observable tmux server instead of detached processes, and verify collector socket coverage.",
+                               maint, key, evidence={"count": len(rows), "projects": sorted({str(r.get("project_label") or "?") for r in rows})[:20],
+                                                     "targets": [r.get("target_short") for r in rows[:15]]}))
+    return out
+
+
+def activity_findings(payload: dict, config: dict, by_mech: dict) -> list:
+    t, out = config["thresholds"], []
+    sessions = [r for r in (payload.get("sessions") or []) if isinstance(r, dict) and not r.get("stale_cached")]
+    for row in sessions:  # prompts, stalls, usage stops and composer drafts on supervisor or non-Mech sessions need direct attention
+        status, role, host = str(row.get("status", "")), row.get("role"), row.get("host_key")
+        where = {"target": row.get("target_short"), "agent": row.get("agent")}
+        if role in ("claw", "mechbay", "other") and status.startswith(HUMAN_PROMPTS):
+            out.append(finding("warning", "activity", f"{role} session {row.get('project_label')} on {host} waits for a human ({status})",
+                               "Only the user answers approval, question, sign-in, trust or update prompts.", owner("user", "prompt"), host, evidence=where))
+        elif role in ("claw", "mechbay", "other") and status.startswith("Goal stalled"):
+            label = f"non-Mech session {row.get('project_label')}" if role == "other" else f"{role} session {row.get('project_label')}"
+            action = ("Inspect the session directly or register the repository in the fleet manifest if it is a fleet Mech."
+                      if role == "other" else "Inspect the supervisor session directly and clear or restart the stalled goal before delegating.")
+            out.append(finding("warning", "activity", f"{label} on {host}: goal stalled",
+                               action, owner("user", "stalled-other" if role == "other" else "stalled-supervisor"), host, evidence=where))
+        elif role in ("claw", "mechbay", "other") and status.startswith("Goal hit usage limits"):
+            label = f"non-Mech session {row.get('project_label')}" if role == "other" else f"{role} session {row.get('project_label')}"
+            out.append(finding("warning", "activity", f"{label} on {host} hit usage limits",
+                               "Decide whether and when to resume; resumes spend usage.", owner("user", "usage"), host, evidence=where))
+        if role in ("claw", "mechbay") and has_composer_draft(row):
+            out.append(finding("warning", "delegation", f"{role} session {row.get('project_label')} on {host} has an unsent composer draft ({row.get('target_short')})",
+                               "Send or clear the unsent text in the composer before pasting a fleet-ops goal.", owner("user", "draft"), host, evidence=where))
+    for mech, rows in sorted(by_mech.items()):
+        for row in rows:
+            status, host = str(row.get("status", "")), row.get("host_key")
+            where = {"host": host, "target": row.get("target_short"), "agent": row.get("agent")}
+            if status.startswith(HUMAN_PROMPTS):
+                out.append(finding("warning", "activity", f"{mech} on {host} waits for a human ({status})",
+                                   "Only the user answers approval, question, sign-in, trust or update prompts.", owner("user", "prompt"), host, mech, where))
+            elif status.startswith("Goal hit usage limits"):
+                out.append(finding("warning", "activity", f"{mech} on {host} hit usage limits", "Decide whether and when to resume; resumes spend usage.", owner("user", "usage"), host, mech, where))
+            elif status.startswith("Goal stalled"):
+                out.append(finding("warning", "activity", f"{mech} on {host}: goal stalled", "Diagnose the stall from authoritative state (ledger, receipts, GitHub); repair with verified facts or report the blocker.", mech_owner(mech, by_mech, config), host, mech, where))
+            elif status.startswith("Goal paused"):
+                out.append(finding("info", "activity", f"{mech} on {host}: goal paused", "Propose resume or close with the reason; do not resume without approval.", mech_owner(mech, by_mech, config), host, mech, where))
+        states = [str(r.get("status", "")) for r in rows]
+        flagged = any(s.startswith(("Goal stalled", "Goal paused", "Goal hit usage limits") + HUMAN_PROMPTS) for s in states)
+        unknown = any(s.upper().startswith("UNKNOWN") for s in states)  # an unreadable screen is not "not working"
+        if rows and not flagged and not unknown and not any(s.startswith(("Pursuing goal", "Working")) for s in states):
+            out.append(finding("info", "activity", f"{mech}: no session is working", "Check the backlog and propose the next goal for this Mech.", mech_owner(mech, by_mech, config), None, mech,
+                               {"states": dict(Counter(states))}))
+    absent = [mech for mech in (payload.get("canonical_mechs") or []) if isinstance(mech, str) and mech and mech not in by_mech]
+    if absent:
+        out.append(finding("info", "activity", f"{len(absent)} fleet Mechs have no session on any observed host",
+                           "Confirm each is intentionally dormant, or assign it to a claw (mech_owner) and start a supervised loop.",
+                           owner("user", "dormant-mechs"), evidence={"mechs": absent}))
+    for key, claw in sorted(config["claws"].items()):
+        c_host = claw.get("host") if isinstance(claw, dict) else None
+        if not claw_targets(payload, claw):
+            out.append(finding("critical", "delegation", f"claw {key} has no live session on {c_host}",
+                               "Delegation to this claw is impossible until it runs; start it on that host (user-authorized).", owner("user", "claws"), c_host))
+    host_sessions = [r for r in sessions if isinstance(r.get("host_key"), str) and r.get("host_key")]
+    idle = Counter(r["host_key"] for r in host_sessions if str(r.get("status")) == "idle" and r.get("role") in ("mech", "claw"))
+    for host, count in sorted(idle.items()):
+        if count >= t["idle_sessions_warn"]:
+            out.append(finding("info", "hygiene", f"{host}: {count} idle Mech/claw sessions",
+                               "Idle agent processes keep memory, swap and ports; close duplicates at an owned idle checkpoint (graceful exit).", owner("xmechbay", "maintenance"), host))
+    non_working = Counter(r["host_key"] for r in host_sessions if not str(r.get("status", "")).startswith(("Pursuing goal", "Working")))
+    totals = Counter(r["host_key"] for r in host_sessions)
+    for host, count in sorted(non_working.items()):
+        if count >= t["non_working_sessions_warn"]:
+            out.append(finding("warning", "hygiene", f"{host}: {count} non-working agent sessions across all roles",
+                               "Retire finished or duplicate sessions at an owned idle checkpoint to reclaim memory, swap and Terminal windows.",
+                               owner("xmechbay", "maintenance"), host, evidence={"non_working": count, "total": totals[host]}))
+    by_achieved = defaultdict(list)
+    for r in host_sessions:
+        if str(r.get("status", "")).startswith("Goal achieved") and parked_achieved_seconds(r) >= t["achieved_goal_age_hours"] * 3600:
+            by_achieved[r["host_key"]].append(r)
+    for host, rows in sorted(by_achieved.items()):
+        if len(rows) >= 2:
+            out.append(finding("info", "hygiene", f"{host}: {len(rows)} sessions parked at Goal achieved for {t['achieved_goal_age_hours']}h+",
+                               "Record their outputs and close or assign the next goal so finished loops stop holding memory and swap.",
+                               owner("xmechbay", "maintenance"), host,
+                               evidence={"projects": [r.get("project_label") for r in rows[:15]], "targets": [r.get("target_short") for r in rows[:15]]}))
+    multi = {mech: sorted({r["host_key"] for r in rows if isinstance(r.get("host_key"), str) and r.get("host_key")}) for mech, rows in sorted(by_mech.items())}
+    multi = {m: hs for m, hs in multi.items() if len(hs) >= 2}
+    if multi:
+        out.append(finding("info", "hygiene", f"{len(multi)} Mechs have live sessions on multiple hosts",
+                           "Keep one primary loop per Mech and retire duplicate sessions at an owned idle checkpoint.",
+                           owner("xmechbay", "maintenance"), evidence={"mechs": multi}))
+    return out
+
+
+def backlog_findings(issues: dict, config: dict, by_mech: dict) -> list:
+    t, out = config["thresholds"], []
+    now = datetime.now(timezone.utc)
+    for mech, repo in sorted(issues.items()):
+        if repo.get("error"):
+            out.append(finding("warning", "observation", f"{mech}: GitHub query failed", "Check gh authentication and the repository name.", owner("xmechbay", "maintenance"), mech=mech, evidence={"error": repo["error"]}))
+            continue
+        prs = repo.get("prs", [])
+        open_ready = [p for p in prs if not p["draft"] and p["mergeable"] == "MERGEABLE" and p.get("review") != "CHANGES_REQUESTED"]
+        ready = [p["number"] for p in open_ready if p["checks"] == "SUCCESS"]
+        unchecked = [p["number"] for p in open_ready if p["checks"] is None]  # no checks ran: not "green"
+        failing = [p["number"] for p in prs if p["checks"] in ("FAILURE", "ERROR")]
+        stale = [p["number"] for p in prs if p["draft"] and (now - parse_time(p["updated_at"])).days >= t["pr_stale_days"]]
+        if ready:
+            out.append(finding("info", "backlog", f"{mech}: {len(ready)} PRs mergeable with green checks",
+                               "Review each PR adversarially before any merge proposal; merging stays the user's decision.", owner("user", "merges"), mech=mech,
+                               evidence={"repo": repo["repo"], "prs": ready[:30], "mergeable_without_checks": unchecked[:30]}))
+        if failing:
+            out.append(finding("warning", "backlog", f"{mech}: {len(failing)} PRs with failing checks",
+                               "Fix or close each failing PR; file an issue for any infrastructure cause.", mech_owner(mech, by_mech, config), mech=mech, evidence={"repo": repo["repo"], "prs": failing[:30]}))
+        if stale:
+            out.append(finding("info", "backlog", f"{mech}: {len(stale)} draft PRs untouched for {t['pr_stale_days']}+ days",
+                               "Advance, split or close each stale draft with a reason.", mech_owner(mech, by_mech, config), mech=mech, evidence={"repo": repo["repo"], "prs": stale[:30]}))
+        if repo.get("open_prs", 0) >= t["pr_backlog_warn"]:
+            out.append(finding("warning", "backlog", f"{mech}: {repo['open_prs']} open PRs, {repo.get('open_issues')} open issues",
+                               "Batch the review queue by theme (fleet-issue-review) and stop opening new PRs until it shrinks.", mech_owner(mech, by_mech, config), mech=mech, evidence={"repo": repo["repo"]}))
+    return out
+
+
+def rank(findings: list) -> list:
+    return sorted(findings, key=lambda f: (SEVERITY_ORDER[f["severity"]], f["category"], f.get("host") or "", f.get("mech") or "", f["title"]))
+
+
+def analyze(payload: dict, resources: dict, issues: dict, config: dict) -> list:
+    sessions = payload.get("sessions") or []
+    by_mech = mech_sessions(sessions)
+    config["_live_claws"] = live_claws(sessions, config)
+    mechs = {m for m in (payload.get("canonical_mechs") or []) if isinstance(m, str) and m} | set(issues or {})
+    findings = (config_findings(config) + host_observation_findings(payload, config)
+                + resource_findings(resources or {}, config, by_mech, mechs)
+                + activity_findings(payload, config, by_mech) + backlog_findings(issues or {}, config, by_mech))
+    ranked = rank(findings)
+    for number, item in enumerate(ranked, 1):
+        item["id"] = f"F{number:03d}"
+    return ranked
+
+
+# --------------------------------------------------------------------------- report
+
+def owner_label(o: dict) -> str:
+    return {"user": "user", "claw": "claw", "xmechbay": "XMechBay"}[o["kind"]] + (f":{o['key']}" if o.get("key") else "")
+
+
+def render_report(run_id: str, payload: dict, resources: dict, issues: dict, findings: list, config: dict) -> str:
+    lines = [f"# Fleet operations report {run_id}", "",
+             f"Sessions observed {payload.get('generated_at')} ({payload.get('mode')}); resources and backlog collected for this run. "
+             "Screen-derived states are observations, not verified completion.", "", "## Hosts", "",
+             "| Host | Free GiB | Swap used/total GiB | Load (1m) | /tmp GiB | user temp GiB | Codex logs GiB | Guard | Sessions |",
+             "|---|---:|---|---:|---:|---:|---:|---|---:|"]
+    live_rows = [r for r in (payload.get("sessions") or []) if isinstance(r, dict) and not r.get("stale_cached")]
+    counts = Counter(r["host_key"] for r in live_rows if isinstance(r.get("host_key"), str) and r["host_key"])
+    payload_hosts = {h["key"] for h in (payload.get("hosts") or []) if isinstance(h, dict) and isinstance(h.get("key"), str) and h["key"]}
+    for host in sorted({k for k in (resources or {}) if isinstance(k, str) and k} | payload_hosts | set(counts)):
+        r = (resources or {}).get(host) or {}
+        if r.get("error"):
+            lines.append(f"| {host} | probe failed: {r['error'][:60]} | | | | | | | {counts.get(host, 0)} |")
+            continue
+        tmp = [t.get("gib") for t in (r.get("tmp_roots") or []) if isinstance(t, dict)] + [None, None]
+        g = r.get("guard") or {}
+        guard = "not installed" if not g.get("installed") else f"{g.get('status')} (exit {g.get('exit_code')}, skipped {sum((g.get('skipped') or {}).values())})"
+        swap = r.get("swap") or {}
+        lines.append(f"| {host} | {(r.get('disk') or {}).get('free_gib')} | {swap.get('used_gib')}/{swap.get('total_gib')} | {round((r.get('loadavg') or [0])[0], 1)} | {tmp[0]} | {tmp[1]} | {(r.get('codex_sessions') or {}).get('gib')} | {guard} | {counts.get(host, 0)} |")
+    tones = ((payload.get("stats") or {}).get("tone_counts")) or {}
+    lines += ["", "## Activity", "", f"Session tones: {', '.join(f'{k} {v}' for k, v in sorted(tones.items()))}.", "",
+              "| Mech | Sessions (host: state) | Responsible claw |", "|---|---|---|"]
+    by_mech = mech_sessions(live_rows)
+    live = config.get("_live_claws")
+    if live is None:
+        live = live_claws(live_rows, config)
+    for mech in sorted(set(by_mech) | {m for m in (payload.get("canonical_mechs") or []) if isinstance(m, str) and m}):
+        states = ", ".join(f"{r.get('host_key')}: {r.get('status')}" for r in by_mech.get(mech, [])) or "none"
+        lines.append(f"| {mech} | {states} | {claw_for_mech(mech, by_mech, config, live) or 'unassigned'} |")
+    if issues:
+        lines += ["", "## Backlog", "", "| Mech | Repository | Open issues | Open PRs | Drafts | Failing checks |", "|---|---|---:|---:|---:|---:|"]
+        for mech, repo in sorted(issues.items()):
+            prs = repo.get("prs", [])
+            lines.append(f"| {mech} | {repo.get('repo')} | {repo.get('open_issues', '?')} | {repo.get('open_prs', '?')} | "
+                         f"{sum(p['draft'] for p in prs)} | {sum(p['checks'] in ('FAILURE', 'ERROR') for p in prs)} |")
+    lines += ["", "## Findings", "", "| ID | Severity | Category | Owner | Finding | Action |", "|---|---|---|---|---|---|"]
+    for f in findings:
+        lines.append(f"| {f['id']} | {f['severity']} | {f['category']} | {owner_label(f['owner'])} | {f['title']} | {f['action']} |")
+    by_owner = Counter(owner_label(f["owner"]) for f in findings)
+    lines += ["", "## Delegation summary", ""] + [f"- {k}: {v} findings" for k, v in sorted(by_owner.items())]
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- plan
+
+BRIEF_RULES = """## Rules for this brief
+- Re-read live state first; this brief was prepared from a read-only snapshot and can be stale.
+- Assess, then act on one Mech end to end (the canary) before fanning out to the rest.
+- No merges, no answering approval, question, sign-in, trust or update prompts, no paid provider credits, no mentions of people or accounts.
+- Never reset or rewrite ledgers, receipts or status; repair only with verified facts.
+- Keep all work in ~/agent-work/ or a repository's .temp/, never in /tmp or $TMPDIR; point test basetemps there too.
+- Resuming goals spends usage: propose resumes in the report instead of resuming many sessions.
+- Do not start disk-heavy work (KG builds, full-corpus validations, large fixtures) while the host has less than {disk_floor} GiB free; delete only regenerable scratch you created.
+"""
+
+
+def render_brief(run_id: str, claw_key: str, claw: dict, items: list, report_dir: str, thresholds: dict) -> str:
+    lines = [f"# XMechBay fleet-ops brief {run_id} for {claw.get('label', claw_key)}", "",
+             "Prepared by the XMechBay fleet-ops skill from read-only observation of sessions, host resources and GitHub.", "",
+             "## Your Mechs needing attention", ""]
+    for f in items:
+        evidence = json.dumps(f["evidence"], sort_keys=True)[:400] if f["evidence"] else ""
+        lines.append(f"- [{f['severity']}] {f['id']} {f['title']}. Action: {f['action']}" + (f" Evidence: {evidence}" if evidence else ""))
+    lines += ["", BRIEF_RULES.format(disk_floor=thresholds["disk_critical_gib"]).rstrip(), "", "## Report", "",
+              f"Write {report_dir}/report.md and summary.json: one row per Mech (state, action taken, PRs, remaining blockers, decision needed from the user), then stop."]
+    return "\n".join(lines) + "\n"
+
+
+def render_goal(run_id: str, brief_path: str, report_dir: str) -> str:
+    text = (f"XMechBay fleet-ops {run_id}: read {brief_path} and carry it out for the Mechs it lists. "
+            "Follow its rules: re-read live state, one canary Mech end to end before the rest, no merges, "
+            "no answering prompts, no paid credits, nothing in /tmp. "
+            f"Write the report it names under {report_dir}, then stop.")
+    if len(text) > GOAL_LIMIT:
+        raise ValueError("goal text over the 1000-character limit")
+    return text
+
+
+def claw_targets(payload: dict, claw: dict) -> list:
+    """Live, controllable claw sessions for a claw config (cached rows and process-only rows excluded)."""
+    if not isinstance(claw, dict):
+        return []
+    claw_host = claw.get("host")
+    if not isinstance(claw_host, str) or not claw_host:
+        return []
+    out = []
+    for r in (payload.get("sessions") or []):
+        if not isinstance(r, dict) or r.get("role") != "claw" or r.get("host_key") != claw_host or r.get("stale_cached"):
+            continue
+        if claw.get("repo") and r.get("repo_label") != claw["repo"]:
+            continue
+        target = str(r.get("target_short") or "")
+        match = re.fullmatch(r"T(\d+)/(\d+)", target)
+        if r.get("tmux_session"):
+            transport = "tmux"
+        elif match:
+            transport = "terminal"
+        else:
+            continue  # process-only rows (P123) cannot receive guarded input
+        out.append({"target": target, "transport": transport,
+                    "window": int(match.group(1)) if match else None, "tab": int(match.group(2)) if match else None,
+                    "tmux_session": r.get("tmux_session"), "tmux_window": r.get("tmux_window"),
+                    "tty": r.get("tty"), "pid": r.get("pid"), "status": r.get("status"),
+                    "has_draft": has_composer_draft(r)})
+    return out
+
+
+def hint_matches(hint: str, t: dict) -> bool:
+    hint = str(hint).strip()
+    forms = {t["target"], t.get("tty") or ""}
+    if t.get("tty"):
+        forms.add("/dev/" + t["tty"])
+    if t["window"] is not None:
+        forms |= {str(t["window"]), f"T{t['window']}"}
+    if t.get("tmux_session"):
+        forms |= {t["tmux_window"] or "", f"{t['tmux_session']}:{t['tmux_window']}"}
+    return hint in forms - {""}
+
+
+def choose_target(targets: list, claw: dict, controller_session: str):
+    """Return (target or None, reason). Never guesses: a hint must match exactly one candidate."""
+    if not targets:
+        return None, "no live controllable claw session on this host"
+    hint = claw.get("target_hint")
+    if hint:
+        matches = [t for t in targets if hint_matches(hint, t)]
+        if len(matches) != 1:
+            return None, f"target_hint {hint!r} matches {len(matches)} of {len(targets)} live claw sessions"
+        chosen = matches[0]
+    elif len(targets) == 1:
+        chosen = targets[0]
+    else:
+        return None, f"{len(targets)} live claw sessions on this host; set target_hint after confirming which claw owns these Mechs"
+    if chosen["transport"] == "tmux" and chosen["tmux_session"] != controller_session:
+        return None, (f"claw runs in tmux session {chosen['tmux_session']!r}, not the controller's owned session "
+                      f"{controller_session!r}; that session's owner must deliver the goal")
+    if chosen["transport"] == "tmux" and not chosen.get("tmux_window"):
+        return None, f"claw {chosen['target']} has no tmux window name; inspect tmux windows before pasting"
+    if chosen["transport"] == "terminal" and chosen["tab"] != 1:
+        return None, f"claw is in tab {chosen['tab']} of window {chosen['window']}; mac-term pastes into the selected tab, so deliver by hand"
+    if chosen.get("has_draft"):
+        return None, f"claw {chosen['target']} has an unsent composer draft; send or clear it before pasting"
+    c_status = str(chosen.get("status") or "")
+    if c_status.startswith(HUMAN_PROMPTS):
+        return None, f"claw {chosen['target']} waits for a human ({c_status}); answer or clear the prompt before pasting"
+    if c_status.startswith("Goal hit usage limits"):
+        return None, f"claw {chosen['target']} hit usage limits; decide whether to resume before pasting"
+    return chosen, "resolved"
+
+
+def plan(run_dir: Path, config: dict) -> dict:
+    run_dir = ensure_private_dir(run_dir, enforce_leaf_mode=False, create=False)
+    findings = json.loads((run_dir / "findings.json").read_text())
+    payload = json.loads((run_dir / "sessions.json").read_text())
+    run_id = run_dir.name
+    out = ensure_private_dir(run_dir / "plan", enforce_leaf_mode=True)
+    ensure_private_dir(out / "briefs", enforce_leaf_mode=True)
+    ensure_private_dir(out / "goals", enforce_leaf_mode=True)
+    hosts = status_hosts(config)
+    groups = defaultdict(list)
+    for f in findings:
+        groups[(f["owner"]["kind"], f["owner"]["key"])].append(f)
+    dispatch = [f"# Dispatch plan {run_id}", "",
+                "Nothing here has been sent. Dispatch needs the user's approval for this batch; send to ONE claw first (the canary), "
+                "verify it accepted the goal and is working, then the rest. Each command is guarded by mac-term.sh: it refuses "
+                "unreadable screens and screens showing a prompt. Re-check the target's tty and screen first; window ids are transient.", ""]
+    summary = {"run": run_id, "claws": {}, "user_decisions": 0, "maintenance": 0}
+    for (kind, key), items in sorted(groups.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
+        if kind != "claw":
+            continue
+        claw = config["claws"].get(key) or {}
+        brief_dir = claw.get("brief_dir", "~/agent-work/claw/fleet-ops").rstrip("/")
+        remote_dir = f"{brief_dir}/{run_id}"
+        brief = render_brief(run_id, key, claw, items, remote_dir, config["thresholds"])
+        goal = render_goal(run_id, f"{remote_dir}/brief.md", remote_dir)
+        write_private_file(out / "briefs" / f"{key}.md", brief)
+        write_private_file(out / "goals" / f"{key}.txt", goal)
+        host_cfg = hosts.get(claw.get("host")) or {}
+        dest = "local" if host_cfg.get("transport") == "local" else host_cfg.get("host", "<ssh-host>")
+        targets = claw_targets(payload, claw)
+        controller = (config["hosts"].get(claw.get("host")) or {}).get("tmux_session", config.get("controller_tmux_session", "fleet"))
+        chosen, reason = choose_target(targets, claw, controller)
+        brief_file, goal_file = (out / "briefs" / f"{key}.md").resolve(), (out / "goals" / f"{key}.txt").resolve()
+        mt = (ROOT / ".agents/skills/mac-orchestration/scripts/mac-term.sh").resolve()
+        dispatch += [f"## {key} ({len(items)} findings, host {claw.get('host')})", "",
+                     f"Live claw candidates: {json.dumps(targets)}",
+                     ("Chosen target: " + json.dumps(chosen)) if chosen else f"**Not resolved: {reason}. Confirm the claw session before sending.**",
+                     "", "```bash"]
+        dispatch.append(f"mkdir -p {remote_dir} && cp {shlex.quote(str(brief_file))} {remote_dir}/brief.md" if dest == "local"
+                        else f"ssh {dest} 'mkdir -p {remote_dir}' && scp {shlex.quote(str(brief_file))} {dest}:{remote_dir.replace('~/', '')}/brief.md")
+        if chosen and chosen["transport"] == "tmux" and chosen.get("tmux_window"):
+            dispatch.append(f"XMECHBAY_TMUX_SESSION={shlex.quote(controller)} bash {shlex.quote(str(mt))} -H {dest} tmux-paste "
+                            f"{shlex.quote(str(chosen['tmux_window']))} {shlex.quote(str(goal_file))}")
+        else:
+            window = chosen["window"] if chosen else "<window-id>"
+            tty = chosen["tty"] if chosen else "<claw tty>"
+            dispatch += [f"# Proceed only if this line shows tty {tty} (the selected tab must be the claw):",
+                         f"bash {shlex.quote(str(mt))} -H {dest} windows | grep '|{window}|'",
+                         f"bash {shlex.quote(str(mt))} -H {dest} screen {window} 40",
+                         f"bash {shlex.quote(str(mt))} -H {dest} paste {window} {shlex.quote(str(goal_file))}",
+                         f"bash {shlex.quote(str(mt))} -H {dest} screen {window} 40"]
+        dispatch += ["```", ""]
+        summary["claws"][key] = {"findings": len(items), "targets": len(targets), "target_resolved": chosen is not None, "reason": reason}
+    decisions = [f for f in findings if f["owner"]["kind"] == "user"]
+    maintenance = [f for f in findings if f["owner"]["kind"] == "xmechbay"]
+    write_private_file(out / "DECISIONS.md", "# Decisions for the user\n\n" + "".join(f"- [{f['severity']}] {f['id']} {f['title']}. {f['action']}\n" for f in decisions))
+    write_private_file(out / "MAINTENANCE.md", "# XMechBay maintenance\n\n" + "".join(f"- [{f['severity']}] {f['id']} {f['title']}. {f['action']}\n" for f in maintenance))
+    write_private_file(out / "DISPATCH.md", "\n".join(dispatch) + "\n")
+    summary.update(user_decisions=len(decisions), maintenance=len(maintenance))
+    write_private_file(out / "summary.json", json.dumps(summary, indent=1) + "\n")
+    return summary
+
+
+# --------------------------------------------------------------------------- recommend
+
+def ensure_private_dir(directory: Path, enforce_leaf_mode: bool = True, create: bool = True) -> Path:
+    target = Path(directory).expanduser()
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    if target.is_symlink() and target not in MACOS_ROOT_SYMLINKS:
+        raise ValueError(f"refusing symlink directory: {target}")
+    current = Path(target.anchor)
+    for part in target.parts[1:]:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            if not create:
+                raise SystemExit(f"run directory not found: {target}")
+            os.mkdir(current, 0o700)
+            os.chmod(current, 0o700)
+            info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            if current in MACOS_ROOT_SYMLINKS and info.st_uid == 0:
+                current = current.resolve(strict=True)
+                res_info = current.lstat()
+                if not stat.S_ISDIR(res_info.st_mode):
+                    raise ValueError(f"not a directory: {current}")
+                continue
+            raise ValueError(f"refusing symlink directory: {current}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"not a directory: {current}")
+    if enforce_leaf_mode:
+        os.chmod(current, 0o700)
+    return current
+
+
+def write_private_file(path: Path, content: str) -> Path:
+    expanded = Path(path).expanduser()
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    if expanded.is_symlink():
+        raise ValueError(f"refusing symlink output path: {path}")
+    parent = ensure_private_dir(expanded.parent, enforce_leaf_mode=False)
+    dest = parent / expanded.name
+    if dest.is_symlink():
+        raise ValueError(f"refusing symlink output path: {path}")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dest.name}.", dir=str(parent))
+    fd_open = True
+    try:
+        os.fchmod(fd, 0o600)
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+        fd_open = False
+        with stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if dest.is_symlink():
+            raise ValueError(f"refusing symlink output path: {path}")
+        os.replace(tmp_name, dest)
+    finally:
+        if fd_open:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if os.path.lexists(tmp_name):
+            os.unlink(tmp_name)
+    return dest
+
+
+def collect_private_host_terms(config: dict, payload: dict | None = None, resources: dict | None = None) -> set:
+    out = set()
+
+    def _add(raw_val: object) -> None:
+        if not isinstance(raw_val, str):
+            return
+        term = raw_val.strip()
+        if "@" in term:
+            term = term.rpartition("@")[2].strip()
+        low = term.lower()
+        if len(term) < 2 or low in GENERIC_HOST_TOKENS or low in ("127.0.0.1", "::1") or low.endswith(".invalid"):
+            return
+        out.add(term)
+        if "." in term and not re.fullmatch(r"[\d.]+", term):
+            short = term.split(".", 1)[0]
+            if len(short) >= 3 and short.lower() not in GENERIC_HOST_TOKENS:
+                out.add(short)
+
+    for key in (config.get("hosts") or {}):
+        _add(key)
+    for claw in (config.get("claws") or {}).values():
+        if isinstance(claw, dict):
+            _add(claw.get("host"))
+    for host in ((payload or {}).get("hosts") or []):
+        if isinstance(host, dict):
+            _add(host.get("key"))
+    for row in ((payload or {}).get("sessions") or []):
+        if isinstance(row, dict):
+            _add(row.get("host_key"))
+    for key, rdata in (resources or {}).items():
+        _add(key)
+        if isinstance(rdata, dict):
+            _add(rdata.get("hostname"))
+    for key, cfg in status_hosts(config).items():
+        _add(key)
+        if isinstance(cfg, dict):
+            _add(cfg.get("host"))
+    return out
+
+
+def sanitize_public_text(text: str, private_terms=()) -> str:
+    """Scrub mentions, emails, local paths, private network names/IPs, tokens and host keys from public drafts."""
+    cleaned = CREDENTIAL_TOKEN_RE.sub("<redacted-token>", str(text))
+    cleaned = PRIVATE_KEY_HEADER_RE.sub("<redacted-private-key>", cleaned)
+    cleaned = CREDENTIAL_ASSIGNMENT_RE.sub(r"\1<redacted-secret>", cleaned)
+
+    def _scrub_email(match: re.Match) -> str:
+        addr = match.group("email")
+        return addr if addr.lower().endswith(".invalid") else "<redacted-email>"
+
+    cleaned = EMAIL_OR_MENTION_RE.sub(_scrub_email, cleaned)
+    cleaned = re.sub(r"(?<!\w)@+(?=[A-Za-z0-9_])", "", cleaned)
+    cleaned = UNIX_LOCAL_PATH_RE.sub("<local-path>", cleaned)
+    cleaned = WIN_LOCAL_PATH_RE.sub("<local-path>", cleaned)
+    cleaned = LOCAL_HOSTNAME_RE.sub("<redacted-host>", cleaned)
+    cleaned = PRIVATE_IP_RE.sub("<redacted-ip>", cleaned)
+    for term in sorted({str(t) for t in (private_terms or ()) if t}, key=len, reverse=True):
+        if len(term) < 2 or term.lower() in GENERIC_HOST_TOKENS:
+            continue
+        cleaned = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", "<host>", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def _parse_json_pages(stdout: str) -> list:
+    if not stdout or not stdout.strip():
+        raise ValueError("empty gh api response")
+    decoder = json.JSONDecoder()
+    idx, length, items = 0, len(stdout), []
+    while idx < length:
+        while idx < length and stdout[idx].isspace():
+            idx += 1
+        if idx >= length:
+            break
+        page, idx = decoder.raw_decode(stdout, idx)
+        if not isinstance(page, list):
+            raise ValueError("expected JSON array page from gh api")
+        for elem in page:
+            if isinstance(elem, list):
+                items.extend(elem)
+            else:
+                items.append(elem)
+    return items
+
+
+def fetch_open_issues_for_repo(repo: str) -> tuple:
+    if not is_valid_repo_slug(repo):
+        return [], f"invalid repository slug: {repo!r}"
+    owner_name, _, repo_name = repo.partition("/")
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "--paginate", f"repos/{owner_name}/{repo_name}/issues?state=open&per_page=100"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], str(exc)
+    if proc.returncode != 0:
+        return [], (proc.stderr or proc.stdout or f"gh exit {proc.returncode}").strip()[-200:]
+    try:
+        raw_items = _parse_json_pages(proc.stdout)
+    except ValueError as exc:
+        return [], f"unparseable gh api JSON: {exc}"
+    rows = []
+    for item in raw_items:
+        if not isinstance(item, dict) or item.get("pull_request") is not None:
+            continue
+        num = item.get("number")
+        if isinstance(num, bool) or not isinstance(num, int):
+            continue
+        rows.append({
+            "number": num,
+            "title": str(item.get("title") or ""),
+            "url": str(item.get("html_url") or item.get("url") or f"https://github.com/{repo}/issues/{num}"),
+        })
+    return rows, None
+
+
+def load_open_issue_index(repos_needed: set, open_issues_json: Path | None = None, no_github: bool = False) -> tuple:
+    if open_issues_json and no_github:
+        raise ValueError("--open-issues-json and --no-github are mutually exclusive")
+    needed = sorted({str(r) for r in repos_needed if isinstance(r, str) and r})
+    if open_issues_json:
+        try:
+            raw = json.loads(Path(open_issues_json).read_text())
+        except (OSError, ValueError) as exc:
+            err = f"failed to read --open-issues-json: {exc}"
+            return {}, {r: err for r in needed}, "file"
+        if not isinstance(raw, dict):
+            err = "--open-issues-json must be a JSON object mapping OWNER/REPO to issue lists"
+            return {}, {r: err for r in needed}, "file"
+        index, errors = {}, {}
+        for repo, rows in raw.items():
+            key = str(repo)
+            if isinstance(rows, list):
+                index[key] = rows
+            else:
+                errors[key] = "entry in --open-issues-json is not a list"
+        for repo in needed:
+            if not is_valid_repo_slug(repo):
+                errors[repo] = f"invalid repository slug: {repo!r}"
+            elif repo not in index and repo not in errors:
+                errors[repo] = "repository missing from --open-issues-json"
+        return index, errors, "file"
+    if no_github:
+        return {}, {}, "disabled"
+    index, errors = {}, {}
+    for repo in needed:
+        rows, err = fetch_open_issues_for_repo(repo)
+        if err:
+            errors[repo] = err
+        else:
+            index[repo] = rows
+    return index, errors, "github"
+
+
+def _keyword_matches(kw: str, title_l: str) -> bool:
+    token = str(kw).strip().lower()
+    if not token:
+        return False
+    prefix_mode = token.endswith("*")
+    if prefix_mode:
+        token = token[:-1]
+    if not token:
+        return False
+    pattern = re.escape(token)
+    if re.match(r"[a-z0-9_]", token[0]):
+        pattern = r"(?<![a-z0-9_])" + pattern
+    if prefix_mode:
+        pattern = pattern + r"[a-z0-9_]*"
+    elif re.match(r"[a-z0-9_]", token[-1]):
+        pattern = pattern + r"(?![a-z0-9_])"
+    return re.search(pattern, title_l) is not None
+
+
+def match_open_issues(index: dict, repos: list, keyword_groups: list) -> list:
+    hits, seen = [], set()
+    if not keyword_groups:
+        return []
+    for repo in repos:
+        rows = index.get(repo, [])
+        if not isinstance(rows, list):
+            continue
+        for item in rows:
+            if not isinstance(item, dict) or item.get("pull_request") is not None:
+                continue
+            raw_num = item.get("number")
+            if isinstance(raw_num, bool):
+                continue
+            try:
+                number = int(raw_num)
+            except (TypeError, ValueError):
+                continue
+            title = str(item.get("title") or "")
+            title_l = title.lower()
+            if (repo, number) in seen:
+                continue
+            if any(all(_keyword_matches(kw, title_l) for kw in group) for group in keyword_groups if group):
+                seen.add((repo, number))
+                hits.append({"repo": repo, "number": number, "title": title,
+                             "url": str(item.get("url") or f"https://github.com/{repo}/issues/{number}")})
+    return sorted(hits, key=lambda h: (h["repo"], h["number"]))
+
+
+def build_recommendation(rule_key: str, priority: str, theme: str, title: str, conclusion: str,
+                         recommendation: str, evidence: dict, check_repos: list, match_groups: list,
+                         draft_repo: str, draft_title: str, draft_body: str,
+                         open_index: dict, open_errors: dict, source_mode: str,
+                         related_groups: list | None = None, private_terms=()) -> dict:
+    matched = match_open_issues(open_index, check_repos, match_groups)
+    related = [h for h in match_open_issues(open_index, check_repos, related_groups or [])
+               if (h["repo"], h["number"]) not in {(m["repo"], m["number"]) for m in matched}]
+    repo_errs = {r: open_errors[r] for r in check_repos if r in open_errors}
+    if not is_valid_repo_slug(draft_repo):
+        repo_errs.setdefault(str(draft_repo), f"invalid repository slug: {draft_repo!r}")
+    if matched:
+        status = "tracked"
+    elif source_mode == "disabled":
+        status = "unverified_offline"
+    elif repo_errs:
+        status = "lookup_failed"
+    else:
+        status = "new_issue"
+    draft = None
+    if status != "tracked":
+        body = sanitize_public_text(draft_body.rstrip(), private_terms=private_terms)
+        if related:
+            rel_lines = ", ".join(f"{r['repo']}#{r['number']}" for r in related)
+            body += f"\n\n### Related issues\n- {sanitize_public_text(rel_lines, private_terms=private_terms)}"
+        draft = {
+            "repo": sanitize_public_text(draft_repo, private_terms=private_terms),
+            "title": sanitize_public_text(draft_title, private_terms=private_terms),
+            "body": body + "\n",
+        }
+    return {
+        "rule": rule_key,
+        "priority": priority,
+        "theme": theme,
+        "title": title,
+        "conclusion": conclusion,
+        "recommendation": recommendation,
+        "evidence": evidence,
+        "tracking": {
+            "status": status,
+            "checked_repos": check_repos,
+            "matched_issues": matched,
+            "related_issues": related,
+            "lookup_errors": repo_errs,
+            "issue_draft": draft,
+        },
+    }
+
+
+def synthesize_recommendations(payload: dict, resources: dict, issues: dict, findings: list, config: dict,
+                               open_index: dict | None = None, open_errors: dict | None = None,
+                               source_mode: str = "disabled", private_terms=None) -> list:
+    t = config["thresholds"]
+    infra = config["infra_repos"]
+    xmb, claw_repo = infra["xmechbay"], infra["claw"]
+    open_index, open_errors = open_index or {}, open_errors or {}
+    if private_terms is None:
+        private_terms = collect_private_host_terms(config, payload, resources)
+    hosts = [h for h in (payload.get("hosts") or []) if isinstance(h, dict) and isinstance(h.get("key"), str) and h.get("key")]
+    reachable_hosts = [h for h in hosts if h.get("reachable") is not False]
+    live_sessions = [r for r in (payload.get("sessions") or []) if isinstance(r, dict) and not r.get("stale_cached")]
+    by_mech = mech_sessions(live_sessions)
+    recs = []
+
+    # 1. Tmux collector false probe failure & named-socket blindness
+    tmux_err_hosts = [h["key"] for h in reachable_hosts if "tmux_probe_failed" in (h.get("errors") or ())]
+    blind_by_host = defaultdict(list)
+    tty_blind_rows = []
+    headless_blind_rows = []
+    for row in live_sessions:
+        hk = row.get("host_key")
+        if isinstance(hk, str) and hk and is_blind_process_row(row):
+            blind_by_host[hk].append(row)
+            tty_val = str(row.get("tty") or "").strip()
+            if tty_val and tty_val not in ("?", "??"):
+                tty_blind_rows.append(row)
+            else:
+                headless_blind_rows.append(row)
+    total_blind = sum(len(v) for v in blind_by_host.values())
+    if tmux_err_hosts or len(tty_blind_rows) >= t["blind_sessions_warn"]:
+        parts = []
+        if tmux_err_hosts:
+            parts.append(f"`tmux_probe_failed` fired on {len(tmux_err_hosts)} of {max(len(reachable_hosts), 1)} reachable host(s)")
+        if tty_blind_rows:
+            parts.append(f"{len(tty_blind_rows)} PTY-backed session(s) resolved only as process-only `P*` (`screen_unavailable`) rows")
+        signal_summary = " and ".join(parts)
+        recs.append(build_recommendation(
+            "R-TMUX-COLLECT", "P1", "observability",
+            "Tmux probe false errors on absent default server and named-socket blindness",
+            (f"{signal_summary}. `fleet_collect.py` runs `tmux list-panes -a` solely against the default socket with `check=True`, "
+             "conflating an absent default server with a collector error and missing panes hosted on named `-L`/`-S` tmux sockets."),
+            "Update `fleet_collect.py` to classify an absent default tmux server as `not_running` (zero errors) and enumerate accessible sockets in the user tmux socket directory or host config.",
+            {"tmux_probe_failed_hosts": tmux_err_hosts, "tty_blind_sessions": len(tty_blind_rows),
+             "blind_counts": {k: len(v) for k, v in sorted(blind_by_host.items())}},
+            [xmb], [("tmux_probe_failed",), ("fleet_collect", "tmux"), ("named", "socket*", "tmux"), ("absent", "default", "tmux")],
+            xmb,
+            "fleet-session-status: distinguish absent default tmux server from probe failure and discover named sockets",
+            (f"### Problem\n"
+             f"In live fleet status collection, {signal_summary}.\n\n"
+             f"### Root cause\n"
+             f"1. `fleet_collect.py` invokes `tmux list-panes -a` with `stderr=DEVNULL` and `check=True` against only the default socket, "
+             f"turning normal `no server running` exit codes into `tmux_probe_failed` (`collection partial`).\n"
+             f"2. Sessions hosted on explicit named tmux servers (`tmux -L <name>` or `-S <path>`) are never enumerated by the collector.\n\n"
+             f"### Proposed fix\n"
+             f"- Distinguish `no server running` / missing default socket (`coverage.tmux = \"not_running\"`, no error) from real `tmux` failures.\n"
+             f"- Discover accessible sockets under the user tmux socket directory (plus optional configured socket names) and record socket identity on pane targets.\n"
+             f"- Add offline unit tests in `tests/test_fleet_collect.py` covering absent default server, named sockets, and permission/error isolation."),
+            open_index, open_errors, source_mode, related_groups=[("tmux", "standard session transport")], private_terms=private_terms,
+        ))
+
+    # 2. Detached / unreadable worker batch spawns & partial host discovery
+    max_blind_host, max_blind = max(((k, len(v)) for k, v in blind_by_host.items()), key=lambda kv: kv[1], default=(None, 0))
+    partial_hosts = [h["key"] for h in reachable_hosts
+                     if h.get("inventory_state") == "partial" or any(e in ("agent_discovery_partial", "terminal_window_unreadable", "terminal_probe_failed") for e in (h.get("errors") or ()))]
+    if max_blind >= 5 or (partial_hosts and total_blind >= t["blind_sessions_warn"]) or len(headless_blind_rows) >= t["blind_sessions_warn"]:
+        host_total = sum(1 for r in live_sessions if r.get("host_key") == max_blind_host) or max_blind
+        parts = []
+        if max_blind:
+            parts.append(f"up to {max_blind} of {host_total} live sessions on one worker host lack a readable Terminal or tmux screen")
+        if partial_hosts:
+            parts.append(f"{len(partial_hosts)} host(s) reported partial process discovery or unreadable Terminal windows")
+        signal_summary = "; ".join(parts)
+        recs.append(build_recommendation(
+            "R-BLIND-SPAWN", "P1", "observability",
+            "Detached worker processes and partial host discovery prevent safe supervision",
+            (f"Observed blind worker state: {signal_summary}. Process-only (`P*`) sessions "
+             "cannot be inspected or given guarded input (`mac-term.sh` rightly refuses them), and partial inventory suppresses departure tracking."),
+            "Audit worker-launch helpers and supervisor briefs so every supervised Mech loop starts inside an observable tmux window rather than a detached background process, and diagnose `agent_discovery_partial` / `terminal_window_unreadable` on degraded hosts.",
+            {"max_blind_host": max_blind_host, "max_blind_sessions": max_blind, "headless_blind_sessions": len(headless_blind_rows),
+             "partial_hosts": partial_hosts,
+             "blind_projects": sorted({str(r.get("project_label") or "?") for rows in blind_by_host.values() for r in rows})[:20]},
+            [xmb, claw_repo],
+            [("no readable screen",), ("detached", "worker*"), ("agent_discovery_partial",), ("terminal_window_unreadable",)],
+            xmb,
+            "fleet-ops / session contract: guard against detached worker spawns without readable Terminal or tmux panes",
+            (f"### Problem\n"
+             f"Fleet observation recorded blind worker state ({signal_summary}).\n\n"
+             f"### Impact\n"
+             f"- Process-only agent loops have no readable screen evidence and cannot receive guarded `mac-term.sh` control.\n"
+             f"- `agent_discovery_partial` suppresses host departure counting so silent crashes go unnoticed.\n\n"
+             f"### Proposed fix\n"
+             f"- Require worker launch helpers and supervisor briefs to spawn loops inside named tmux windows rather than detached background processes, and refuse headless worker launches in preflight checks.\n"
+             f"- Document remediation steps for `terminal_window_unreadable` and `agent_discovery_partial` in the fleet operations playbook."),
+            open_index, open_errors, source_mode, related_groups=[("tmux", "standard session transport"), ("role and status file",)],
+            private_terms=private_terms,
+        ))
+
+    # 3. Missing, stale, or degraded ephemeral-port health watch
+    missing_health = [h["key"] for h in reachable_hosts if (h.get("health") or {}).get("status") in (None, "unknown")]
+    stale_health = [h["key"] for h in reachable_hosts
+                    if (h.get("health") or {}).get("status") == "stale" and is_live_host_observation(payload, h)]
+    degraded_health = [h["key"] for h in reachable_hosts
+                       if (h.get("health") or {}).get("status") in ("warning", "critical")
+                       or (h.get("health") or {}).get("process_status") in ("warning", "critical")]
+    if missing_health or stale_health or degraded_health:
+        prio = "P1" if degraded_health else "P2"
+        parts = []
+        if missing_health:
+            parts.append(f"{len(missing_health)} of {max(len(reachable_hosts), 1)} reachable host(s) have `health.status = unknown` (port-watch LaunchAgent not reporting)")
+        if stale_health:
+            parts.append(f"{len(stale_health)} host(s) report stale `port-watch` telemetry")
+        if degraded_health:
+            parts.append(f"{len(degraded_health)} host(s) report warning/critical listener socket pressure")
+        signal_summary = "; ".join(parts)
+        recs.append(build_recommendation(
+            "R-PORT-WATCH", prio, "observability",
+            "Ephemeral TCP port-watch telemetry is missing, stale, or degraded on observed hosts",
+            f"{signal_summary}. High-session hosts without fresh `port-watch` reports cannot detect runaway localhost listeners before macOS ephemeral port exhaustion.",
+            "Install or repair the `port-watch` LaunchAgent on every configured host and add a fleet-wide readiness/install check in `XMechBay`.",
+            {"missing_health_hosts": missing_health, "stale_health_hosts": stale_health, "degraded_health_hosts": degraded_health},
+            [xmb], [("port-watch", "missing"), ("port-watch", "install*"), ("port-watch", "launchagent"), ("port-watch", "fleet"), ("port-watch", "stale")],
+            xmb,
+            "port-watch: audit and enforce LaunchAgent health reporting across all configured fleet hosts",
+            (f"### Problem\n"
+             f"In multi-host fleet observation, {signal_summary}.\n\n"
+             f"### Proposed fix\n"
+             f"- Add a read-only verification / install helper across all hosts in `fleet-status` config confirming that the `port-watch` LaunchAgent is loaded and writing fresh health reports.\n"
+             f"- Remediate runaway localhost listeners at owned idle checkpoints on hosts reporting warning/critical socket occupancy."),
+            open_index, open_errors, source_mode, private_terms=private_terms,
+        ))
+
+    # 4. Claw dispatch readiness: composer drafts, multi-claw ambiguity, missing claws
+    draft_claws = [f"{r.get('host_key')}:{r.get('target_short')}" for r in live_sessions
+                   if r.get("role") == "claw" and isinstance(r.get("host_key"), str) and r.get("host_key") and has_composer_draft(r)]
+    claws_per_host = Counter(r["host_key"] for r in live_sessions
+                             if r.get("role") == "claw" and isinstance(r.get("host_key"), str) and r.get("host_key"))
+    multi_claw_hosts = {h: c for h, c in sorted(claws_per_host.items()) if c >= 2}
+    dead_claws = [k for k, c in sorted(config["claws"].items()) if not claw_targets(payload, c)]
+    if draft_claws or multi_claw_hosts or dead_claws:
+        parts = []
+        if draft_claws:
+            parts.append(f"{len(draft_claws)} live claw session(s) hold unsent composer drafts")
+        if multi_claw_hosts:
+            parts.append(f"{len(multi_claw_hosts)} host(s) run multiple concurrent claw sessions")
+        if dead_claws:
+            parts.append(f"{len(dead_claws)} configured claw(s) have no live controllable session")
+        signal_summary = "; ".join(parts)
+        recs.append(build_recommendation(
+            "R-CLAW-DISPATCH", "P1", "supervision",
+            "Claw dispatch requires role-status identity and live controllable supervisor sessions",
+            (f"{signal_summary}. Static window `target_hint` IDs drift when Terminal or tmux restarts, "
+             "and missing or ambiguous supervisor sessions block automated delegation."),
+            "Publish machine-readable claw role/status files so `fleet-ops` can route findings and resolve targets by role rather than static window hints, retire duplicate coordinator claws, and ensure configured claws run in named tmux sessions.",
+            {"draft_claws": draft_claws, "multi_claw_hosts": multi_claw_hosts, "dead_claws": dead_claws},
+            [xmb, claw_repo],
+            [("label claw sessions by role",), ("route findings by claw role",), ("role and status file",), ("claw", "status file*")],
+            xmb,
+            "Delegation: resolve claw roles and dispatch targets from machine-readable claw status files",
+            (f"### Problem\n"
+             f"Fleet delegation check observed: {signal_summary}.\n\n"
+             f"### Proposed fix\n"
+             f"- Publish machine-readable claw role/status files per supervisor checkout and route `fleet-ops` findings by role instead of host catch-alls.\n"
+             f"- Ensure every configured claw runs inside a persistent named tmux session and retire leftover duplicate coordinator claws."),
+            open_index, open_errors, source_mode, private_terms=private_terms,
+        ))
+
+    # 5. Manifest vs CANONICAL_MECHS drift
+    untracked_mechs = sorted(set(by_mech) - set(issues)) if issues else []
+    if untracked_mechs:
+        recs.append(build_recommendation(
+            "R-MANIFEST-CLASSIFICATION", "P2", "observability",
+            "Canonical Mech list drift between live sessions and fleet manifest backlog",
+            f"{len(untracked_mechs)} active Mech loop(s) ({', '.join(untracked_mechs)}) are absent from the backlog manifest query.",
+            "Derive `fleet-session-status` Mech membership directly from the claw fleet manifest and complete manifest onboarding for active Mechs.",
+            {"mechs_missing_from_manifest_backlog": untracked_mechs},
+            [xmb, claw_repo],
+            [("derive the mech list", "manifest"), ("canonical_mechs",), ("mech membership", "manifest"), ("not a declared fleet member",)],
+            xmb,
+            "fleet-session-status: derive canonical Mech membership from the claw fleet manifest",
+            (f"### Problem\n"
+             f"`CANONICAL_MECHS` in `fleet_view.py` and the claw fleet manifest can drift, leaving {len(untracked_mechs)} active Mech repository loop(s) omitted from backlog queries or misclassified.\n\n"
+             f"### Proposed fix\n"
+             f"- Read canonical Mech membership from the fleet manifest with a static fallback for standalone use."),
+            open_index, open_errors, source_mode, private_terms=private_terms,
+        ))
+
+    # 6. Per-repository systemic CI check-failure cohorts
+    for mech, repo_data in sorted(issues.items()):
+        if not isinstance(repo_data, dict) or repo_data.get("error"):
+            continue
+        prs = repo_data.get("prs", [])
+        failing = [p["number"] for p in prs if isinstance(p, dict) and p.get("checks") in ("FAILURE", "ERROR")]
+        if len(failing) >= t["pr_ci_cohort_min"] and len(failing) / max(len(prs), 1) >= t["pr_ci_cohort_ratio"]:
+            repo_slug = repo_data.get("repo") or xmb
+            drafts = sum(1 for p in prs if isinstance(p, dict) and p.get("draft"))
+            recs.append(build_recommendation(
+                f"R-CI-COHORT-{mech.upper()}", "P1", "workflow",
+                f"{mech}: systemic CI failure across {len(failing)} of {len(prs)} sampled open PRs",
+                (f"{len(failing)} of {len(prs)} sampled open PRs ({round(100 * len(failing) / len(prs))}%) in `{repo_slug}` fail status checks "
+                 f"({drafts} drafts). Per the fleet operations playbook, mass check failures indicate one shared base-branch, pin, or workflow cause rather than independent PR defects."),
+                f"Pause new PR creation in `{repo_slug}`, isolate the shared failing check from 2-3 representative runs, fix it once on `main`, and batch-revalidate.",
+                {"mech": mech, "repo": repo_slug, "failing_prs": len(failing), "sampled_prs": len(prs), "sample_numbers": failing[:15]},
+                [repo_slug],
+                [("open prs", "fail*"), ("prs", "failing checks"), ("prs", "fail*", "check*"), ("shared", "ci", "fail*")],
+                repo_slug,
+                f"CI: {len(failing)} of {len(prs)} sampled open PRs fail checks (shared root-cause fix)",
+                (f"### Problem\n"
+                 f"`fleet-ops` observed {len(failing)} of {len(prs)} sampled open PRs ({drafts} drafts) failing checks in `{repo_slug}` "
+                 f"(sample PRs: {', '.join(f'#{n}' for n in failing[:10])}).\n\n"
+                 f"### Proposed fix\n"
+                 f"- Inspect 2-3 representative failing workflow runs to identify the shared root cause (e.g., pinned source/site check, schema/dependency drift).\n"
+                 f"- Fix the shared cause once on `main` before rebasing or rerunning open PRs."),
+                open_index, open_errors, source_mode, private_terms=private_terms,
+            ))
+
+    # 7. Fleet-wide PR backlog accumulation, >100 PR truncation, and publication stalls
+    stalled_mechs = sorted({f["mech"] for f in findings if f.get("mech") and "goal stalled" in f["title"]})
+    over_wip = {m: d["open_prs"] for m, d in sorted(issues.items()) if isinstance(d, dict) and not d.get("error") and d.get("open_prs", 0) >= t["pr_backlog_warn"]}
+    truncated_100 = {m: d["open_prs"] for m, d in sorted(issues.items()) if isinstance(d, dict) and not d.get("error") and d.get("open_prs", 0) > 100}
+    if len(stalled_mechs) >= 3 or len(over_wip) >= 3 or truncated_100:
+        parts = []
+        if stalled_mechs:
+            parts.append(f"{len(stalled_mechs)} Mech(s) are in `Goal stalled`")
+        if over_wip:
+            parts.append(f"{len(over_wip)} Mech(s) exceed the {t['pr_backlog_warn']}-PR backlog warning ({sum(over_wip.values())} open PRs across those queues)")
+        if truncated_100:
+            parts.append(f"{len(truncated_100)} repository queue(s) exceed the 100-PR single-page GraphQL window")
+        signal_summary = "; ".join(parts)
+        recs.append(build_recommendation(
+            "R-CLOSURE-THROUGHPUT", "P1", "workflow",
+            "PR generation outpaces closure, stalling Mech loops and truncating >100-PR queries",
+            f"{signal_summary}.",
+            "Enforce per-Mech open-PR WIP caps before new discovery stages, route green PR cohorts to a dedicated closure steward, paginate `collect_issues` past 100 PRs, and align automatic-approval scope for routine PR publication.",
+            {"stalled_mechs": stalled_mechs, "over_wip_open_prs": over_wip, "over_100_open_prs": truncated_100},
+            [claw_repo, xmb],
+            [("pr production outpaces review",), ("open-pr", "limit*"), ("open-pr", "wip"), ("automatic approval review refuses publication",), ("first 100 open prs",)],
+            claw_repo,
+            "Fleet workflow: enforce per-Mech open-PR WIP limits and unblock publication closure stalls",
+            (f"### Problem\n"
+             f"Fleet backlog analysis observed: {signal_summary}.\n\n"
+             f"### Proposed fix\n"
+             f"- Gate new record-production cycles when a Mech exceeds its open-PR WIP cap.\n"
+             f"- Batch adversarial review and stale-draft triage via the closure steward role, and paginate backlog queries past 100 PRs."),
+            open_index, open_errors, source_mode, private_terms=private_terms,
+        ))
+
+    # 8. Swap saturation, multi-host duplicate Mech loops, and session sprawl
+    swap_hosts = [h for h, r in sorted(resources.items())
+                  if isinstance(h, str) and h and isinstance(r, dict) and not r.get("error") and (r.get("swap") or {}).get("total_gib")
+                  and ((r["swap"].get("used_gib") or 0) >= t["swap_warn_min_gib"])
+                  and ((r["swap"].get("used_gib") or 0) / r["swap"]["total_gib"] >= t["swap_warn_ratio"])]
+    multi_mechs = {m: sorted({r["host_key"] for r in rows if isinstance(r.get("host_key"), str) and r.get("host_key")}) for m, rows in sorted(by_mech.items())}
+    multi_mechs = {m: hs for m, hs in multi_mechs.items() if len(hs) >= 2}
+    sprawl_hosts = {f["host"]: f["evidence"].get("non_working") for f in findings if f.get("host") and "non-working agent sessions across all roles" in f["title"]}
+    achieved_hosts = {f["host"]: len(f["evidence"].get("projects", [])) for f in findings if f.get("host") and "parked at Goal achieved" in f["title"]}
+    if len(swap_hosts) >= 2 or len(multi_mechs) >= 2 or sprawl_hosts or achieved_hosts:
+        parts = []
+        if swap_hosts:
+            parts.append(f"{len(swap_hosts)} host(s) exceed {int(t['swap_warn_ratio'] * 100)}% swap usage")
+        if multi_mechs:
+            parts.append(f"{len(multi_mechs)} Mech(s) have concurrent sessions across multiple hosts")
+        if sprawl_hosts:
+            parts.append(f"{len(sprawl_hosts)} host(s) exceed {t['non_working_sessions_warn']} non-working sessions across all roles")
+        if achieved_hosts:
+            parts.append(f"{len(achieved_hosts)} host(s) keep long-parked `Goal achieved` loops open")
+        signal_summary = "; ".join(parts)
+        sprawl_title = ("Fleet-wide swap saturation and idle/duplicate session sprawl"
+                        if swap_hosts else "Duplicate multi-host Mech loops and idle/completed session sprawl")
+        recs.append(build_recommendation(
+            "R-SWAP-SESSION-SPRAWL", "P1", "capacity",
+            sprawl_title,
+            f"{signal_summary}.",
+            "Assign each active Mech to a single primary host/loop, gracefully exit duplicate idle and parked `Goal achieved` sessions at owned checkpoints, and cap concurrent sessions per host.",
+            {"swap_hosts": swap_hosts, "multi_host_mechs": multi_mechs, "sprawl_hosts": sprawl_hosts, "achieved_hosts": achieved_hosts},
+            [xmb],
+            [("one primary loop per mech",), ("retire duplicate idle sessions",), ("swap near full",), ("session sprawl",)],
+            xmb,
+            "Fleet memory: enforce one primary loop per Mech and retire idle/completed session sprawl",
+            (f"### Problem\n"
+             f"Fleet session and memory audit observed: {signal_summary}.\n\n"
+             f"### Proposed fix\n"
+             f"- Enforce one primary host/session per Mech and retire duplicate idle or long-achieved sessions via the graceful exit protocol."),
+            open_index, open_errors, source_mode, private_terms=private_terms,
+        ))
+
+    # 9a. Codex rollout log growth
+    codex_hosts = {h: (r.get("codex_sessions") or {}).get("gib") for h, r in sorted(resources.items())
+                   if isinstance(h, str) and h and isinstance(r, dict) and not r.get("error")
+                   and ((r.get("codex_sessions") or {}).get("gib") or 0) >= t["codex_sessions_warn_gib"]}
+    low_disk = {h: (r.get("disk") or {}).get("free_gib") for h, r in sorted(resources.items())
+                if isinstance(h, str) and h and isinstance(r, dict) and not r.get("error")
+                and (r.get("disk") or {}).get("free_gib") is not None and r["disk"]["free_gib"] < t["disk_warn_gib"]}
+    if codex_hosts:
+        total_codex_gib = round(sum(codex_hosts.values()), 1)
+        disk_note = f" while {len(low_disk)} host(s) also have < {t['disk_warn_gib']} GiB free disk" if low_disk else ""
+        recs.append(build_recommendation(
+            "R-CODEX-LOG-ARCHIVE", "P1", "capacity",
+            "Unarchived Codex session rollouts accumulate significant host disk usage",
+            f"{len(codex_hosts)} host(s) hold >= {t['codex_sessions_warn_gib']} GiB in `.codex/sessions` ({total_codex_gib} GiB combined){disk_note}.",
+            "Deploy verified archiving of closed Codex rollouts older than 14 days into checksummed `tar.zst` bundles before removing originals.",
+            {"codex_sessions_gib": codex_hosts, "low_disk_free_gib": low_disk},
+            [xmb],
+            [("archiving of closed codex session logs",), ("codex session logs", "archiv*")],
+            xmb,
+            "Maintained, verified archiving of closed Codex session logs",
+            (f"### Problem\n"
+             f"{len(codex_hosts)} host(s) hold >= {t['codex_sessions_warn_gib']} GiB in `.codex/sessions` ({total_codex_gib} GiB combined){disk_note}.\n\n"
+             f"### Proposed fix\n"
+             f"- Archive closed Codex session rollouts older than 14 days into verified per-day `tar.zst` archives before removing originals."),
+            open_index, open_errors, source_mode, private_terms=private_terms,
+        ))
+
+    # 9b. Low free disk headroom
+    if low_disk:
+        crit_disk = {h: v for h, v in low_disk.items() if v < t["disk_critical_gib"]}
+        prio = "P0" if crit_disk else "P1"
+        crit_note = f" ({len(crit_disk)} below critical {t['disk_critical_gib']} GiB floor)" if crit_disk else ""
+        recs.append(build_recommendation(
+            "R-DISK-HEADROOM", prio, "capacity",
+            "Low free disk headroom threatens builds and tmp-state guard rescues",
+            f"{len(low_disk)} host(s) have less than {t['disk_warn_gib']} GiB free disk{crit_note} (minimum observed: {min(low_disk.values())} GiB).",
+            "Run a read-only space inventory (`disk-usage-report` / `fleet-repo-crud-cleanup`), pause disk-heavy KG/corpus builds below the critical floor, and remove only approved, verified-regenerable artifacts.",
+            {"low_disk_free_gib": low_disk, "critical_disk_hosts": crit_disk},
+            [xmb],
+            [("free disk", "headroom"), ("free-disk", "gates"), ("low-disk", "hosts"), ("low free disk", "fleet"), ("disk-heavy", "floor")],
+            xmb,
+            "Fleet capacity: enforce preflight free-disk gates and reclaim regenerable build scratch on low-disk hosts",
+            (f"### Problem\n"
+             f"{len(low_disk)} observed host(s) have < {t['disk_warn_gib']} GiB free disk{crit_note}, risking failed builds and skipped `tmp-state` rescues.\n\n"
+             f"### Proposed fix\n"
+             f"- Gate disk-heavy workflows when host free space is below {t['disk_critical_gib']} GiB and run reviewed `fleet-repo-crud-cleanup` passes."),
+            open_index, open_errors, source_mode,
+            related_groups=[("nearly full disk",), ("disk-proposal",), ("disk-audit",)],
+            private_terms=private_terms,
+        ))
+
+    # 10. tmp-state guard incomplete / unrescued / missing entries
+    guard_hosts = {f["host"]: f["title"] for f in findings if "tmp-state guard" in f["title"] and f.get("host")}
+    if guard_hosts:
+        has_unrescued = any("unrescued" in v for v in guard_hosts.values())
+        has_incomplete = any("incomplete" in v for v in guard_hosts.values())
+        prio = "P0" if has_unrescued else "P2"
+        if has_unrescued:
+            guard_match = [("tmp-state guard", "unrescued"), ("tmp-state guard", "skip*"), ("tmp-state guard", "entry cap")]
+            guard_draft_title = "tmp-state guard: resolve unrescued temporary-root work across fleet hosts"
+        elif has_incomplete:
+            guard_match = [("tmp-state guard", "incomplete"), ("tmp-state guard", "unknown")]
+            guard_draft_title = "tmp-state guard: resolve incomplete durability status and unknown entries"
+        else:
+            guard_match = [("tmp-state guard", "not installed"), ("tmp-state guard", "no report"), ("tmp-state guard", "stale")]
+            guard_draft_title = "tmp-state guard: install or repair stale LaunchAgent reporting across fleet hosts"
+        recs.append(build_recommendation(
+            "R-TMP-GUARD", prio, "capacity",
+            "tmp-state guard runs report non-clean durability status",
+            f"`tmp-state` guard flagged {len(guard_hosts)} host(s), preventing clean exit-0 durability verification across `/tmp` and `$TMPDIR`.",
+            "Install/verify the `tmp-state` LaunchAgent, classify gutted empty clones cleanly, exclude regenerable ignored build outputs from rescue sizing, and rescue small high-risk entries before hitting disk-floor caps.",
+            {"guard_findings": guard_hosts},
+            [xmb],
+            guard_match,
+            xmb,
+            guard_draft_title,
+            (f"### Problem\n"
+             f"`tmp-state` guard reported non-clean status across {len(guard_hosts)} observed host(s).\n\n"
+             f"### Proposed fix\n"
+             f"- Ensure the LaunchAgent runs cleanly on every host, handle already-cleaned clones without failing as unknown, and prioritize small real-work rescues near the free-space floor."),
+            open_index, open_errors, source_mode, private_terms=private_terms,
+        ))
+
+    # 11. Claude Code 30-day transcript auto-deletion
+    claude_hosts = {f["host"]: f["evidence"] for f in findings if "Claude Code deletes old transcripts" in f["title"] and f.get("host")}
+    if claude_hosts:
+        recs.append(build_recommendation(
+            "R-CLAUDE-RETENTION", "P1", "capacity",
+            "Claude Code config directories retain the 30-day transcript auto-deletion default",
+            (f"{len(claude_hosts)} host(s) have Claude Code configuration directories (`.claude*`) with unset or <365-day `cleanupPeriodDays`, "
+             "causing Claude Code to silently delete local transcripts older than 30 days and lose session provenance."),
+            "Add an idempotent XMechBay helper/check that archives existing Claude transcripts, backs up each `settings.json`, and sets `cleanupPeriodDays` >= 3650 across all `.claude*` profiles.",
+            {"hosts": claude_hosts},
+            [xmb],
+            [("cleanupperioddays",), ("claude", "transcript*", "delet*"), ("claude", "transcript*", "archiv*"), ("claude", "retention")],
+            xmb,
+            "durability: archive Claude Code transcripts and enforce cleanupPeriodDays across fleet config dirs",
+            (f"### Problem\n"
+             f"`host_resources_probe.py` detected {len(claude_hosts)} host(s) where Claude Code config directories (`.claude`, `.claude-work`, etc.) "
+             f"leave `cleanupPeriodDays` unset (default 30 days) or below 365 days, risking silent deletion of session transcripts and research provenance.\n\n"
+             f"### Proposed fix\n"
+             f"- Provide an idempotent durability script (with `--check` and `--apply`) that archives existing transcripts, backs up each `<dir>/settings.json` as `settings.json.bak-cleanupPeriodDays-<YYYYMMDD>`, and sets `cleanupPeriodDays` to `3650`.\n"
+             f"- Verify the setting across all `.claude*` config directories on every fleet host."),
+            open_index, open_errors, source_mode, private_terms=private_terms,
+        ))
+
+    recs.sort(key=lambda r: (PRIORITY_ORDER.get(r["priority"], 9), r["theme"], r["rule"]))
+    for idx, rec in enumerate(recs, 1):
+        rec["id"] = f"R{idx:02d}"
+    return recs
+
+
+def render_recommendations_md(run_id: str, recs: list, source_mode: str, open_errors: dict) -> str:
+    lines = [
+        f"# Fleet systemic conclusions & recommendations ({run_id})", "",
+        f"Open-issue reconciliation mode: `{source_mode}`."
+        + (f" Lookup warnings: `{json.dumps(open_errors, sort_keys=True)}`." if open_errors else "")
+        + " Nothing has been filed on GitHub; creating any issue requires explicit user approval.", "",
+        "## Summary table", "",
+        "| ID | Priority | Theme | Status | Tracked / Target | Title |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in recs:
+        tr = r["tracking"]
+        rid = r.get("id") or r.get("rule", "R00")
+        if tr["matched_issues"]:
+            ref = ", ".join(f"{m['repo']}#{m['number']}" for m in tr["matched_issues"][:4])
+        else:
+            ref = (tr["issue_draft"] or {}).get("repo", "—")
+        lines.append(f"| {rid} | {r['priority']} | {r['theme']} | `{tr['status']}` | {ref} | {r['title']} |")
+    lines += ["", "## Detailed conclusions & recommendations", ""]
+    for r in recs:
+        tr = r["tracking"]
+        rid = r.get("id") or r.get("rule", "R00")
+        lines += [
+            f"### {rid} [{r['priority']} · {r['theme']}] {r['title']}", "",
+            f"- **Conclusion:** {r['conclusion']}",
+            f"- **Recommendation:** {r['recommendation']}",
+            f"- **Tracking (`{tr['status']}`):** " + (
+                ", ".join(f"[{m['repo']}#{m['number']}]({m['url']}) ({m['title']})" for m in tr["matched_issues"])
+                if tr["matched_issues"] else f"Candidate issue for `{(tr.get('issue_draft') or {}).get('repo', '—')}` — `{(tr.get('issue_draft') or {}).get('title', '—')}`"
+            ),
+            f"- **Evidence:** `{json.dumps(r['evidence'], sort_keys=True)}`", "",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def render_issue_drafts_md(run_id: str, recs: list, private_terms=()) -> str:
+    safe_run_id = sanitize_public_text(str(run_id), private_terms=private_terms)
+    drafts = [r for r in recs if r["tracking"].get("issue_draft")]
+    lines = [
+        f"# Candidate GitHub issue drafts ({safe_run_id})", "",
+        "Prepared read-only by `fleet_ops.py recommend`. **Do not run `gh issue create` without explicit per-issue human permission** "
+        "naming the destination repository and title. Draft bodies omit hostnames, local paths and account mentions.", "",
+    ]
+    if not recs:
+        lines.append("No systemic recommendations were triggered by this run.")
+        return "\n".join(lines) + "\n"
+    if not drafts:
+        lines.append("All synthesized systemic recommendations are already tracked by open GitHub issues.")
+        return "\n".join(lines) + "\n"
+    for r in drafts:
+        tr = r["tracking"]
+        d = tr["issue_draft"]
+        rid = r.get("id") or r.get("rule", "R00")
+        safe_repo = sanitize_public_text(str(d.get("repo") or ""), private_terms=private_terms)
+        safe_title = sanitize_public_text(str(d.get("title") or ""), private_terms=private_terms)
+        safe_body = sanitize_public_text(str(d.get("body") or "").rstrip(), private_terms=private_terms)
+        badge = "" if tr["status"] == "new_issue" else f" ({tr['status']} — verify open issues before filing)"
+        lines += [
+            f"## {rid} [{r['priority']}] `{safe_repo}` — {safe_title}{badge}", "",
+            "```markdown",
+            safe_body,
+            "```", "",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def recommend(run_dir: Path, config: dict, open_issues_json: Path | None = None,
+              no_github: bool = False, infra_overrides: list | None = None) -> dict:
+    if open_issues_json and no_github:
+        raise SystemExit("--open-issues-json and --no-github are mutually exclusive")
+    for item in infra_overrides or []:
+        key, sep, val = str(item).partition("=")
+        if not sep or not key:
+            raise SystemExit(f"--infra-repo must be KEY=OWNER/REPO, got {item!r}")
+        if key not in DEFAULT_INFRA_REPOS:
+            raise SystemExit(f"--infra-repo key must be one of {sorted(DEFAULT_INFRA_REPOS)}, got {key!r}")
+        if not is_valid_repo_slug(val):
+            raise SystemExit(f"--infra-repo value must be OWNER/REPO, got {val!r}")
+        config["infra_repos"][key] = val
+    run_dir = ensure_private_dir(run_dir, enforce_leaf_mode=False, create=False)
+    payload = json.loads((run_dir / "sessions.json").read_text())
+    resources = json.loads((run_dir / "resources.json").read_text()) if (run_dir / "resources.json").exists() else {}
+    issues = json.loads((run_dir / "issues.json").read_text()) if (run_dir / "issues.json").exists() else {}
+    findings = analyze(payload, resources, issues, config)
+
+    t = config["thresholds"]
+    repos_needed = {config["infra_repos"]["xmechbay"], config["infra_repos"]["claw"]}
+    for repo_data in issues.values():
+        if not isinstance(repo_data, dict) or repo_data.get("error"):
+            continue
+        prs = repo_data.get("prs", [])
+        failing = [p for p in prs if isinstance(p, dict) and p.get("checks") in ("FAILURE", "ERROR")]
+        if len(failing) >= t["pr_ci_cohort_min"] and len(failing) / max(len(prs), 1) >= t["pr_ci_cohort_ratio"] and repo_data.get("repo"):
+            repos_needed.add(repo_data["repo"])
+
+    private_terms = collect_private_host_terms(config, payload, resources)
+    open_index, open_errors, source_mode = load_open_issue_index(repos_needed, open_issues_json=open_issues_json, no_github=no_github)
+    recs = synthesize_recommendations(payload, resources, issues, findings, config,
+                                      open_index=open_index, open_errors=open_errors,
+                                      source_mode=source_mode, private_terms=private_terms)
+    out = ensure_private_dir(run_dir / "recommendations", enforce_leaf_mode=True)
+    if source_mode == "github":
+        write_private_file(out / "open_issues_snapshot.json", json.dumps(open_index, indent=1) + "\n")
+    summary = {
+        "run": run_dir.name,
+        "source_mode": source_mode,
+        "total": len(recs),
+        "by_status": dict(Counter(r["tracking"]["status"] for r in recs)),
+        "new_issue_drafts": [
+            {"id": r["id"], "priority": r["priority"], "repo": r["tracking"]["issue_draft"]["repo"], "title": r["tracking"]["issue_draft"]["title"]}
+            for r in recs if r["tracking"]["status"] == "new_issue" and r["tracking"].get("issue_draft")
+        ],
+        "tracked": [
+            {"id": r["id"], "issues": [f"{m['repo']}#{m['number']}" for m in r["tracking"]["matched_issues"]]}
+            for r in recs if r["tracking"]["status"] == "tracked"
+        ],
+        "lookup_errors": open_errors,
+        "recommendations": recs,
+    }
+    write_private_file(out / "recommendations.json", json.dumps(summary, indent=1) + "\n")
+    write_private_file(out / "RECOMMENDATIONS.md", render_recommendations_md(run_dir.name, recs, source_mode, open_errors))
+    write_private_file(out / "ISSUE_DRAFTS.md", render_issue_drafts_md(run_dir.name, recs, private_terms=private_terms))
+    return {k: v for k, v in summary.items() if k != "recommendations"}
+
+
+# --------------------------------------------------------------------------- CLI
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", type=Path, default=Path(os.environ.get("XMECHBAY_FLEET_OPS_CONFIG", ROOT / ".local/fleet-ops.json")))
+    sub = parser.add_subparsers(dest="command", required=True)
+    obs = sub.add_parser("observe", help="collect sessions, resources and backlog; write findings and REPORT.md")
+    obs.add_argument("--out", type=Path, help="run directory (default .local/fleet-ops/runs/<UTC>)")
+    obs.add_argument("--snapshot", type=Path, help="offline fleet-session-status fixture instead of live collection")
+    obs.add_argument("--status-json", type=Path, help="use a saved /api/status payload")
+    obs.add_argument("--dashboard-url", help="read sessions from a running dashboard, e.g. http://127.0.0.1:8765")
+    obs.add_argument("--resources-json", type=Path, help="use saved probe results {host: probe} instead of probing")
+    obs.add_argument("--issues-json", type=Path, help="use saved backlog data instead of querying GitHub")
+    obs.add_argument("--no-issues", action="store_true", help="skip the GitHub backlog")
+    pl = sub.add_parser("plan", help="write claw briefs, goals, decisions and dispatch commands for a run")
+    pl.add_argument("run_dir", type=Path)
+    rc = sub.add_parser("recommend", help="synthesize systemic conclusions, reconcile open issues and draft non-duplicate GitHub issues")
+    rc.add_argument("run_dir", type=Path)
+    rc_src = rc.add_mutually_exclusive_group()
+    rc_src.add_argument("--open-issues-json", type=Path, help="offline {owner/repo: [{number, title, url}]} snapshot instead of querying gh")
+    rc_src.add_argument("--no-github", action="store_true", help="skip gh open-issue queries (marks drafts unverified_offline)")
+    rc.add_argument("--infra-repo", action="append", default=[], metavar="KEY=OWNER/REPO",
+                    help="override infra_repos entry (xmechbay or claw)")
+    args = parser.parse_args(argv)
+    config = load_config(args.config)
+    if args.command == "plan":
+        summary = plan(args.run_dir, config)
+        print(json.dumps(summary, indent=1))
+        return 0
+    if args.command == "recommend":
+        summary = recommend(args.run_dir, config, open_issues_json=args.open_issues_json,
+                            no_github=args.no_github, infra_overrides=args.infra_repo)
+        print(json.dumps(summary, indent=1))
+        return 0
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = ensure_private_dir(args.out or (ROOT / ".local/fleet-ops/runs" / run_id), enforce_leaf_mode=True)
+    started = time.time()
+
+    def save(name, data):  # each part is kept as soon as it exists, so a later failure loses nothing
+        write_private_file(run_dir / name, json.dumps(data, indent=1) + "\n")
+        return data
+
+    payload = save("sessions.json", collect_sessions(args, config))
+    host_keys = [h["key"] for h in (payload.get("hosts") or []) if isinstance(h, dict) and isinstance(h.get("key"), str) and h["key"]]
+    resources = save("resources.json", json.loads(args.resources_json.read_text()) if args.resources_json
+                     else collect_resources(config, host_keys))
+    if args.issues_json:
+        issues = json.loads(args.issues_json.read_text())
+    elif args.no_issues:
+        issues = {}
+    else:
+        issues = collect_issues(fleet_repos(config))
+    save("issues.json", issues)
+    findings = save("findings.json", analyze(payload, resources, issues, config))
+    report = render_report(run_dir.name, payload, resources, issues, findings, config)
+    write_private_file(run_dir / "REPORT.md", report)
+    print(report)
+    print(f"run: {run_dir} ({time.time() - started:.0f} s); next: fleet_ops.py plan {run_dir}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

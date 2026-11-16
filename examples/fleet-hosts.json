@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "hosts": {
+    "workstation-local": {
+      "transport": "local",
+      "label": "Local Workstation",
+      "python": "/usr/bin/python3"
+    },
+    "laptop-a": {
+      "host": "worker-a.example.invalid",
+      "label": "Laptop A",
+      "python": "/usr/bin/python3"
+    },
+    "laptop-b": {
+      "host": "worker-b.example.invalid",
+      "label": "Laptop B",
+      "python": "/usr/bin/python3"
+    }
+  },
+  "aliases": {
+    "local": "workstation-local",
+    "a": "laptop-a",
+    "b": "laptop-b"
+  },
+  "max_health_age_seconds": 120,
+  "state_dir": "fleet-status-state"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "Public source linear history",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {"include": ["~ALL"], "exclude": []}
+  },
+  "rules": [
+    {"type": "non_fast_forward"},
+    {"type": "required_linear_history"}
+  ]
+}
