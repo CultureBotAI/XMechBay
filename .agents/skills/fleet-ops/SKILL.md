@@ -47,13 +47,26 @@ findings first; the backlog rows can be long.
 | Owner | Gets | Examples |
 |---|---|---|
 | **user** | Decisions only the user can make | merges, human prompts across any role (approval, question, sign-in, trust, update), unsent composer drafts on claws/MechBay, usage limits, supervisor (`claw`/`mechbay`) or non-Mech stalls, starting a missing claw, dormant Mechs |
-| **claw** (responsible for the Mech) | Mech work | stalled or paused goals, failing or stale PRs, backlog batching, a Mech's oversized working data |
-| **XMechBay maintenance** | Host observability, health and durability | unreachable/partial host collection (`tmux_probe_failed`, `terminal_window_unreadable`, `agent_discovery_partial`), blind `P*` process clusters, missing/stale/degraded `port-watch` health, disk, swap, temporary roots, Codex logs, tmp-state guard, transcript retention, idle/all-role session sprawl, parked `Goal achieved` loops, multi-host duplicate Mech loops |
+| **claw** (role-routed or explicit owner) | Mech work, read-only closure review, or host-local hygiene | `discovery_supervisor`: bounded discovery/add-record work in `discover` lane; `stewardship_supervisor`: stalls, pauses, failing PRs, PR/issue backlog batching in `steward` lane; `infrastructure_supervisor`: systemic CI cohorts and pinned bootstrap Mechs (`infra` lane); `closure_steward`: read-only diff review of unapproved green PRs and stale-draft triage; `fleet_maintainer`: reachable same-host and multi-host session/storage hygiene |
+| **XMechBay maintenance** | Coordinator-owned observability, unreachable hosts, and unmaintained hosts | unreachable hosts (`reachable: false`), failed resource probes, and host observability/resource/durability/hygiene findings on hosts without a live `fleet_maintainer` claw |
 
-A Mech's claw is resolved in this order: `mech_owner` in the config; a claw
-whose `mechs` list names the Mech; otherwise a catch-all claw (`"mechs": ["*"]`)
-on the host running the Mech's busiest loop. Record real ownership in
-`mech_owner` rather than relying on the fallback.
+A Mech's primary writer claw is resolved in this order:
+1. `mech_owner` in the config;
+2. a claw whose `mechs` list explicitly names the Mech;
+3. when any claw declares `roles` (see [`docs/claw-roles.md`](../../../docs/claw-roles.md)),
+   the Mech's observed backlog lane:
+   - `infra` (`>= pr_ci_cohort_min` and `>= pr_ci_cohort_ratio` failing PRs) -> `infrastructure_supervisor` (falling back to `stewardship_supervisor` / `cycle_supervisor`);
+   - `steward` (`open_prs >= pr_backlog_warn`, any failing check, or `open_issues >= issue_steward_warn`) -> `stewardship_supervisor` (or `cycle_supervisor`);
+   - `discover` (healthy queue below those thresholds) -> `discovery_supervisor` (or `cycle_supervisor`);
+   - `unknown` (`--no-issues` or query error) -> host-matched `stewardship_supervisor` / `cycle_supervisor` (never triggers blind discovery);
+4. otherwise a catch-all supervisor claw (`"mechs": ["*"]`) on the host running
+   the Mech's busiest loop.
+
+An explicit `"mechs": []` (or a claw holding only `closure_steward` /
+`fleet_maintainer`) never acts as a catch-all primary Mech owner. When a live
+`closure_steward` claw is configured, `user:merges` keeps merge authority while
+`closure_steward` receives a read-only diff-review finding for unapproved green
+PRs and owns stale-draft triage.
 
 ## 3. Plan
 
@@ -128,9 +141,11 @@ explicit yes/no approval in the current conversation.
    - a Terminal claw must be tab 1, and the plan's first command lists the
      window so you can check that its selected tab has the claw's tty, because
      `mac-term.sh paste` types into the selected tab;
-   - a claw inside a tmux session other than the controller's owned session
-     (`hosts.<key>.tmux_session`, default `fleet`), or without a `tmux_window`
-     name, is left unresolved; the plan never retargets `XMECHBAY_TMUX_SESSION`.
+   - a claw inside a tmux session other than its configured controller-owned
+     session (`claws.<key>.tmux_session`, falling back to
+     `hosts.<key>.tmux_session`, then `controller_tmux_session`, default
+     `fleet`), or without a `tmux_window` name, is left unresolved; the plan
+     never retargets `XMECHBAY_TMUX_SESSION` to an unconfigured session.
    All paths in `DISPATCH.md` are absolute, so it runs from any directory.
 3. **Canary one claw**: copy its brief to the claw's host, read the screen,
    paste the goal with `mac-term.sh paste` (Terminal) or `tmux-paste` (tmux),
@@ -163,9 +178,14 @@ ignored `.local/fleet-ops.json` (or set `XMECHBAY_FLEET_OPS_CONFIG`):
   campaign's `.temp`. A watched path whose name contains a Mech is routed to
   that Mech's claw.
 - `claws.<key>`: `host`, `label`, `repo` (the claw checkout's basename),
-  `mechs` (names or `"*"`), `brief_dir` on that host, optional `target_hint`.
-- `mech_owner`: explicit Mech-to-claw ownership.
-- `hosts.<key>.tmux_session`: the controller-owned tmux session on that host.
+  `mechs` (explicit Mech names, `["*"]` for catch-all supervisors, or `[]` for
+  non-catch-all role claws), optional `roles` (`discovery_supervisor`,
+  `stewardship_supervisor`, `infrastructure_supervisor`, `closure_steward`,
+  `fleet_maintainer`, `cycle_supervisor`), `brief_dir` on that host, optional
+  `target_hint`, and optional `tmux_session` (when one host runs multiple
+  controller-owned tmux sessions).
+- `mech_owner`: explicit Mech-to-claw ownership overrides.
+- `hosts.<key>.tmux_session`: default controller-owned tmux session on that host.
 - `infra_repos`: map of infrastructure repositories (`xmechbay`, `claw`) checked
   and targeted by `recommend` (defaults to `CultureBotAI/XMechBay` and
   `CultureBotAI/culturebotai-claw`; overridable via `--infra-repo KEY=OWNER/REPO`).
@@ -174,7 +194,7 @@ ignored `.local/fleet-ops.json` (or set `XMECHBAY_FLEET_OPS_CONFIG`):
   `watch_warn_gib`, `codex_sessions_warn_gib`, `guard_stale_hours`,
   `idle_sessions_warn`, `non_working_sessions_warn`, `blind_sessions_warn`,
   `achieved_goal_age_hours`, `pr_stale_days`, `pr_backlog_warn`,
-  `pr_ci_cohort_min`, `pr_ci_cohort_ratio`).
+  `issue_steward_warn`, `pr_ci_cohort_min`, `pr_ci_cohort_ratio`).
 
 Keep the real config, runs, briefs and dispatch records under `.local/`; they
 hold hostnames and paths. Only synthetic examples belong in Git.
