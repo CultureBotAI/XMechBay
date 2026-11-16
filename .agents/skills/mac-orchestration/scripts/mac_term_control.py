@@ -379,7 +379,7 @@ class Controller:
             if after_input:
                 raise OutcomeUnknown("input was attempted but the screen could not be read; "
                                      "outcome unknown; no further input sent; "
-                                     "read the screen before retrying") from None
+                                     "inspect the target screen; do not repeat earlier input") from None
             raise ScreenUnreadable("cannot read target screen; no further input sent") from exc
 
     def guard(self, target, tmux=False, consume=False, after_input=False):
@@ -399,7 +399,12 @@ class Controller:
             if (not self.override_available or signature != self.override_screen
                     or "SIGN-IN" in states):
                 self.override_available = False
-                self.record(target, "refused", states)
+                self.record(target, "outcome-unknown" if after_input else "refused", states)
+                if after_input:
+                    raise OutcomeUnknown("earlier input was attempted; target now shows " +
+                                         ", ".join(states) + "; remaining input stopped; "
+                                         "no further input sent; inspect the target screen; "
+                                         "do not repeat earlier input")
                 raise Refused("target shows " + ", ".join(states) + "; no input sent")
             if consume:
                 self.record(target, "explicit-user-override", states)
@@ -410,7 +415,7 @@ class Controller:
         return screen
 
     def send(self, target, text, after_input=False):
-        # Compound paste calls this after delivering text but before Enter.
+        # Compound paste and key sequences retain the earlier input's phase.
         self.guard(target, consume=True, after_input=after_input)
         self.transport.apple(SEND_SCRIPT, target, text)
         time.sleep(0.8)
@@ -602,8 +607,8 @@ def main(argv=None):
         for value in values:
             if value not in KEYS and (len(value) != 1 or ord(value) < 32 or 127 <= ord(value) < 160):
                 parser.error("use a named key or one printable character")
-        for value in values:
-            screen = control.send(target, KEYS.get(value, value))
+        for index, value in enumerate(values):
+            screen = control.send(target, KEYS.get(value, value), after_input=index > 0)
     elif args.command in ("paste", "tmux-paste"):
         if len(values) != 1:
             parser.error("one prompt file required")

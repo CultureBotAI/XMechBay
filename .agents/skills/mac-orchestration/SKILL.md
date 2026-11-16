@@ -66,6 +66,11 @@ that the input failed. Neither condition triggers an automatic retry or later
 input. Read the target screen and establish what happened before retrying. An SCP
 failure occurs before input and is reported as such.
 
+If a prompt blocks Enter after a paste or a later key in a sequence, earlier input
+has already been attempted. The tool records an unknown outcome with the detected
+prompt state and stops the remaining input. Inspect the target before continuing;
+do not repeat the earlier paste or keys merely because the sequence stopped.
+
 The helper requires Terminal to be running already and refuses to launch it.
 `open DIRECTORY [COMMAND]` creates a new window in that existing app; use it only
 for a user-requested session. `front` and `cascade` change the existing layout.

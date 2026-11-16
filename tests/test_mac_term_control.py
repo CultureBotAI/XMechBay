@@ -195,8 +195,8 @@ class GuardTests(unittest.TestCase):
         fake = FakeTransport([IDLE, "Requesting permission", "Requesting permission"])
         controller = self.controller(fake)
         controller.send("123", "1")
-        with self.assertRaises(control.Refused):
-            controller.send("123", "")
+        with self.assertRaises(control.OutcomeUnknown):
+            controller.send("123", "", after_input=True)
         self.assertEqual(sum(event[0] == "apple-input" for event in fake.events), 1)
 
     def test_override_cannot_authorize_next_key_prompt(self):
@@ -205,8 +205,8 @@ class GuardTests(unittest.TestCase):
                 fake = FakeTransport(["Update available", later, later])
                 controller = self.controller(fake, "User instructed skip update")
                 controller.send("123", "")
-                with self.assertRaises(control.Refused):
-                    controller.send("123", "")
+                with self.assertRaises(control.OutcomeUnknown):
+                    controller.send("123", "", after_input=True)
                 self.assertEqual(sum(event[0] == "apple-input" for event in fake.events), 1)
 
     def test_override_does_not_arm_on_initially_unprompted_screen(self):
@@ -231,7 +231,7 @@ class GuardTests(unittest.TestCase):
             with self.subTest(tmux=tmux):
                 fake = FakeTransport(["Type your answer", "Type your answer", "Requesting permission"])
                 controller = self.controller(fake, "User supplied the answer", command="paste")
-                with self.assertRaises(control.Refused):
+                with self.assertRaises(control.OutcomeUnknown):
                     controller.paste("sample-project" if tmux else "123", Path("answer.txt"), tmux)
                 if tmux:
                     self.assertTrue(any(event[:2] == ("tmux", "paste-buffer") for event in fake.events))
@@ -274,7 +274,7 @@ class GuardTests(unittest.TestCase):
 
     def test_prompt_between_paste_and_enter_prevents_submit_and_cleans(self):
         fake = FakeTransport([IDLE, IDLE, "Requesting permission"])
-        with self.assertRaises(control.Refused):
+        with self.assertRaises(control.OutcomeUnknown):
             self.controller(fake).paste("sample-project", Path("goal.txt"), True)
         self.assertFalse(any(event[:2] == ("tmux", "send-keys") for event in fake.events))
         self.assertTrue(any(event[:2] == ("tmux", "delete-buffer") for event in fake.events))
@@ -696,6 +696,77 @@ class DeadlineTests(unittest.TestCase):
                 with self.assertRaises(control.TransportTimeout):
                     control.main(["-H", "local", "key", "123", "enter", "enter"])
         self.assertEqual(sum(event[0] == "apple-input" for event in fake.events), 1)
+
+    def test_prompt_after_paste_records_partial_outcome(self):
+        prompts = ("Requesting permission", "Type your answer", "Trust this folder",
+                   "Update available", "Sign in with ChatGPT")
+        for tmux in (False, True):
+            for prompt in prompts:
+                with self.subTest(tmux=tmux, prompt=prompt):
+                    fake = FakeTransport([IDLE, IDLE, prompt + " synthetic-private-context"])
+                    with self.assertRaises(RuntimeError) as raised:
+                        self.controller(fake).paste("sample-project" if tmux else "123", self.source, tmux)
+                    self.assertIsInstance(raised.exception, control.OutcomeUnknown)
+                    self.assertNotIsInstance(raised.exception, control.Refused)
+                    message = str(raised.exception)
+                    self.assertIn("earlier input was attempted", message)
+                    self.assertIn("no further input sent", message)
+                    self.assertIn("do not repeat earlier input", message)
+                    self.assertNotIn("; no input sent", message)
+                    self.assertNotIn("synthetic-private-context", message)
+                    raw = next(Path(self.temp.name).glob("mac-term-guard-*.jsonl")).read_text(encoding="utf-8")
+                    receipt = json.loads(raw.splitlines()[-1])
+                    self.assertEqual(receipt["event"], "outcome-unknown")
+                    self.assertEqual(receipt["states"], control.prompt_states(prompt))
+                    self.assertNotIn("synthetic-private-context", raw)
+                    self.assertNotIn("/goal", raw)
+                    if tmux:
+                        self.assertEqual(sum(event[:2] == ("tmux", "paste-buffer") for event in fake.events), 1)
+                        self.assertFalse(any(event[:2] == ("tmux", "send-keys") for event in fake.events))
+                        self.assertTrue(any(event[:2] == ("tmux", "delete-buffer") for event in fake.events))
+                    else:
+                        self.assertEqual(sum(event[0] == "apple-input" for event in fake.events), 1)
+                    self.assertEqual(fake.events[-1], ("cleanup",))
+
+    def test_key_sequence_prompt_records_partial_outcome_and_stops(self):
+        for sent in (1, 2):
+            for override in (False, True):
+                with self.subTest(sent=sent, override=override):
+                    screens = [IDLE] * (sent * 2) + ["Type your answer synthetic-private-context"]
+                    if override:
+                        screens[0] = "Update available"
+                    fake = FakeTransport(screens)
+                    args = ["-H", "local", "key", "123", "enter", "enter", "enter"]
+                    if override:
+                        args[:0] = ["--override-prompt", "User requested one update response"]
+                    with patch.dict(control.os.environ, {"XMECHBAY_RECORDS_DIR": self.temp.name}):
+                        with patch.object(control, "Transport", return_value=fake):
+                            with self.assertRaises(RuntimeError) as raised:
+                                control.main(args)
+                    self.assertIsInstance(raised.exception, control.OutcomeUnknown)
+                    self.assertNotIsInstance(raised.exception, control.Refused)
+                    self.assertIn("do not repeat earlier input", str(raised.exception))
+                    self.assertEqual(sum(event[0] == "apple-input" for event in fake.events), sent)
+                    raw = next(Path(self.temp.name).glob("mac-term-guard-*.jsonl")).read_text(encoding="utf-8")
+                    receipt = json.loads(raw.splitlines()[-1])
+                    self.assertEqual(receipt["event"], "outcome-unknown")
+                    self.assertEqual(receipt["states"], ["QUESTION"])
+                    self.assertNotIn("synthetic-private-context", raw)
+
+    def test_unreadable_later_key_guard_retains_prior_input_phase(self):
+        fake = FakeTransport([IDLE, IDLE, RuntimeError("synthetic-private-screen")])
+        with patch.dict(control.os.environ, {"XMECHBAY_RECORDS_DIR": self.temp.name}):
+            with patch.object(control, "Transport", return_value=fake):
+                with self.assertRaises(RuntimeError) as raised:
+                    control.main(["-H", "local", "key", "123", "enter", "enter"])
+        self.assertIsInstance(raised.exception, control.OutcomeUnknown)
+        self.assertNotIsInstance(raised.exception, control.Refused)
+        self.assertEqual(sum(event[0] == "apple-input" for event in fake.events), 1)
+        raw = next(Path(self.temp.name).glob("mac-term-guard-*.jsonl")).read_text(encoding="utf-8")
+        receipt = json.loads(raw)
+        self.assertEqual(receipt["event"], "outcome-unknown")
+        self.assertEqual(receipt["states"], ["screen-unavailable"])
+        self.assertNotIn("synthetic-private-screen", raw)
 
 
 class ConfigurationTests(unittest.TestCase):
