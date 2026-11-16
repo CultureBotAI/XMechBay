@@ -50,15 +50,16 @@ record production never starves review, repair and infrastructure maintenance:
 
 To prevent cross-session branch collisions and duplicate loops across hosts,
 routing enforces **at most one active writer lane per repository** from observed
-backlog state (unless overridden by `mech_owner` or an explicit `claws.<key>.mechs`
-assignment):
+backlog state (unless pinned via `mech_owner` or an explicit writer
+`claws.<key>.mechs` list):
 
 | Lane | Entry condition | Active writer | Concurrent read-only / hygiene lanes |
 | --- | --- | --- | --- |
-| `infra` | Systemic check-failure cohort (`>= pr_ci_cohort_min` and `>= pr_ci_cohort_ratio` failing PRs) or explicitly listed bootstrap repository | `infrastructure_supervisor` | `closure_steward` (stale-draft classification via `gh`), `fleet_maintainer` (duplicate-loop inventory) |
-| `steward` | Open PRs `>= pr_backlog_warn`, any non-cohort failing check, or open issues `>= issue_steward_warn` | `stewardship_supervisor` | `closure_steward` (read-only diff review of green PRs via `gh`) |
-| `discover` | Open PRs `< pr_backlog_warn`, zero failing checks, and open issues `< issue_steward_warn` | `discovery_supervisor` | `closure_steward` (read-only diff review of green PRs via `gh`) |
-| `unknown` | Backlog unobserved (`--no-issues` or query failure) | Existing host `stewardship_supervisor` / `cycle_supervisor` (never triggers blind discovery) | Coordinator / `fleet_maintainer` restores backlog observation |
+| `pinned` | Explicit `mech_owner` entry or writer `claws.<key>.mechs` list (for example, bootstrap repositories) | Configured supervisor claw | `closure_steward` (read-only diff/draft review via `gh`), `fleet_maintainer` (host-local hygiene) |
+| `infra` | Systemic check-failure cohort (`>= pr_ci_cohort_min` and `>= pr_ci_cohort_ratio` failing PRs) | `infrastructure_supervisor` (when `accept_infra_cohorts` is enabled; falls back to `stewardship_supervisor` / `cycle_supervisor`) | `closure_steward` (stale-draft classification via `gh`), `fleet_maintainer` (host-local duplicate-loop inventory) |
+| `steward` | Open PRs `>= pr_backlog_warn`, any non-cohort failing check, truncated PR sample (`open_prs > len(prs)`), or open issues `>= issue_steward_warn` | `stewardship_supervisor` (or `cycle_supervisor`) | `closure_steward` (read-only diff review of green PRs via `gh`) |
+| `discover` | Open PRs `< pr_backlog_warn`, zero failing checks across all open PRs, and open issues `< issue_steward_warn` | `discovery_supervisor` (or `cycle_supervisor`) | `closure_steward` (read-only diff review of green PRs via `gh`) |
+| `unknown` | Backlog unobserved (`--no-issues` or query failure) | `stewardship_supervisor` / `cycle_supervisor` (never triggers blind discovery) | Coordinator restores backlog observation |
 
 **Workload-matched host placement.** Because `discover`, `steward` and `infra`
 are mutually exclusive per repository and `closure_steward` operates read-only
@@ -67,7 +68,8 @@ CPU-intensive lanes (`stewardship_supervisor`, `infrastructure_supervisor`) to
 higher-compute hosts while placing I/O- and API-bound lanes
 (`discovery_supervisor`, `closure_steward`, and host-local `fleet_maintainer`)
 on lighter hosts. Claws holding only non-writer roles configure `"mechs": []` so
-they never capture repositories as catch-all owners.
+they never capture repositories as catch-all owners; cross-host duplicate-loop
+and coordinator-query findings remain with the Coordinator.
 
 ## Session ownership and capability checks
 
@@ -86,7 +88,7 @@ the helper's checks.
 | --- | --- | --- |
 | Reporting interface | Coordinator's observation and planning | No session input |
 | Host controller | An explicitly authorized controller | Only identified host-loop targets, with before/after checks |
-| Repository supervisor | Cycle supervisor | Only the sessions in its verified supervisor map |
+| Repository supervisor | Supervisor roles (`cycle_supervisor`, `discovery_supervisor`, `stewardship_supervisor`, `infrastructure_supervisor`) | Only the sessions in its verified supervisor map |
 | Task dispatcher | The session that launched workers | Only its owned workers |
 
 Fleet-wide roles may need host-local actions. An SSH process may have a different
