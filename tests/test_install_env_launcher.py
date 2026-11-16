@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from unittest.mock import patch
 
@@ -198,6 +199,57 @@ class LauncherTests(unittest.TestCase):
             self.install(tdm_env=self.backup(), apply=True)
         self.assertFalse(self.backup().exists())
         self.assertEqual(self.destination.read_text(), "previous")
+
+    def test_case_and_unicode_credential_aliases_refuse_before_reading_destination(self):
+        for target in ("destination", "backup"):
+            for variant in ("case", "unicode"):
+                for field in ("tdm_env", "cborg_shells"):
+                    with self.subTest(target=target, variant=variant, field=field):
+                        folder = self.root / (target + "-" + variant + "-" + field)
+                        folder.mkdir()
+                        destination = folder / "café-launcher"
+                        destination.write_text("previous")
+                        candidate = (destination if target == "destination" else
+                                     destination.with_name(destination.name + ".bak-" + self.tag))
+                        alias_name = (candidate.name.upper() if variant == "case" else
+                                      unicodedata.normalize("NFD", candidate.name))
+                        alias = candidate.with_name(alias_name)
+                        changes = {field: [alias] if field == "cborg_shells" else alias}
+                        with patch.object(INSTALL, "read_destination") as read:
+                            with self.assertRaisesRegex(INSTALL.Refused, "collides"):
+                                self.install(destination=destination, apply=True, **changes)
+                            read.assert_not_called()
+                        self.assertEqual(destination.read_text(), "previous")
+                        self.assertEqual(set(folder.iterdir()), {destination})
+
+    def test_runtime_and_interpreter_spelling_aliases_are_protected(self):
+        for source in (self.runtime, self.interpreter):
+            with self.subTest(source=source):
+                alias = source.with_name(source.name.swapcase())
+                with patch.object(INSTALL, "read_destination") as read:
+                    with self.assertRaisesRegex(INSTALL.Refused, "Destination collides"):
+                        self.install(destination=alias, apply=True)
+                    read.assert_not_called()
+
+    def test_existing_hardlink_input_aliases_are_rejected_before_destination_reads(self):
+        source = self.root / "synthetic-credential-source.env"
+        source.write_text("synthetic credential content")
+        for target in ("destination", "backup"):
+            with self.subTest(target=target):
+                if target == "destination":
+                    candidate = self.destination
+                else:
+                    self.destination.write_text("previous")
+                    candidate = self.backup()
+                os.link(source, candidate)
+                with patch.object(INSTALL, "read_destination") as read:
+                    with self.assertRaisesRegex(INSTALL.Refused, "collides"):
+                        self.install(tdm_env=source, apply=True)
+                    read.assert_not_called()
+                self.assertEqual(source.read_text(), "synthetic credential content")
+                candidate.unlink()
+                if target == "backup":
+                    self.assertEqual(self.destination.read_text(), "previous")
 
     def test_concurrent_update_is_preserved_and_original_backup_retained(self):
         self.destination.write_text("original")

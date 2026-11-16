@@ -36,7 +36,11 @@ The installed mode is `0700`. Replacing a launcher first creates an exclusive
 adjacent `<destination>.bak-<tag>` containing the previous bytes and permission
 bits. Existing backups, symlink/nonregular/hardlinked destinations, foreign-owned
 destinations, files larger than 1 MiB, and destination/backup collisions with
-the supplied input paths are refused. Identical bytes with mode `0700` are a no-op. Installation
+the supplied input paths are refused. Before reading destination bytes, collision
+checks compare existing files by device/inode and prospective paths by Unicode
+normalization plus case folding. This deliberately refuses spelling aliases even
+on a case-sensitive filesystem, protecting credential paths that do not yet
+exist. Identical bytes with mode `0700` are a no-op. Installation
 uses a temporary file in the same pinned directory and atomically publishes it,
 then checks the persisted bytes and mode. A new destination is published without
 overwriting a file that appeared concurrently. Existing destinations are

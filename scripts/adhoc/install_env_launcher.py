@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import shlex
 import stat
+import unicodedata
 import uuid
 
 
@@ -132,6 +133,31 @@ def launcher_bytes(interpreter, runtime, tdm_env, cborg_shells):
             + " ".join(shlex.quote(value) for value in arguments) + ' "$@"\n').encode()
 
 
+def prospective_identity(path):
+    """Conservative alias protection even when a future input does not exist."""
+    text = unicodedata.normalize("NFC", str(path.resolve(strict=False)))
+    return unicodedata.normalize("NFC", text.casefold())
+
+
+def existing_identity(path):
+    """Metadata only: detect aliases/hardlinks without opening input content."""
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def refuse_input_collisions(destination, backup, inputs):
+    prospective = {prospective_identity(path) for path in inputs}
+    existing = {identity for path in inputs if (identity := existing_identity(path)) is not None}
+    for label, candidate in (("Destination", destination), ("Backup", backup)):
+        identity = existing_identity(candidate)
+        if (prospective_identity(candidate) in prospective
+                or (identity is not None and identity in existing)):
+            raise Refused(label + " collides with an interpreter, runtime or credential path")
+
+
 def install(destination, interpreter, runtime, tdm_env, cborg_shells, backup_tag, apply=False):
     destination = absolute_path(destination)
     interpreter, runtime = source_file(interpreter, True), source_file(runtime)
@@ -141,16 +167,11 @@ def install(destination, interpreter, runtime, tdm_env, cborg_shells, backup_tag
         raise Refused("At least one CBORG shell path is required")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*-[0-9]{8}", backup_tag):
         raise Refused("Backup tag must contain letters/digits/hyphens and end in -YYYYMMDD")
-    # Metadata-only resolution prevents installing over a loader or credential
-    # file, including an alias through an existing symlink. Never open them.
-    protected_paths = {
-        path.resolve(strict=False) for path in [interpreter, runtime, tdm_env, *cborg_shells]
-    }
-    if destination.resolve(strict=False) in protected_paths:
-        raise Refused("Destination collides with an interpreter, runtime or credential path")
+    # Check both prospective spelling aliases and existing file identities
+    # before reading destination bytes or creating a backup. Never open inputs.
     backup_name = destination.name + ".bak-" + backup_tag
-    if destination.with_name(backup_name).resolve(strict=False) in protected_paths:
-        raise Refused("Backup collides with an interpreter, runtime or credential path")
+    refuse_input_collisions(destination, destination.with_name(backup_name),
+                            [interpreter, runtime, tdm_env, *cborg_shells])
     content = launcher_bytes(interpreter, runtime, tdm_env, cborg_shells)
     if len(content) > MAX_LAUNCHER_BYTES:
         raise Refused("Generated launcher is too large")
