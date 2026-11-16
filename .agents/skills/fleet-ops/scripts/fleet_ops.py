@@ -68,9 +68,24 @@ DEFAULT_THRESHOLDS = {
     "achieved_goal_age_hours": 12,
     "pr_stale_days": 14,
     "pr_backlog_warn": 25,
+    "issue_steward_warn": 100,
     "pr_ci_cohort_min": 5,
     "pr_ci_cohort_ratio": 0.5,
 }
+KNOWN_CLAW_ROLES = frozenset({
+    "cycle_supervisor",
+    "discovery_supervisor",
+    "stewardship_supervisor",
+    "infrastructure_supervisor",
+    "closure_steward",
+    "fleet_maintainer",
+})
+SUPERVISOR_ROLES = frozenset({
+    "cycle_supervisor",
+    "discovery_supervisor",
+    "stewardship_supervisor",
+    "infrastructure_supervisor",
+})
 DEFAULT_INFRA_REPOS = {
     "xmechbay": "CultureBotAI/XMechBay",
     "claw": "CultureBotAI/culturebotai-claw",
@@ -80,6 +95,7 @@ PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2}
 HUMAN_PROMPTS = ("APPROVAL", "QUESTION", "SIGN-IN", "TRUST-PROMPT", "UPDATE-PROMPT")
 ACTIVE_STATES = ("Pursuing goal", "Working", "Goal stalled", "Goal paused", "Goal hit usage limits") + HUMAN_PROMPTS
 REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+TMUX_SESSION_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
 MACOS_ROOT_SYMLINKS = {Path("/tmp"), Path("/var"), Path("/etc")}
 GENERIC_HOST_TOKENS = {
     "local", "localhost", "fleet", "main", "host", "hosts", "mac", "work", "ssh", "tmux", "claw", "mech", "mechs",
@@ -324,46 +340,238 @@ def mech_sessions(sessions: list | None) -> dict:
     return by_mech
 
 
-def claw_for_mech(mech: str, by_mech: dict, config: dict, live: set | None = None) -> str | None:
-    """Explicit owner, then a claw listing the Mech, then a catch-all claw on the host of its busiest loop.
+def valid_tmux_session_name(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned if TMUX_SESSION_RE.fullmatch(cleaned) else None
 
-    Only configured claws are returned (an unknown `mech_owner` value is ignored; config_findings reports it),
-    and among catch-all candidates a claw with a live session (`live`) is preferred."""
-    claws = config["claws"]
-    explicit = config["mech_owner"].get(mech)
-    if explicit in claws:
-        return explicit
-    for key, claw in sorted(claws.items()):
-        if isinstance(claw, dict) and mech in (claw.get("mechs") or []):
-            return key
-    rows = by_mech.get(mech, [])
+
+def claw_roles(claw: object) -> tuple:
+    if not isinstance(claw, dict):
+        return ()
+    raw = claw.get("roles")
+    if not isinstance(raw, list):
+        return ()
+    out = []
+    for item in raw:
+        if isinstance(item, str):
+            role = item.strip()
+            if role and role not in out:
+                out.append(role)
+    return tuple(out)
+
+
+def is_writer_claw(claw: object) -> bool:
+    if not isinstance(claw, dict) or not claw.get("host"):
+        return False
+    roles = set(claw_roles(claw))
+    return not roles or bool(roles & SUPERVISOR_ROLES)
+
+
+def claw_mechs(claw: object) -> list:
+    """Configured Mech scope for a claw.
+
+    An explicit list (`["AlphaMech"]`, `["*"]`, or `[]`) is respected verbatim so `[]` never
+    becomes a catch-all. When `mechs` is omitted (`None`), roleless claws and supervisor claws
+    (`cycle_supervisor`, `discovery_supervisor`, `stewardship_supervisor`) default to `["*"]`,
+    while pure `closure_steward`, `fleet_maintainer` and `infrastructure_supervisor` claws default to `[]`."""
+    if not isinstance(claw, dict):
+        return []
+    raw = claw.get("mechs")
+    if raw is None:
+        roles = set(claw_roles(claw))
+        if not roles or (roles & {"cycle_supervisor", "discovery_supervisor", "stewardship_supervisor"}):
+            return ["*"]
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [m.strip() for m in raw if isinstance(m, str) and m.strip()]
+
+
+def accepts_infra_cohorts(claw: object) -> bool:
+    if not isinstance(claw, dict) or "infrastructure_supervisor" not in claw_roles(claw):
+        return False
+    raw = claw.get("accept_infra_cohorts")
+    if isinstance(raw, bool):
+        return raw
+    if raw is not None:
+        return False
+    raw_mechs = claw.get("mechs")
+    return raw_mechs is None or (isinstance(raw_mechs, list) and len(claw_mechs(claw)) > 0)
+
+
+def has_role_routing(config: dict) -> bool:
+    return any(bool(claw_roles(claw)) for claw in (config.get("claws") or {}).values())
+
+
+def preferred_hosts_for_mech(rows: list) -> list:
     ranked = sorted(rows, key=lambda r: (not str(r.get("status", "")).startswith(ACTIVE_STATES), str(r.get("host_key") or "")))
-    candidates = []
+    out = []
     for row in ranked:
         row_host = row.get("host_key")
-        if not isinstance(row_host, str) or not row_host:
-            continue
-        for key, claw in sorted(claws.items()):
-            if (isinstance(claw, dict) and isinstance(claw.get("host"), str) and claw["host"] == row_host
-                    and "*" in (claw.get("mechs") or ["*"]) and key not in candidates):
-                candidates.append(key)
+        if isinstance(row_host, str) and row_host and row_host not in out:
+            out.append(row_host)
+    return out
+
+
+def pick_claw(candidates: list, live: set | None = None, preferred_hosts: list | None = None,
+              claws: dict | None = None, require_live: bool = False) -> str | None:
+    if not candidates:
+        return None
     if live is not None:
         alive = [key for key in candidates if key in live]
-        if alive:
-            return alive[0]
-    return candidates[0] if candidates else None
+        if require_live:
+            if not alive:
+                return None
+            pool = alive
+        else:
+            pool = alive or candidates
+    else:
+        pool = candidates
+    if preferred_hosts and claws:
+        for host in preferred_hosts:
+            for key in pool:
+                if (claws.get(key) or {}).get("host") == host:
+                    return key
+    return pool[0]
+
+
+def mech_mode(mech: str, repo_data: dict | None, thresholds: dict) -> str:
+    """Classify a Mech's operational lane from observed GitHub backlog.
+
+    Returns 'infra' (systemic CI check-failure cohort), 'steward' (open PRs/issues above
+    thresholds, failing checks, or truncated PR sample), 'discover' (healthy queue below
+    thresholds with all open PRs observed), or 'unknown'."""
+    if not isinstance(repo_data, dict) or repo_data.get("error"):
+        return "unknown"
+    prs = [p for p in (repo_data.get("prs") or []) if isinstance(p, dict)]
+    failing = [p for p in prs if p.get("checks") in ("FAILURE", "ERROR")]
+    if len(failing) >= thresholds["pr_ci_cohort_min"] and len(failing) / max(len(prs), 1) >= thresholds["pr_ci_cohort_ratio"]:
+        return "infra"
+    open_prs = repo_data.get("open_prs") or 0
+    open_issues = repo_data.get("open_issues") or 0
+    if (open_prs >= thresholds["pr_backlog_warn"] or failing
+            or open_issues >= thresholds["issue_steward_warn"] or open_prs > len(prs)):
+        return "steward"
+    return "discover"
+
+
+def claw_for_mech(mech: str, by_mech: dict, config: dict, live: set | None = None, issues: dict | None = None) -> str | None:
+    """Explicit writer owner, then a writer claw listing the Mech, then role-based lane (`discover`/`steward`/`infra`),
+    then a catch-all supervisor claw on the host of its busiest loop.
+
+    Only configured writer claws are returned (unknown or non-writer `mech_owner` values are ignored; config_findings
+    reports them). An explicit `mechs: []` or a claw holding only non-writer roles (`closure_steward`, `fleet_maintainer`)
+    never acts as a primary Mech writer."""
+    claws = config["claws"]
+    explicit = config["mech_owner"].get(mech)
+    if explicit in claws and is_writer_claw(claws[explicit]):
+        return explicit
+    preferred_hosts = preferred_hosts_for_mech(by_mech.get(mech, []))
+
+    listed = [
+        key for key, claw in sorted(claws.items())
+        if is_writer_claw(claw) and mech in claw_mechs(claw)
+    ]
+    if listed:
+        return pick_claw(listed, live, preferred_hosts, claws)
+
+    role_mode = has_role_routing(config)
+    mode = mech_mode(mech, (issues or {}).get(mech), config["thresholds"]) if role_mode else "unknown"
+    if role_mode:
+        def _role_pool(role_name: str, allow_infra_cohorts: bool = False) -> list:
+            out = []
+            for key, claw in sorted(claws.items()):
+                if not isinstance(claw, dict) or not claw.get("host") or role_name not in claw_roles(claw):
+                    continue
+                scope = claw_mechs(claw)
+                if "*" in scope or mech in scope or (allow_infra_cohorts and accepts_infra_cohorts(claw)):
+                    out.append(key)
+            return out
+
+        if mode == "infra":
+            pools = [_role_pool("infrastructure_supervisor", allow_infra_cohorts=True),
+                     _role_pool("stewardship_supervisor"), _role_pool("cycle_supervisor")]
+        elif mode == "discover":
+            pools = [_role_pool("discovery_supervisor"), _role_pool("cycle_supervisor")]
+        else:
+            pools = [_role_pool("stewardship_supervisor"), _role_pool("cycle_supervisor")]
+
+        if live is not None:
+            for pool in pools:
+                chosen = pick_claw(pool, live, preferred_hosts, claws, require_live=True)
+                if chosen:
+                    return chosen
+        for pool in pools:
+            chosen = pick_claw(pool, live, preferred_hosts, claws, require_live=False)
+            if chosen:
+                return chosen
+
+    allowed_catchall_roles = {"cycle_supervisor", "discovery_supervisor"} if mode == "discover" else {"cycle_supervisor", "stewardship_supervisor"}
+    candidates = []
+    for row_host in preferred_hosts:
+        for key, claw in sorted(claws.items()):
+            if not isinstance(claw, dict) or not isinstance(claw.get("host"), str) or claw["host"] != row_host:
+                continue
+            roles = set(claw_roles(claw))
+            if roles and not (roles & (allowed_catchall_roles if role_mode else SUPERVISOR_ROLES)):
+                continue
+            if "*" in claw_mechs(claw) and key not in candidates:
+                candidates.append(key)
+    return pick_claw(candidates, live)
+
+
+def closure_claw_for_mech(mech: str, config: dict, by_mech: dict | None = None, live: set | None = None) -> str | None:
+    claws = config["claws"]
+    candidates = []
+    for key, claw in sorted(claws.items()):
+        if not isinstance(claw, dict) or not claw.get("host") or "closure_steward" not in claw_roles(claw):
+            continue
+        raw_closure = claw.get("closure_mechs")
+        if raw_closure is not None:
+            if not isinstance(raw_closure, list) or any(not isinstance(m, str) or not m.strip() for m in raw_closure):
+                continue
+            scope = [m.strip() for m in raw_closure]
+            if "*" not in scope and mech not in scope:
+                continue
+        elif not is_writer_claw(claw):
+            raw_mechs = claw.get("mechs")
+            if raw_mechs is not None and not isinstance(raw_mechs, list):
+                continue
+            scope = claw_mechs(claw)
+            if scope and "*" not in scope and mech not in scope:
+                continue
+        candidates.append(key)
+    preferred_hosts = preferred_hosts_for_mech((by_mech or {}).get(mech, []))
+    return pick_claw(candidates, live, preferred_hosts, claws, require_live=(live is not None))
+
+
+def maintenance_owner(config: dict, host: str | None = None, live: set | None = None) -> dict:
+    """Route reachable host-local maintenance to a live `fleet_maintainer` on that host;
+    cross-host or coordinator-level maintenance stays on XMechBay."""
+    if not host:
+        return owner("xmechbay", "maintenance")
+    claws = config["claws"]
+    candidates = [
+        key for key, claw in sorted(claws.items())
+        if isinstance(claw, dict) and claw.get("host") == host and "fleet_maintainer" in claw_roles(claw)
+    ]
+    if live is not None:
+        candidates = [key for key in candidates if key in live]
+    return owner("claw", candidates[0]) if candidates else owner("xmechbay", "maintenance")
 
 
 def live_claws(sessions: list | None, config: dict) -> set:
-    return {key for key, claw in config["claws"].items() if claw_targets({"sessions": sessions or []}, claw)}
+    return {key for key, claw in config["claws"].items() if claw_matching_targets({"sessions": sessions or []}, claw)}
 
 
 def owner(kind: str, key: str | None = None) -> dict:
     return {"kind": kind, "key": key}
 
 
-def mech_owner(mech: str, by_mech: dict, config: dict) -> dict:
-    key = claw_for_mech(mech, by_mech, config, config.get("_live_claws"))
+def mech_owner(mech: str, by_mech: dict, config: dict, live: set | None = None, issues: dict | None = None) -> dict:
+    key = claw_for_mech(mech, by_mech, config, live, issues=issues)
     return owner("claw", key) if key else owner("user", "unassigned-mech")
 
 
@@ -374,9 +582,47 @@ def config_findings(config: dict) -> list:
         if key not in config["claws"]:
             out.append(finding("warning", "observation", f"mech_owner names unknown claw {key!r} for {mech}",
                                "Fix the config; the Mech falls back to the default ownership rules.", owner("user", "config"), mech=mech))
+        elif not is_writer_claw(config["claws"][key]):
+            out.append(finding("warning", "observation", f"mech_owner assigns {mech} to non-writer claw {key!r}",
+                               "Assign a supervisor claw or add a supervisor role; the Mech falls back to default writer routing.",
+                               owner("user", "config"), mech=mech))
+    roles_by_host = defaultdict(lambda: defaultdict(list))
     for key, claw in sorted(config["claws"].items()):
         if not isinstance(claw, dict) or not claw.get("host"):
             out.append(finding("warning", "observation", f"claw {key!r} has no host", "Set its host in the config.", owner("user", "config")))
+            continue
+        raw_mechs = claw.get("mechs")
+        if raw_mechs is not None and (not isinstance(raw_mechs, list) or any(not isinstance(m, str) or not m.strip() for m in raw_mechs)):
+            out.append(finding("warning", "observation", f"claw {key!r} mechs must be a list of non-empty strings",
+                               "Set mechs to a list of Mech names, ['*'], or [].", owner("user", "config")))
+        raw_closure = claw.get("closure_mechs")
+        if raw_closure is not None and (not isinstance(raw_closure, list) or any(not isinstance(m, str) or not m.strip() for m in raw_closure)):
+            out.append(finding("warning", "observation", f"claw {key!r} closure_mechs must be a list of non-empty strings",
+                               "Set closure_mechs to a list of Mech names, ['*'], or [].", owner("user", "config")))
+        raw_cohorts = claw.get("accept_infra_cohorts")
+        if raw_cohorts is not None and not isinstance(raw_cohorts, bool):
+            out.append(finding("warning", "observation", f"claw {key!r} accept_infra_cohorts must be a boolean",
+                               "Set accept_infra_cohorts to true or false, or omit it.", owner("user", "config")))
+        raw_tmux = claw.get("tmux_session")
+        if raw_tmux is not None and not valid_tmux_session_name(raw_tmux):
+            out.append(finding("warning", "observation", f"claw {key!r} tmux_session must be a valid session name",
+                               "Set tmux_session to match ^[A-Za-z0-9_][A-Za-z0-9_-]*$ or omit it.", owner("user", "config")))
+        raw_roles = claw.get("roles")
+        if raw_roles is not None:
+            if not isinstance(raw_roles, list) or any(not isinstance(r, str) or not r.strip() for r in raw_roles):
+                out.append(finding("warning", "observation", f"claw {key!r} roles must be a list of non-empty strings",
+                                   f"Use roles from {sorted(KNOWN_CLAW_ROLES)}.", owner("user", "config")))
+            for role in claw_roles(claw):
+                if role not in KNOWN_CLAW_ROLES:
+                    out.append(finding("warning", "observation", f"claw {key!r} names unknown role {role!r}",
+                                       f"Use roles from {sorted(KNOWN_CLAW_ROLES)}.", owner("user", "config")))
+                else:
+                    roles_by_host[claw["host"]][role].append(key)
+    for host, role_map in sorted(roles_by_host.items()):
+        for role, keys in sorted(role_map.items()):
+            if len(keys) >= 2:
+                out.append(finding("warning", "observation", f"host {host!r} assigns role {role!r} to multiple claws ({', '.join(keys)})",
+                                   "Give at most one claw per host each role so delegation is unambiguous.", owner("user", "config"), host=host))
     return out
 
 
@@ -400,13 +646,14 @@ def mech_in_path(path: str, mechs) -> str | None:
     return max(hits, key=len) if hits else None
 
 
-def resource_findings(resources: dict, config: dict, by_mech: dict, mechs=()) -> list:
+def resource_findings(resources: dict, config: dict, by_mech: dict, mechs=(), issues: dict | None = None, live: set | None = None) -> list:
     t, out = config["thresholds"], []
-    maint = owner("xmechbay", "maintenance")
+    coord_maint = owner("xmechbay", "maintenance")
     for host, r in sorted(resources.items()):
         if r.get("error"):
-            out.append(finding("warning", "observation", f"{host}: resource probe failed", "Fix SSH/probe access; treat the host as unobserved.", maint, host, evidence={"error": r["error"]}))
+            out.append(finding("warning", "observation", f"{host}: resource probe failed", "Fix SSH/probe access; treat the host as unobserved.", coord_maint, host, evidence={"error": r["error"]}))
             continue
+        maint = maintenance_owner(config, host=host, live=live)
         free = (r.get("disk") or {}).get("free_gib")
         tmp = {root["path"]: root for root in r.get("tmp_roots", [])}
         if free is None:
@@ -443,9 +690,14 @@ def resource_findings(resources: dict, config: dict, by_mech: dict, mechs=()) ->
                                    "Temporary roots are purged by macOS and hold only scratch: point test basetemps and work dirs at a repository .temp/ or ~/agent-work, then remove verified scratch.", maint, host, evidence={"top": item.get("children", [])}))
             elif limit == "watch_warn_gib":
                 mech = mech_in_path(path, set(by_mech) | set(mechs))
+                mo = mech_owner(mech, by_mech, config, live=live, issues=issues) if mech else None
+                watch_owner = (
+                    mo if (mo and mo["kind"] == "claw" and (config["claws"].get(mo["key"]) or {}).get("host") == host)
+                    else maint
+                )
                 out.append(finding("warning", "resources", f"{host}: {gib} GiB in a watched path",
                                    "Ask the owning session for a retention inventory (what it still needs), then archive or delete with approval.",
-                                   mech_owner(mech, by_mech, config) if mech else maint, host, mech, evidence={"path": path}))
+                                   watch_owner, host, mech, evidence={"path": path}))
             else:
                 out.append(finding("info", "resources", f"{host}: {gib} GiB of Codex session logs",
                                    "Archive closed rollouts older than 14 days into verified per-day tar.zst files, then remove the originals with approval.", maint, host))
@@ -506,19 +758,23 @@ def parked_achieved_seconds(row: dict) -> float:
     return -1.0
 
 
-def host_observation_findings(payload: dict, config: dict) -> list:
+def host_observation_findings(payload: dict, config: dict, live: set | None = None) -> list:
     t, out = config["thresholds"], []
-    maint = owner("xmechbay", "maintenance")
+    if live is None and "sessions" in payload:
+        live = live_claws(payload.get("sessions"), config)
+    coord_maint = owner("xmechbay", "maintenance")
     raw_hosts = [h for h in (payload.get("hosts") or []) if isinstance(h, dict)]
+    unreachable_hosts = {h.get("key") for h in raw_hosts if isinstance(h.get("key"), str) and h.get("reachable") is False}
     for host in sorted(raw_hosts, key=lambda h: str(h.get("key") or "")):
         key = host.get("key")
         if not isinstance(key, str) or not key:
             continue
         if host.get("reachable") is False:
             out.append(finding("critical", "observation", f"{key}: session collection unreachable",
-                               "Restore SSH or local probe access; cached rows are not live state.", maint, key,
+                               "Restore SSH or local probe access; cached rows are not live state.", coord_maint, key,
                                evidence={"errors": host.get("errors") or [], "last_reachable": host.get("last_reachable")}))
             continue
+        maint = maintenance_owner(config, host=key, live=live)
         errors = list(host.get("errors") or [])
         inv = host.get("inventory_state")
         if errors or inv == "partial":
@@ -552,6 +808,7 @@ def host_observation_findings(payload: dict, config: dict) -> list:
             by_blind[hk].append(row)
     for key, rows in sorted(by_blind.items()):
         if len(rows) >= t["blind_sessions_warn"]:
+            maint = coord_maint if key in unreachable_hosts else maintenance_owner(config, host=key, live=live)
             out.append(finding("warning", "observation", f"{key}: {len(rows)} agent sessions have no readable screen",
                                "Launch worker loops inside an observable tmux server instead of detached processes, and verify collector socket coverage.",
                                maint, key, evidence={"count": len(rows), "projects": sorted({str(r.get("project_label") or "?") for r in rows})[:20],
@@ -559,8 +816,10 @@ def host_observation_findings(payload: dict, config: dict) -> list:
     return out
 
 
-def activity_findings(payload: dict, config: dict, by_mech: dict) -> list:
+def activity_findings(payload: dict, config: dict, by_mech: dict, issues: dict | None = None, live: set | None = None) -> list:
     t, out = config["thresholds"], []
+    if live is None:
+        live = live_claws(payload.get("sessions"), config)
     sessions = [r for r in (payload.get("sessions") or []) if isinstance(r, dict) and not r.get("stale_cached")]
     for row in sessions:  # prompts, stalls, usage stops and composer drafts on supervisor or non-Mech sessions need direct attention
         status, role, host = str(row.get("status", "")), row.get("role"), row.get("host_key")
@@ -591,15 +850,23 @@ def activity_findings(payload: dict, config: dict, by_mech: dict) -> list:
             elif status.startswith("Goal hit usage limits"):
                 out.append(finding("warning", "activity", f"{mech} on {host} hit usage limits", "Decide whether and when to resume; resumes spend usage.", owner("user", "usage"), host, mech, where))
             elif status.startswith("Goal stalled"):
-                out.append(finding("warning", "activity", f"{mech} on {host}: goal stalled", "Diagnose the stall from authoritative state (ledger, receipts, GitHub); repair with verified facts or report the blocker.", mech_owner(mech, by_mech, config), host, mech, where))
+                out.append(finding("warning", "activity", f"{mech} on {host}: goal stalled", "Diagnose the stall from authoritative state (ledger, receipts, GitHub); repair with verified facts or report the blocker.", mech_owner(mech, by_mech, config, live=live, issues=issues), host, mech, where))
             elif status.startswith("Goal paused"):
-                out.append(finding("info", "activity", f"{mech} on {host}: goal paused", "Propose resume or close with the reason; do not resume without approval.", mech_owner(mech, by_mech, config), host, mech, where))
+                out.append(finding("info", "activity", f"{mech} on {host}: goal paused", "Propose resume or close with the reason; do not resume without approval.", mech_owner(mech, by_mech, config, live=live, issues=issues), host, mech, where))
         states = [str(r.get("status", "")) for r in rows]
         flagged = any(s.startswith(("Goal stalled", "Goal paused", "Goal hit usage limits") + HUMAN_PROMPTS) for s in states)
         unknown = any(s.upper().startswith("UNKNOWN") for s in states)  # an unreadable screen is not "not working"
         if rows and not flagged and not unknown and not any(s.startswith(("Pursuing goal", "Working")) for s in states):
-            out.append(finding("info", "activity", f"{mech}: no session is working", "Check the backlog and propose the next goal for this Mech.", mech_owner(mech, by_mech, config), None, mech,
-                               {"states": dict(Counter(states))}))
+            m_owner = mech_owner(mech, by_mech, config, live=live, issues=issues)
+            lane = mech_lane_label(mech, config, issues=issues) if has_role_routing(config) else "unknown"
+            owner_claw = config["claws"].get(m_owner["key"]) if m_owner["kind"] == "claw" else None
+            is_discovery_lane = lane == "discover" and "discovery_supervisor" in claw_roles(owner_claw)
+            action = ("Run bounded source discovery and add_records up to the open-PR WIP cap, recording the discovery saturation ledger."
+                      if is_discovery_lane else "Check the backlog and propose the next goal for this Mech.")
+            evidence = {"states": dict(Counter(states))}
+            if lane != "unknown":
+                evidence["mode"] = lane
+            out.append(finding("info", "activity", f"{mech}: no session is working", action, m_owner, None, mech, evidence))
     absent = [mech for mech in (payload.get("canonical_mechs") or []) if isinstance(mech, str) and mech and mech not in by_mech]
     if absent:
         out.append(finding("info", "activity", f"{len(absent)} fleet Mechs have no session on any observed host",
@@ -607,22 +874,25 @@ def activity_findings(payload: dict, config: dict, by_mech: dict) -> list:
                            owner("user", "dormant-mechs"), evidence={"mechs": absent}))
     for key, claw in sorted(config["claws"].items()):
         c_host = claw.get("host") if isinstance(claw, dict) else None
-        if not claw_targets(payload, claw):
+        if not claw_matching_targets(payload, claw):
+            host_candidates = claw_targets(payload, claw)
+            action = ("No live claw session on that host matches this claw's tmux_session/target_hint; start the missing claw or update its binding."
+                      if host_candidates else "Delegation to this claw is impossible until it runs; start it on that host (user-authorized).")
             out.append(finding("critical", "delegation", f"claw {key} has no live session on {c_host}",
-                               "Delegation to this claw is impossible until it runs; start it on that host (user-authorized).", owner("user", "claws"), c_host))
+                               action, owner("user", "claws"), c_host))
     host_sessions = [r for r in sessions if isinstance(r.get("host_key"), str) and r.get("host_key")]
     idle = Counter(r["host_key"] for r in host_sessions if str(r.get("status")) == "idle" and r.get("role") in ("mech", "claw"))
     for host, count in sorted(idle.items()):
         if count >= t["idle_sessions_warn"]:
             out.append(finding("info", "hygiene", f"{host}: {count} idle Mech/claw sessions",
-                               "Idle agent processes keep memory, swap and ports; close duplicates at an owned idle checkpoint (graceful exit).", owner("xmechbay", "maintenance"), host))
+                               "Idle agent processes keep memory, swap and ports; close duplicates at an owned idle checkpoint (graceful exit).", maintenance_owner(config, host=host, live=live), host))
     non_working = Counter(r["host_key"] for r in host_sessions if not str(r.get("status", "")).startswith(("Pursuing goal", "Working")))
     totals = Counter(r["host_key"] for r in host_sessions)
     for host, count in sorted(non_working.items()):
         if count >= t["non_working_sessions_warn"]:
             out.append(finding("warning", "hygiene", f"{host}: {count} non-working agent sessions across all roles",
                                "Retire finished or duplicate sessions at an owned idle checkpoint to reclaim memory, swap and Terminal windows.",
-                               owner("xmechbay", "maintenance"), host, evidence={"non_working": count, "total": totals[host]}))
+                               maintenance_owner(config, host=host, live=live), host, evidence={"non_working": count, "total": totals[host]}))
     by_achieved = defaultdict(list)
     for r in host_sessions:
         if str(r.get("status", "")).startswith("Goal achieved") and parked_achieved_seconds(r) >= t["achieved_goal_age_hours"] * 3600:
@@ -631,7 +901,7 @@ def activity_findings(payload: dict, config: dict, by_mech: dict) -> list:
         if len(rows) >= 2:
             out.append(finding("info", "hygiene", f"{host}: {len(rows)} sessions parked at Goal achieved for {t['achieved_goal_age_hours']}h+",
                                "Record their outputs and close or assign the next goal so finished loops stop holding memory and swap.",
-                               owner("xmechbay", "maintenance"), host,
+                               maintenance_owner(config, host=host, live=live), host,
                                evidence={"projects": [r.get("project_label") for r in rows[:15]], "targets": [r.get("target_short") for r in rows[:15]]}))
     multi = {mech: sorted({r["host_key"] for r in rows if isinstance(r.get("host_key"), str) and r.get("host_key")}) for mech, rows in sorted(by_mech.items())}
     multi = {m: hs for m, hs in multi.items() if len(hs) >= 2}
@@ -642,32 +912,47 @@ def activity_findings(payload: dict, config: dict, by_mech: dict) -> list:
     return out
 
 
-def backlog_findings(issues: dict, config: dict, by_mech: dict) -> list:
+def backlog_findings(issues: dict, config: dict, by_mech: dict, live: set | None = None) -> list:
     t, out = config["thresholds"], []
     now = datetime.now(timezone.utc)
+    coord_maint = owner("xmechbay", "maintenance")
     for mech, repo in sorted(issues.items()):
         if repo.get("error"):
-            out.append(finding("warning", "observation", f"{mech}: GitHub query failed", "Check gh authentication and the repository name.", owner("xmechbay", "maintenance"), mech=mech, evidence={"error": repo["error"]}))
+            out.append(finding("warning", "observation", f"{mech}: GitHub query failed", "Check gh authentication and the repository name.", coord_maint, mech=mech, evidence={"error": repo["error"]}))
             continue
         prs = repo.get("prs", [])
         open_ready = [p for p in prs if not p["draft"] and p["mergeable"] == "MERGEABLE" and p.get("review") != "CHANGES_REQUESTED"]
         ready = [p["number"] for p in open_ready if p["checks"] == "SUCCESS"]
+        unreviewed_ready = [p["number"] for p in open_ready if p["checks"] == "SUCCESS" and p.get("review") != "APPROVED"]
         unchecked = [p["number"] for p in open_ready if p["checks"] is None]  # no checks ran: not "green"
         failing = [p["number"] for p in prs if p["checks"] in ("FAILURE", "ERROR")]
         stale = [p["number"] for p in prs if p["draft"] and (now - parse_time(p["updated_at"])).days >= t["pr_stale_days"]]
+        closure_key = closure_claw_for_mech(mech, config, by_mech=by_mech, live=live)
         if ready:
             out.append(finding("info", "backlog", f"{mech}: {len(ready)} PRs mergeable with green checks",
                                "Review each PR adversarially before any merge proposal; merging stays the user's decision.", owner("user", "merges"), mech=mech,
                                evidence={"repo": repo["repo"], "prs": ready[:30], "mergeable_without_checks": unchecked[:30]}))
+        if closure_key and unreviewed_ready:
+            out.append(finding("info", "backlog", f"{mech}: {len(unreviewed_ready)} green PRs awaiting closure-steward diff review",
+                               "Review each exact PR head read-only via gh, file issues for any defects, and record verified merge candidates without merging or editing branches.",
+                               owner("claw", closure_key), mech=mech,
+                               evidence={"repo": repo["repo"], "prs": unreviewed_ready[:30], "mergeable_without_checks": unchecked[:30]}))
         if failing:
             out.append(finding("warning", "backlog", f"{mech}: {len(failing)} PRs with failing checks",
-                               "Fix or close each failing PR; file an issue for any infrastructure cause.", mech_owner(mech, by_mech, config), mech=mech, evidence={"repo": repo["repo"], "prs": failing[:30]}))
+                               "Fix or close each failing PR; file an issue for any infrastructure cause.", mech_owner(mech, by_mech, config, live=live, issues=issues), mech=mech, evidence={"repo": repo["repo"], "prs": failing[:30]}))
         if stale:
+            stale_owner = owner("claw", closure_key) if closure_key else mech_owner(mech, by_mech, config, live=live, issues=issues)
+            stale_action = ("Inspect stale drafts read-only via gh, classify obsolete vs salvageable drafts, and route closure or handoff actions without pushing to another writer's branch."
+                            if closure_key else "Advance, split or close each stale draft with a reason.")
             out.append(finding("info", "backlog", f"{mech}: {len(stale)} draft PRs untouched for {t['pr_stale_days']}+ days",
-                               "Advance, split or close each stale draft with a reason.", mech_owner(mech, by_mech, config), mech=mech, evidence={"repo": repo["repo"], "prs": stale[:30]}))
-        if repo.get("open_prs", 0) >= t["pr_backlog_warn"]:
-            out.append(finding("warning", "backlog", f"{mech}: {repo['open_prs']} open PRs, {repo.get('open_issues')} open issues",
-                               "Batch the review queue by theme (fleet-issue-review) and stop opening new PRs until it shrinks.", mech_owner(mech, by_mech, config), mech=mech, evidence={"repo": repo["repo"]}))
+                               stale_action, stale_owner, mech=mech, evidence={"repo": repo["repo"], "prs": stale[:30]}))
+        open_prs = repo.get("open_prs") or 0
+        if open_prs >= t["pr_backlog_warn"]:
+            out.append(finding("warning", "backlog", f"{mech}: {open_prs} open PRs, {repo.get('open_issues')} open issues",
+                               "Batch the review queue by theme (fleet-issue-review) and stop opening new PRs until it shrinks.", mech_owner(mech, by_mech, config, live=live, issues=issues), mech=mech, evidence={"repo": repo["repo"]}))
+        elif (repo.get("open_issues") or 0) >= t["issue_steward_warn"]:
+            out.append(finding("info", "backlog", f"{mech}: {repo.get('open_issues')} open issues, {open_prs} open PRs",
+                               "Triage and resolve open review/curation issues by theme (fleet-issue-review) before starting new record discovery.", mech_owner(mech, by_mech, config, live=live, issues=issues), mech=mech, evidence={"repo": repo["repo"]}))
     return out
 
 
@@ -678,11 +963,12 @@ def rank(findings: list) -> list:
 def analyze(payload: dict, resources: dict, issues: dict, config: dict) -> list:
     sessions = payload.get("sessions") or []
     by_mech = mech_sessions(sessions)
-    config["_live_claws"] = live_claws(sessions, config)
+    live = live_claws(sessions, config)
     mechs = {m for m in (payload.get("canonical_mechs") or []) if isinstance(m, str) and m} | set(issues or {})
-    findings = (config_findings(config) + host_observation_findings(payload, config)
-                + resource_findings(resources or {}, config, by_mech, mechs)
-                + activity_findings(payload, config, by_mech) + backlog_findings(issues or {}, config, by_mech))
+    findings = (config_findings(config) + host_observation_findings(payload, config, live=live)
+                + resource_findings(resources or {}, config, by_mech, mechs, issues=issues, live=live)
+                + activity_findings(payload, config, by_mech, issues=issues, live=live)
+                + backlog_findings(issues or {}, config, by_mech, live=live))
     ranked = rank(findings)
     for number, item in enumerate(ranked, 1):
         item["id"] = f"F{number:03d}"
@@ -693,6 +979,15 @@ def analyze(payload: dict, resources: dict, issues: dict, config: dict) -> list:
 
 def owner_label(o: dict) -> str:
     return {"user": "user", "claw": "claw", "xmechbay": "XMechBay"}[o["kind"]] + (f":{o['key']}" if o.get("key") else "")
+
+
+def mech_lane_label(mech: str, config: dict, issues: dict | None = None) -> str:
+    explicit = config["mech_owner"].get(mech)
+    if explicit in config["claws"] and is_writer_claw(config["claws"][explicit]):
+        return "pinned"
+    if any(is_writer_claw(claw) and mech in claw_mechs(claw) for claw in config["claws"].values()):
+        return "pinned"
+    return mech_mode(mech, (issues or {}).get(mech), config["thresholds"])
 
 
 def render_report(run_id: str, payload: dict, resources: dict, issues: dict, findings: list, config: dict) -> str:
@@ -715,15 +1010,26 @@ def render_report(run_id: str, payload: dict, resources: dict, issues: dict, fin
         swap = r.get("swap") or {}
         lines.append(f"| {host} | {(r.get('disk') or {}).get('free_gib')} | {swap.get('used_gib')}/{swap.get('total_gib')} | {round((r.get('loadavg') or [0])[0], 1)} | {tmp[0]} | {tmp[1]} | {(r.get('codex_sessions') or {}).get('gib')} | {guard} | {counts.get(host, 0)} |")
     tones = ((payload.get("stats") or {}).get("tone_counts")) or {}
-    lines += ["", "## Activity", "", f"Session tones: {', '.join(f'{k} {v}' for k, v in sorted(tones.items()))}.", "",
-              "| Mech | Sessions (host: state) | Responsible claw |", "|---|---|---|"]
     by_mech = mech_sessions(live_rows)
-    live = config.get("_live_claws")
-    if live is None:
-        live = live_claws(live_rows, config)
-    for mech in sorted(set(by_mech) | {m for m in (payload.get("canonical_mechs") or []) if isinstance(m, str) and m}):
-        states = ", ".join(f"{r.get('host_key')}: {r.get('status')}" for r in by_mech.get(mech, [])) or "none"
-        lines.append(f"| {mech} | {states} | {claw_for_mech(mech, by_mech, config, live) or 'unassigned'} |")
+    live = live_claws(live_rows, config)
+    role_mode = has_role_routing(config)
+    lines += ["", "## Activity", "", f"Session tones: {', '.join(f'{k} {v}' for k, v in sorted(tones.items()))}."]
+    if role_mode:
+        lines += ["", "### Claw roles", ""]
+        for key, claw in sorted(config["claws"].items()):
+            if isinstance(claw, dict):
+                roles_txt = ", ".join(claw_roles(claw)) or "untyped"
+                lines.append(f"- `{key}` ({claw.get('host')}): {roles_txt}")
+        lines += ["", "| Mech | Lane | Sessions (host: state) | Responsible claw |", "|---|---|---|---|"]
+        for mech in sorted(set(by_mech) | {m for m in (payload.get("canonical_mechs") or []) if isinstance(m, str) and m}):
+            states = ", ".join(f"{r.get('host_key')}: {r.get('status')}" for r in by_mech.get(mech, [])) or "none"
+            lane = mech_lane_label(mech, config, issues=issues)
+            lines.append(f"| {mech} | {lane} | {states} | {claw_for_mech(mech, by_mech, config, live, issues=issues) or 'unassigned'} |")
+    else:
+        lines += ["", "| Mech | Sessions (host: state) | Responsible claw |", "|---|---|---|"]
+        for mech in sorted(set(by_mech) | {m for m in (payload.get("canonical_mechs") or []) if isinstance(m, str) and m}):
+            states = ", ".join(f"{r.get('host_key')}: {r.get('status')}" for r in by_mech.get(mech, [])) or "none"
+            lines.append(f"| {mech} | {states} | {claw_for_mech(mech, by_mech, config, live, issues=issues) or 'unassigned'} |")
     if issues:
         lines += ["", "## Backlog", "", "| Mech | Repository | Open issues | Open PRs | Drafts | Failing checks |", "|---|---|---:|---:|---:|---:|"]
         for mech, repo in sorted(issues.items()):
@@ -739,6 +1045,35 @@ def render_report(run_id: str, payload: dict, resources: dict, issues: dict, fin
 
 
 # --------------------------------------------------------------------------- plan
+
+ROLE_BRIEF_RULES = {
+    "discovery_supervisor": (
+        "- Discovery lane: create net-new record files and source saturation ledgers only (`add/...` branches under "
+        "`~/agent-work/<Mech>-discovery/`). Do not edit existing records, schemas or workflows, and stop opening new PRs "
+        "on any Mech that reaches {pr_cap} open PRs or a failing check."
+    ),
+    "stewardship_supervisor": (
+        "- Stewardship lane: run `record_review`, `resolve_review_findings`, `open_issue_triage` and failing-PR repairs "
+        "under `~/agent-work/<Mech>-steward/`. Pause new record additions on these Mechs until open PRs drop below {pr_cap} "
+        "and status checks pass."
+    ),
+    "infrastructure_supervisor": (
+        "- Infrastructure lane: fix shared CI/workflow/schema causes once on `main`, advance `INFRA_TASKS.md` and shared "
+        "exporters, and bootstrap explicitly assigned repositories."
+    ),
+    "closure_steward": (
+        "- Closure lane: inspect PR diffs and checks read-only via `gh`, file issues for defects, and prepare per-Mech "
+        "verified merge lists for the user. Never merge, push to another session's branch, or edit Mech checkouts."
+    ),
+    "fleet_maintainer": (
+        "- Maintainer lane: run read-only inventories first (`fleet-repo-crud-cleanup`, `disk-usage-report`), clean only "
+        "approved regenerable scratch on this host, refresh checkouts at idle checkpoints, and retire duplicate/completed "
+        "loops only via the graceful exit protocol."
+    ),
+    "cycle_supervisor": (
+        "- Cycle supervisor lane: verify closure receipts before advancing stages and keep at most one primary loop per Mech."
+    ),
+}
 
 BRIEF_RULES = """## Rules for this brief
 - Re-read live state first; this brief was prepared from a read-only snapshot and can be stale.
@@ -758,6 +1093,9 @@ def render_brief(run_id: str, claw_key: str, claw: dict, items: list, report_dir
     for f in items:
         evidence = json.dumps(f["evidence"], sort_keys=True)[:400] if f["evidence"] else ""
         lines.append(f"- [{f['severity']}] {f['id']} {f['title']}. Action: {f['action']}" + (f" Evidence: {evidence}" if evidence else ""))
+    role_lines = [ROLE_BRIEF_RULES[r].format(pr_cap=thresholds["pr_backlog_warn"]) for r in claw_roles(claw) if r in ROLE_BRIEF_RULES]
+    if role_lines:
+        lines += ["", "## Role boundaries", ""] + role_lines
     lines += ["", BRIEF_RULES.format(disk_floor=thresholds["disk_critical_gib"]).rstrip(), "", "## Report", "",
               f"Write {report_dir}/report.md and summary.json: one row per Mech (state, action taken, PRs, remaining blockers, decision needed from the user), then stop."]
     return "\n".join(lines) + "\n"
@@ -810,24 +1148,66 @@ def hint_matches(hint: str, t: dict) -> bool:
     if t["window"] is not None:
         forms |= {str(t["window"]), f"T{t['window']}"}
     if t.get("tmux_session"):
-        forms |= {t["tmux_window"] or "", f"{t['tmux_session']}:{t['tmux_window']}"}
+        forms |= {t["tmux_session"], t["tmux_window"] or "", f"{t['tmux_session']}:{t['tmux_window']}"}
     return hint in forms - {""}
+
+
+def claw_matching_targets(payload: dict, claw: dict) -> list:
+    """Controllable claw sessions matching this claw's host, repo, tmux_session and target_hint."""
+    targets = claw_targets(payload, claw)
+    if not targets or not isinstance(claw, dict):
+        return []
+    if claw.get("tmux_session") is not None:
+        sess = valid_tmux_session_name(claw.get("tmux_session"))
+        if not sess:
+            return []
+        targets = [t for t in targets if t["transport"] == "tmux" and t["tmux_session"] == sess]
+    raw_hint = claw.get("target_hint")
+    if raw_hint is not None:
+        hint = str(raw_hint).strip()
+        if not hint:
+            return []
+        targets = [t for t in targets if hint_matches(hint, t)]
+    return targets
+
+
+def controller_tmux_for_claw(claw: dict, config: dict) -> str:
+    sess = valid_tmux_session_name(claw.get("tmux_session") if isinstance(claw, dict) else None)
+    if sess:
+        return sess
+    host_cfg = (config.get("hosts") or {}).get(claw.get("host") if isinstance(claw, dict) else None) or {}
+    host_tmux = valid_tmux_session_name(host_cfg.get("tmux_session"))
+    if host_tmux:
+        return host_tmux
+    default_tmux = valid_tmux_session_name(config.get("controller_tmux_session"))
+    return default_tmux or "fleet"
 
 
 def choose_target(targets: list, claw: dict, controller_session: str):
     """Return (target or None, reason). Never guesses: a hint must match exactly one candidate."""
     if not targets:
         return None, "no live controllable claw session on this host"
-    hint = claw.get("target_hint")
-    if hint:
-        matches = [t for t in targets if hint_matches(hint, t)]
+    pool = targets
+    if isinstance(claw, dict) and claw.get("tmux_session") is not None:
+        claw_tmux = valid_tmux_session_name(claw.get("tmux_session"))
+        if not claw_tmux:
+            return None, f"configured tmux_session {claw.get('tmux_session')!r} is invalid"
+        pool = [t for t in targets if t["transport"] == "tmux" and t["tmux_session"] == claw_tmux]
+        if not pool:
+            return None, f"no live claw session in configured tmux_session {claw_tmux!r} ({len(targets)} other session(s) on this host)"
+    hint = claw.get("target_hint") if isinstance(claw, dict) else None
+    if hint is not None:
+        hint_str = str(hint).strip()
+        if not hint_str:
+            return None, "configured target_hint is empty"
+        matches = [t for t in pool if hint_matches(hint_str, t)]
         if len(matches) != 1:
-            return None, f"target_hint {hint!r} matches {len(matches)} of {len(targets)} live claw sessions"
+            return None, f"target_hint {hint!r} matches {len(matches)} of {len(pool)} live claw sessions"
         chosen = matches[0]
-    elif len(targets) == 1:
-        chosen = targets[0]
+    elif len(pool) == 1:
+        chosen = pool[0]
     else:
-        return None, f"{len(targets)} live claw sessions on this host; set target_hint after confirming which claw owns these Mechs"
+        return None, f"{len(pool)} live claw sessions on this host; set target_hint after confirming which claw owns these Mechs"
     if chosen["transport"] == "tmux" and chosen["tmux_session"] != controller_session:
         return None, (f"claw runs in tmux session {chosen['tmux_session']!r}, not the controller's owned session "
                       f"{controller_session!r}; that session's owner must deliver the goal")
@@ -862,12 +1242,17 @@ def plan(run_dir: Path, config: dict) -> dict:
                 "verify it accepted the goal and is working, then the rest. Each command is guarded by mac-term.sh: it refuses "
                 "unreadable screens and screens showing a prompt. Re-check the target's tty and screen first; window ids are transient.", ""]
     summary = {"run": run_id, "claws": {}, "user_decisions": 0, "maintenance": 0}
+    shared_brief_dirs = Counter(
+        (c.get("host"), (c.get("brief_dir") or "~/agent-work/claw/fleet-ops").rstrip("/"))
+        for c in config["claws"].values() if isinstance(c, dict) and c.get("host")
+    )
     for (kind, key), items in sorted(groups.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
         if kind != "claw":
             continue
         claw = config["claws"].get(key) or {}
-        brief_dir = claw.get("brief_dir", "~/agent-work/claw/fleet-ops").rstrip("/")
-        remote_dir = f"{brief_dir}/{run_id}"
+        brief_dir = (claw.get("brief_dir") or "~/agent-work/claw/fleet-ops").rstrip("/")
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(key))
+        remote_dir = f"{brief_dir}/{safe_key}/{run_id}" if shared_brief_dirs[(claw.get("host"), brief_dir)] >= 2 else f"{brief_dir}/{run_id}"
         brief = render_brief(run_id, key, claw, items, remote_dir, config["thresholds"])
         goal = render_goal(run_id, f"{remote_dir}/brief.md", remote_dir)
         write_private_file(out / "briefs" / f"{key}.md", brief)
@@ -875,7 +1260,7 @@ def plan(run_dir: Path, config: dict) -> dict:
         host_cfg = hosts.get(claw.get("host")) or {}
         dest = "local" if host_cfg.get("transport") == "local" else host_cfg.get("host", "<ssh-host>")
         targets = claw_targets(payload, claw)
-        controller = (config["hosts"].get(claw.get("host")) or {}).get("tmux_session", config.get("controller_tmux_session", "fleet"))
+        controller = controller_tmux_for_claw(claw, config)
         chosen, reason = choose_target(targets, claw, controller)
         brief_file, goal_file = (out / "briefs" / f"{key}.md").resolve(), (out / "goals" / f"{key}.txt").resolve()
         mt = (ROOT / ".agents/skills/mac-orchestration/scripts/mac-term.sh").resolve()
@@ -1370,7 +1755,7 @@ def synthesize_recommendations(payload: dict, resources: dict, issues: dict, fin
     claws_per_host = Counter(r["host_key"] for r in live_sessions
                              if r.get("role") == "claw" and isinstance(r.get("host_key"), str) and r.get("host_key"))
     multi_claw_hosts = {h: c for h, c in sorted(claws_per_host.items()) if c >= 2}
-    dead_claws = [k for k, c in sorted(config["claws"].items()) if not claw_targets(payload, c)]
+    dead_claws = [k for k, c in sorted(config["claws"].items()) if not claw_matching_targets(payload, c)]
     if draft_claws or multi_claw_hosts or dead_claws:
         parts = []
         if draft_claws:

@@ -11,12 +11,15 @@ A role is a documented responsibility held by an identified session. A small
 deployment can give several compatible roles to one session. Multiple sessions
 must not claim the same ownership boundary without an explicit handoff.
 
-| Role | Responsibility | Boundary |
-| --- | --- | --- |
-| Coordinator | Observe activity, resources and backlog; route findings; prepare a decision list and briefs for the owning supervisors | Does not perform domain work or send input to another supervisor's workers |
-| Cycle supervisor | Track the configured stages for its assigned repositories; verify closure receipts; diagnose stalls and escalate prompts | Controls only explicitly bound sessions; does not acquire merge or restart authority from its role |
-| Closure steward | Find unpublished or blocked completed work; route it to the owning session; track per-PR reviews, checks and required decisions | Does not push another session's commits, substitute batch sampling for independent review, or declare another session's work complete |
-| Fleet maintainer | Maintain source pins, configuration, service integration, skills and authorized retention/cleanup work | Does not change scientific content or treat generic maintenance guidance as permission to remove data |
+| Role | Config key (`roles`) | Responsibility | Boundary |
+| --- | --- | --- | --- |
+| Coordinator | *(coordinator session)* | Observe activity, resources and backlog; route findings; prepare a decision list and briefs for the owning supervisors | Does not perform domain work or send input to another supervisor's workers |
+| Cycle supervisor | `cycle_supervisor` | Track all configured stages for its assigned repositories in smaller single-lane deployments; verify closure receipts; diagnose stalls and escalate prompts | Controls only explicitly bound sessions; does not acquire merge or restart authority from its role |
+| Discovery supervisor | `discovery_supervisor` | Run bounded `source_discovery` and net-new `add_records` (`add/...` branches and discovery saturation ledgers) for repositories in the `discover` lane | Does not edit existing records, schemas or workflows; stops opening PRs when a repository reaches its open-PR cap or fails checks |
+| Stewardship supervisor | `stewardship_supervisor` | Run `record_review`, `resolve_review_findings`, `open_issue_triage` and non-cohort failing-PR repair for repositories in the `steward` lane | Pauses net-new record additions until open PRs and status checks clear; does not merge PRs |
+| Infrastructure supervisor | `infrastructure_supervisor` | Fix shared CI, schema and workflow causes once on `main`, maintain shared exporters/infrastructure tasks, and bootstrap explicitly assigned repositories (`infra` lane) | Does not mass-edit scientific claims across open PR branches when one base-branch fix resolves the cohort |
+| Closure steward | `closure_steward` | Review mergeable green PR heads and triage stale drafts read-only via `gh`; file defect issues; record verified merge candidates for the operator | Never merges, pushes to another session's branch, substitutes batch sampling for per-PR diff review, or edits repository checkouts |
+| Fleet maintainer | `fleet_maintainer` | Run read-only space/session inventories first, clean approved regenerable scratch on its host, refresh checkouts at idle checkpoints, and retire duplicate/completed loops via graceful exit | Does not change scientific content, touch unreachable hosts, or treat generic maintenance guidance as permission to remove data |
 
 The owning repository session remains responsible for its changes and evidence.
 A closure receipt should identify the reviewed head, checks, findings and their
@@ -29,6 +32,44 @@ a merge. Without the owner's approval, record the PR and decision needed, mark
 the closure as held, and route it to the owner's decision list. Subsequent work
 may proceed only if the configured cycle permits that held state. Related
 external discussion: [held closure handling](https://github.com/CultureBotAI/culturebotai-claw/issues/1248).
+
+## Two-fleet workload split and exclusive-writer contract
+
+Larger deployments can split domain supervision into two complementary fleets so
+record production never starves review, repair and infrastructure maintenance:
+
+1. **Discovery and add-record fleet (`discovery_supervisor`):** network- and
+   literature-bound `source_discovery` and net-new `add_records` work, writing
+   only new record files on `add/...` branches and updating discovery saturation
+   ledgers in dedicated discovery worktrees.
+2. **Stewardship, closure and infrastructure fleet (`stewardship_supervisor`,
+   `infrastructure_supervisor`, `closure_steward`, `fleet_maintainer`):**
+   validation- and test-heavy `record_review`, `resolve_review_findings`,
+   `open_issue_triage`, failing-PR repair, shared CI/exporter infrastructure,
+   read-only green-PR diff review, and host session/storage hygiene.
+
+To prevent cross-session branch collisions and duplicate loops across hosts,
+routing enforces **at most one active writer lane per repository** from observed
+backlog state (unless pinned via `mech_owner` or an explicit writer
+`claws.<key>.mechs` list):
+
+| Lane | Entry condition | Active writer | Concurrent read-only / hygiene lanes |
+| --- | --- | --- | --- |
+| `pinned` | Explicit `mech_owner` entry or writer `claws.<key>.mechs` list (for example, bootstrap repositories) | Configured supervisor claw | `closure_steward` (read-only diff/draft review via `gh`), `fleet_maintainer` (host-local hygiene) |
+| `infra` | Systemic check-failure cohort (`>= pr_ci_cohort_min` and `>= pr_ci_cohort_ratio` failing PRs) | `infrastructure_supervisor` (when `accept_infra_cohorts` is enabled; falls back to `stewardship_supervisor` / `cycle_supervisor`) | `closure_steward` (stale-draft classification via `gh`), `fleet_maintainer` (host-local duplicate-loop inventory) |
+| `steward` | Open PRs `>= pr_backlog_warn`, any non-cohort failing check, truncated PR sample (`open_prs > len(prs)`), or open issues `>= issue_steward_warn` | `stewardship_supervisor` (or `cycle_supervisor`) | `closure_steward` (read-only diff review of green PRs via `gh`) |
+| `discover` | Open PRs `< pr_backlog_warn`, zero failing checks across all open PRs, and open issues `< issue_steward_warn` | `discovery_supervisor` (or `cycle_supervisor`) | `closure_steward` (read-only diff review of green PRs via `gh`) |
+| `unknown` | Backlog unobserved (`--no-issues` or query failure) | `stewardship_supervisor` / `cycle_supervisor` (never triggers blind discovery) | Coordinator restores backlog observation |
+
+**Workload-matched host placement.** Because `discover`, `steward` and `infra`
+are mutually exclusive per repository and `closure_steward` operates read-only
+through GitHub metadata and diffs, heterogeneous multi-host deployments can bind
+CPU-intensive lanes (`stewardship_supervisor`, `infrastructure_supervisor`) to
+higher-compute hosts while placing I/O- and API-bound lanes
+(`discovery_supervisor`, `closure_steward`, and host-local `fleet_maintainer`)
+on lighter hosts. Claws holding only non-writer roles configure `"mechs": []` so
+they never capture repositories as catch-all owners; cross-host duplicate-loop
+and coordinator-query findings remain with the Coordinator.
 
 ## Session ownership and capability checks
 
@@ -47,7 +88,7 @@ the helper's checks.
 | --- | --- | --- |
 | Reporting interface | Coordinator's observation and planning | No session input |
 | Host controller | An explicitly authorized controller | Only identified host-loop targets, with before/after checks |
-| Repository supervisor | Cycle supervisor | Only the sessions in its verified supervisor map |
+| Repository supervisor | Supervisor roles (`cycle_supervisor`, `discovery_supervisor`, `stewardship_supervisor`, `infrastructure_supervisor`) | Only the sessions in its verified supervisor map |
 | Task dispatcher | The session that launched workers | Only its owned workers |
 
 Fleet-wide roles may need host-local actions. An SSH process may have a different
