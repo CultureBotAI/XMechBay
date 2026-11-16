@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "fleet_status_config": "fleet-hosts.json",
+  "fleet_manifest": null,
+  "repos": {
+    "SampleMech": "example-org/SampleMech",
+    "OtherMech": "example-org/OtherMech"
+  },
+  "thresholds": {
+    "disk_warn_gib": 100,
+    "disk_critical_gib": 50
+  },
+  "hosts": {
+    "laptop-a": {"watch": ["~/work/SampleMech/.temp"]}
+  },
+  "claws": {
+    "claw-a": {
+      "host": "laptop-a",
+      "label": "Laptop A claw",
+      "repo": "sample-claw",
+      "mechs": ["*"],
+      "brief_dir": "~/agent-work/claw/fleet-ops"
+    },
+    "claw-b": {
+      "host": "laptop-b",
+      "label": "Laptop B claw",
+      "repo": "sample-claw",
+      "mechs": ["*"],
+      "brief_dir": "~/agent-work/claw/fleet-ops"
+    }
+  },
+  "mech_owner": {
+    "OtherMech": "claw-a"
+  }
+}

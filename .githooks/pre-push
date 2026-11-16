@@ -1,0 +1,7 @@
+#!/bin/sh
+# Purpose: installed pre-upload publication guard; date: 2026-11-15.
+# Inputs: Git pre-push arguments/stdin; output: refusal or verified scope counts.
+# Installed beside a pinned scanner and contract by install_publication_guard.py.
+set -eu
+hook_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 -E -s -B "$hook_directory/../publication_guard.py" --contract "$hook_directory/../contract.json" "$@"

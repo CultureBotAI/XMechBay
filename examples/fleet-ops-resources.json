@@ -1,0 +1,26 @@
+{
+  "workstation-local": {
+    "schema_version": 1, "observed_at": "2026-01-15T18:00:00Z", "hostname": "workstation.example.invalid",
+    "disk": {"free_gib": 210.5, "total_gib": 926.4, "used_pct": 77.3},
+    "swap": {"total_gib": 2.0, "used_gib": 0.4}, "memory_gib": 64.0, "loadavg": [1.4, 1.2, 1.1], "cpus": 12,
+    "tmp_roots": [{"path": "/private/tmp", "gib": 0.8, "children": []},
+                  {"path": "/private/var/folders/xx/example/T", "gib": 1.1, "children": []}],
+    "codex_sessions": {"path": "~/.codex/sessions", "exists": true, "gib": 3.2},
+    "watched": [], "guard": {"installed": true, "phase": "complete", "status": "ok", "exit_code": 0,
+                             "finished_at": "2099-01-01T00:00:00+00:00", "at_risk": 0, "skipped": {}, "unknown": 0},
+    "local_snapshots": 0, "claude_cleanup_period_days": {".claude": 3650}
+  },
+  "laptop-a": {
+    "schema_version": 1, "observed_at": "2026-01-15T18:00:00Z", "hostname": "worker-a.example.invalid",
+    "disk": {"free_gib": 31.0, "total_gib": 1858.0, "used_pct": 98.3},
+    "swap": {"total_gib": 32.0, "used_gib": 30.5}, "memory_gib": 48.0, "loadavg": [3.2, 3.0, 2.8], "cpus": 18,
+    "tmp_roots": [{"path": "/private/tmp", "gib": 16.9, "children": [{"name": "example-1371-full-v2", "gib": 5.6}]},
+                  {"path": "/private/var/folders/yy/example/T", "gib": 6.0, "children": [{"name": "example-pytest-abc", "gib": 5.5}]}],
+    "codex_sessions": {"path": "~/.codex/sessions", "exists": true, "gib": 62.0},
+    "watched": [{"path": "~/work/SampleMech/.temp", "exists": true, "gib": 221.0}],
+    "guard": {"installed": true, "phase": "complete", "status": "incomplete", "exit_code": 30,
+              "finished_at": "2099-01-01T00:00:00+00:00", "at_risk": 120, "skipped": {"free-disk-floor": 12}, "unknown": 3},
+    "local_snapshots": 0, "claude_cleanup_period_days": {".claude": null}
+  },
+  "laptop-b": {"error": "probe exit 255: ssh: connect to host worker-b.example.invalid port 22: Operation timed out"}
+}

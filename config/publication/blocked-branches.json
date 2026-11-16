@@ -1,0 +1,16 @@
+{
+  "name": "Block branches outside public source namespace",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": ["~ALL"],
+      "exclude": ["refs/heads/main", "refs/heads/public/**/*"]
+    }
+  },
+  "rules": [
+    {"type": "creation"},
+    {"type": "update", "parameters": {"update_allows_fetch_and_merge": false}}
+  ]
+}

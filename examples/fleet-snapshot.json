@@ -1,0 +1,215 @@
+{
+  "schema_version": 1,
+  "description": "Synthetic fleet-session-status and HTML dashboard example, 2026-11-14. All sessions, paths, identifiers, models and observations are fictional; fixed timestamps are historical evidence, not live status.",
+  "hosts": {
+    "workstation-local": {
+      "label": "Local Workstation",
+      "snapshot": {
+        "schema_version": 1,
+        "observed_at": "2026-01-01T12:00:00+00:00",
+        "sessions": [
+          {
+            "agent": "codex",
+            "pid": 81,
+            "ppid": 70,
+            "tty": "ttys000",
+            "started_at": "2026-01-01T08:30:00+00:00",
+            "age_seconds": 12600,
+            "cwd": "/work/XMechBay",
+            "session_id": "99999999-0000-4000-8000-000000000001",
+            "session_id_source": "argv",
+            "target": {"transport": "terminal", "window_id": 10, "tab": 1, "selected": true, "minimized": false},
+            "screen": "› check fleet readiness\n• Verified 3 host configurations and 0 public-content findings.\n» Ask Codex to do anything\nGPT-Example high · XMechBay\n74% context left\n",
+            "title": "XMechBay coordinator",
+            "errors": []
+          },
+          {
+            "agent": "claude",
+            "pid": 82,
+            "ppid": 71,
+            "tty": "ttys004",
+            "started_at": "2026-01-01T10:15:00+00:00",
+            "age_seconds": 6300,
+            "cwd": "/work/sample-notes",
+            "session_id": "99999999-0000-4000-8000-000000000002",
+            "session_id_source": "argv",
+            "target": {"transport": "terminal", "window_id": 11, "tab": 2, "selected": false, "minimized": false},
+            "screen": "⏺ Summarized synthetic notes.\n>\n[WORK] Claude Sonnet 1 · medium\n",
+            "title": "sample-notes scratch",
+            "errors": []
+          }
+        ],
+        "health": {
+          "report": {
+            "schema_version": 1,
+            "observed_at": "2026-01-01T11:59:55+00:00",
+            "status": "ok",
+            "exit_code": 0,
+            "host": {"first": 49152, "last": 65535, "range_size": 16384, "distinct_local_ports": 640, "occupancy_ratio": 0.039, "status": "ok", "observed_status": "ok"},
+            "process_status": "ok",
+            "attribution": {"status": "complete", "unattributed_rows": 0},
+            "largest_processes": [
+              {"program": "codex", "pid": 81, "listen_sockets": 2, "status": "ok"}
+            ],
+            "offenders": [],
+            "errors": []
+          },
+          "error": null
+        },
+        "system": {"arch": "arm64", "cpu_count": 10, "loadavg_1m": 1.42, "disk_free_gib": 210.5, "disk_total_gib": 926.4},
+        "coverage": {"processes": "complete", "terminal": "complete", "tmux": "unavailable", "cwd": "complete", "agent_discovery": "complete"},
+        "errors": []
+      }
+    },
+    "laptop-a": {
+      "label": "Laptop A",
+      "snapshot": {
+        "schema_version": 1,
+        "observed_at": "2026-01-01T12:00:00+00:00",
+        "sessions": [
+          {
+            "agent": "codex",
+            "pid": 101,
+            "ppid": 90,
+            "tty": "ttys001",
+            "started_at": "2026-01-01T09:00:00+00:00",
+            "age_seconds": 10800,
+            "cwd": "/work/sample-claw",
+            "session_id": "aaaaaaaa-1111-4111-8111-111111111111",
+            "session_id_source": "argv",
+            "target": {"transport": "tmux", "pane": "%1", "tmux_session": "fleet", "tmux_sessions": ["fleet", "xmb-view-claw"], "window": "sample-claw"},
+            "screen": "› summarize the fleet\n• Fleet report ready: 3 completed tasks and 1 task awaiting review.\n» Ask Codex to do anything\nGPT-Example high · sample-claw\n",
+            "title": "sample-claw supervisor",
+            "errors": []
+          },
+          {
+            "agent": "codex",
+            "pid": 103,
+            "ppid": 92,
+            "tty": "ttys003",
+            "started_at": "2026-01-01T11:00:00+00:00",
+            "age_seconds": 3600,
+            "cwd": "/work/SampleMech",
+            "session_id": "cccccccc-3333-4333-8333-333333333333",
+            "session_id_source": "argv",
+            "target": {"transport": "tmux", "pane": "%4", "tmux_session": "fleet", "tmux_sessions": ["fleet", "xmb-view-SampleMech"], "window": "SampleMech"},
+            "screen": "› review the example records\n• Reviewed 18/120 records; checking record 19.\nWorking (42s • esc to interrupt)\n›\nGPT-Example ultra · SampleMech · Pursuing goal (45m)\n61% context remaining\n",
+            "title": "SampleMech review",
+            "errors": []
+          },
+          {
+            "agent": "codex",
+            "pid": 104,
+            "ppid": 93,
+            "tty": "ttys005",
+            "started_at": "2026-01-01T11:20:00+00:00",
+            "age_seconds": 2400,
+            "cwd": "/tmp/boss-workers/mim-example-01/worktree",
+            "session_id": null,
+            "session_id_source": null,
+            "target": {"transport": "tmux", "pane": "%9", "tmux_session": "mim-example-01", "tmux_sessions": ["mim-example-01"], "window": "worker"},
+            "screen": "› validate batch 01\n• Validated 10 records.\n» Ask Codex to do anything\nGPT-Example high · worktree\n",
+            "title": "worker",
+            "errors": []
+          }
+        ],
+        "health": {
+          "report": {
+            "schema_version": 1,
+            "observed_at": "2026-01-01T11:59:50+00:00",
+            "status": "ok",
+            "exit_code": 0,
+            "host": {"first": 49152, "last": 65535, "range_size": 16384, "distinct_local_ports": 1024, "occupancy_ratio": 0.0625, "status": "ok", "observed_status": "ok"},
+            "process_status": "ok",
+            "attribution": {"status": "complete", "unattributed_rows": 0},
+            "largest_processes": [
+              {"program": "codex", "pid": 101, "listen_sockets": 1, "status": "ok"},
+              {"program": "codex", "pid": 103, "listen_sockets": 3, "status": "ok"}
+            ],
+            "offenders": [],
+            "errors": []
+          },
+          "error": null
+        },
+        "system": {"arch": "arm64", "cpu_count": 12, "loadavg_1m": 3.18, "disk_free_gib": 412.0, "disk_total_gib": 1858.0},
+        "coverage": {"processes": "complete", "terminal": "complete", "tmux": "complete", "cwd": "complete", "agent_discovery": "complete"},
+        "errors": []
+      }
+    },
+    "laptop-b": {
+      "label": "Laptop B",
+      "snapshot": {
+        "schema_version": 1,
+        "observed_at": "2026-01-01T12:00:00+00:00",
+        "sessions": [
+          {
+            "agent": "agy",
+            "pid": 201,
+            "ppid": 190,
+            "tty": "ttys011",
+            "started_at": "2025-12-30T12:00:00+00:00",
+            "age_seconds": 172800,
+            "cwd": "/work/SampleMech",
+            "session_id": "dddddddd-4444-4444-8444-444444444444",
+            "session_id_source": "argv",
+            "target": {"transport": "terminal", "window_id": 31, "tab": 1, "selected": true, "minimized": true},
+            "screen": "The independent reviewer is checking the change.\n┃ self needs approval for Bash\n┃ ● Bash(git diff --stat)\n┃ ctrl+k approve · alt+j manage\n────────────────────\n>\n────────────────────\n● Agent(self: Example Reviewer) Blocked · 19s\n? for shortcuts Gemini 1 Example · high · 1 subagent(s)\n",
+            "title": "SampleMech independent review",
+            "errors": []
+          },
+          {
+            "agent": "claude",
+            "pid": 202,
+            "ppid": 191,
+            "tty": "ttys012",
+            "started_at": "2026-01-01T11:30:00+00:00",
+            "age_seconds": 1800,
+            "cwd": "/work/OtherMech",
+            "session_id": "eeeeeeee-5555-4555-8555-555555555555",
+            "session_id_source": "argv",
+            "target": {"transport": "terminal", "window_id": 32, "tab": 2, "selected": false, "minimized": false},
+            "screen": "⏺ Example validation completed: 12 checks passed.\n>\n[WORK] Claude Sonnet 1 · high\n",
+            "title": "OtherMech validation",
+            "errors": []
+          },
+          {
+            "agent": "codex",
+            "pid": 203,
+            "ppid": 192,
+            "tty": "??",
+            "started_at": "2026-01-01T11:55:00+00:00",
+            "age_seconds": 300,
+            "cwd": "/work/DetachedMech",
+            "session_id": null,
+            "session_id_source": null,
+            "target": {"transport": "process"},
+            "screen": "",
+            "title": "",
+            "errors": ["screen_unavailable"]
+          }
+        ],
+        "health": {
+          "report": {
+            "schema_version": 1,
+            "observed_at": "2026-01-01T11:50:00+00:00",
+            "status": "critical",
+            "exit_code": 20,
+            "host": {"first": 49152, "last": 65535, "range_size": 16384, "distinct_local_ports": 3072, "occupancy_ratio": 0.1875, "status": "ok", "observed_status": "ok"},
+            "process_status": "critical",
+            "attribution": {"status": "partial", "unattributed_rows": 1},
+            "largest_processes": [
+              {"program": "agy", "pid": 201, "listen_sockets": 1200, "status": "critical"},
+              {"program": "claude", "pid": 202, "listen_sockets": 2, "status": "ok"}
+            ],
+            "offenders": [{"program": "agy", "pid": 201, "listen_sockets": 1200, "status": "critical"}],
+            "errors": []
+          },
+          "error": null
+        },
+        "system": {"arch": "x86_64", "loadavg_1m": 2.04, "disk_free_gib": 94.2, "disk_total_gib": 465.6},
+        "coverage": {"processes": "complete", "terminal": "complete", "tmux": "not_running", "cwd": "complete", "agent_discovery": "complete"},
+        "errors": []
+      }
+    }
+  }
+}
