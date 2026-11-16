@@ -143,14 +143,17 @@ def install(destination, interpreter, runtime, tdm_env, cborg_shells, backup_tag
         raise Refused("Backup tag must contain letters/digits/hyphens and end in -YYYYMMDD")
     # Metadata-only resolution prevents installing over a loader or credential
     # file, including an alias through an existing symlink. Never open them.
-    if destination.resolve(strict=False) in {
+    protected_paths = {
         path.resolve(strict=False) for path in [interpreter, runtime, tdm_env, *cborg_shells]
-    }:
+    }
+    if destination.resolve(strict=False) in protected_paths:
         raise Refused("Destination collides with an interpreter, runtime or credential path")
+    backup_name = destination.name + ".bak-" + backup_tag
+    if destination.with_name(backup_name).resolve(strict=False) in protected_paths:
+        raise Refused("Backup collides with an interpreter, runtime or credential path")
     content = launcher_bytes(interpreter, runtime, tdm_env, cborg_shells)
     if len(content) > MAX_LAUNCHER_BYTES:
         raise Refused("Generated launcher is too large")
-    backup_name = destination.name + ".bak-" + backup_tag
     with parent_directory(destination) as fd:
         previous, info = read_destination(fd, destination.name)
         changed = previous != content or info is None or stat.S_IMODE(info.st_mode) != 0o700

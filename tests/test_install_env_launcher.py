@@ -192,6 +192,13 @@ class LauncherTests(unittest.TestCase):
             self.install(runtime=self.root / "absent.py", apply=True)
         self.assertFalse(self.destination.exists())
 
+    def test_backup_cannot_create_a_missing_credential_source(self):
+        self.destination.write_text("previous")
+        with self.assertRaisesRegex(INSTALL.Refused, "Backup collides"):
+            self.install(tdm_env=self.backup(), apply=True)
+        self.assertFalse(self.backup().exists())
+        self.assertEqual(self.destination.read_text(), "previous")
+
     def test_concurrent_update_is_preserved_and_original_backup_retained(self):
         self.destination.write_text("original")
         original_write = INSTALL.exclusive_write
