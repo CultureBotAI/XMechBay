@@ -724,6 +724,353 @@ class CompactTableTests(unittest.TestCase):
         self.assertEqual(cleaned, "alphabeta")
         self.assertEqual(cleaned.encode("utf-8"), b"alphabeta")
 
+    def test_pasted_prompt_extracts_composer_text_and_distinguishes_paste_from_single_line(self):
+        pasted = VIEW.analyze_session(session("""● Finished schema audit on SampleMech.
+────────────────
+❯ add these to NEXT TASKS [Pasted text #2 +26 lines]
+────────────────
+[WORK] sample@example.invalid · Claude Opus 5.5
+""", "claude"))
+        self.assertEqual(pasted["status"], "UNKNOWN")
+        self.assertIn("draft", pasted["flags"])
+        self.assertIn("pasted-prompt", pasted["flags"])
+        self.assertEqual(pasted["composer_text"], "add these to NEXT TASKS [Pasted text #2 +26 lines]")
+        syms = VIEW.session_symbols(pasted, host_key="m1", host_label="Workstation")
+        self.assertEqual((syms["guard"]["dot"], syms["guard"]["glyph"], syms["guard"]["short"]), ("🟠", "📋", "pasted"))
+
+        # Pasted prompt after Goal achieved is still flagged as not running
+        paused_paste = VIEW.analyze_session(session("""• Completed goal batch.
+› run follow-up verification on sample batch 2
+  and update summary table
+GPT-6-Astra high · examples/SampleMech · Goal achieved (1h 10m)
+""", "codex"))
+        self.assertEqual(paused_paste["status"], "Goal achieved")
+        self.assertIn("draft", paused_paste["flags"])
+        self.assertIn("pasted-prompt", paused_paste["flags"])
+        self.assertIn("run follow-up verification", paused_paste["composer_text"])
+
+        # Claude tool/timing lines with ⎿ or Churned for after a submitted > turn are NOT drafts
+        submitted_turn = VIEW.analyze_session(session("""────────────────
+> run tests
+  ⎿ Running pytest -q
+  ✻ Churned for 42s
+────────────────
+[WORK] sample@example.invalid · Claude Sonnet 4.6
+""", "claude"))
+        self.assertNotIn("draft", submitted_turn["flags"])
+
+    def test_keystroke_hints_and_agy_work_permission_subset(self):
+        # AGY APPROVAL without skip_permissions -> agy_work_fixable=True
+        agy_fix = session("""Allow execution of pytest?
+❯ 1. Yes, allow command
+  2. No, deny command
+↑/↓ Navigate · f full diff
+? for shortcuts Gemini 4 Argon · high
+""", "agy", skip_permissions=False)
+        res_fix = VIEW.analyze_session(agy_fix)
+        self.assertEqual(res_fix["status"], "APPROVAL")
+        self.assertTrue(res_fix["agy_work_fixable"])
+        self.assertEqual(res_fix["agy_work_status"], "fixable")
+        self.assertIn("agy-work-fixable", res_fix["flags"])
+        self.assertEqual(res_fix["keystroke_hint"], "1 or Enter allow · 2 deny · f diff · ↑/↓")
+        syms_fix = VIEW.session_symbols({**agy_fix, **res_fix}, host_key="m1", host_label="Workstation")
+        self.assertEqual((syms_fix["guard"]["dot"], syms_fix["guard"]["glyph"], syms_fix["guard"]["short"]), ("🟡", "⚡", "agy-wk"))
+
+        # AGY APPROVAL already running with skip_permissions=True -> already_enabled (not fixable by agy-work)
+        agy_already = session("""Allow execution of rm scratch.txt?
+❯ 1. Yes, allow command
+  2. No, deny command
+? for shortcuts Gemini 4 Argon · high
+""", "agy", skip_permissions=True)
+        res_already = VIEW.analyze_session(agy_already)
+        self.assertFalse(res_already["agy_work_fixable"])
+        self.assertEqual(res_already["agy_work_status"], "already_enabled")
+        self.assertIn("agy-work-active", res_already["flags"])
+        syms_already = VIEW.session_symbols({**agy_already, **res_already}, host_key="m1", host_label="Workstation")
+        self.assertEqual((syms_already["guard"]["dot"], syms_already["guard"]["short"]), ("🟡", "prompt"))
+
+        # AGY QUESTION with skip_permissions=False -> NOT fixable by agy-work
+        agy_q = VIEW.analyze_session(session("""? Which validation profile should we use?
+❯ 1. Strict (Recommended)
+  2. Fast
+  3. Minimal
+Enter to select · ↑/↓ to navigate
+? for shortcuts Gemini 4 Argon · high
+""", "agy", skip_permissions=False))
+        self.assertEqual(agy_q["status"], "QUESTION")
+        self.assertFalse(agy_q["agy_work_fixable"])
+        self.assertEqual(agy_q["keystroke_hint"], "1–3 or ↑/↓ + Enter")
+
+        # Claude 3-choice approval and historical prose non-false-positive
+        claude_app = VIEW.analyze_session(session("""Do you want to make this edit to schema.yaml?
+❯ 1. Yes
+  2. Yes, and don't ask again this session
+  3. No, and tell Claude what to do differently (esc)
+[WORK] sample@example.invalid · Claude Opus 5.5
+""", "claude"))
+        self.assertEqual(claude_app["keystroke_hint"], "1 allow once · 2 session-allow · 3/esc deny")
+
+        prose_mention = VIEW.analyze_session(session("""● The UI lets users press Enter to submit answer or arrow keys to navigate questions in interactive forms.
+❯
+[WORK] sample@example.invalid · Claude Sonnet 4.6
+""", "claude"))
+        self.assertEqual(prose_mention["status"], "idle")
+
+    def test_coding_agent_end_of_response_message_requires_reply_without_false_positives(self):
+        # Direct end-of-turn question at empty composer
+        ask_end = VIEW.analyze_session(session("""> review backlog
+● Ranked 3 open items for SampleMech.
+Which of those (if any) would you like me to branch and build first?
+────────────────
+>
+────────────────
+? for shortcuts Gemini 4 Argon · high
+""", "agy"))
+        self.assertEqual(ask_end["status"], "idle")
+        self.assertIn("agent-message", ask_end["flags"])
+        self.assertIn("Which of those", ask_end["agent_message"])
+        syms_msg = VIEW.session_symbols(ask_end, host_key="m1", host_label="Workstation")
+        self.assertEqual((syms_msg["guard"]["dot"], syms_msg["guard"]["glyph"], syms_msg["guard"]["short"]), ("🟣", "💬", "reply"))
+
+        # Yes/No confirmation question followed by short metadata bullets (Shape B)
+        pr_gate = VIEW.analyze_session(session("""> open PR
+● All checks passed.
+Do you approve opening this PR?
+- Destination: SampleOrg/SampleMech
+- Title: Fix validation
+>
+? for shortcuts Gemini 4 Argon · high
+""", "agy"))
+        self.assertEqual(pr_gate["status"], "idle")
+        self.assertIn("agent-message", pr_gate["flags"])
+        self.assertIn("Do you approve opening this PR?", pr_gate["agent_message"])
+
+        # Esc-interrupted turn MUST NOT be classified as an agent response message
+        interrupted = VIEW.analyze_session(session("""> run sweep
+⎿ Interrupted · What should Antigravity CLI do instead?
+────────────────
+>
+────────────────
+? for shortcuts Gemini 4 Argon · high
+""", "agy"))
+        self.assertEqual(interrupted["status"], "idle")
+        self.assertIsNone(interrupted["agent_message"])
+        self.assertNotIn("agent-message", interrupted["flags"])
+
+        # Framed multi-line user question with empty output MUST NOT spoof assistant message
+        empty_after_framed_q = VIEW.analyze_session(session("""────────────────
+> Why did the sample validation
+fail on worker node?
+────────────────
+────────────────
+>
+────────────────
+? for shortcuts Gemini 4 Argon · high
+""", "agy"))
+        self.assertEqual(empty_after_framed_q["status"], "idle")
+        self.assertIsNone(empty_after_framed_q["agent_message"])
+
+        # Polite courtesy sign-off at end of finished task stays plain idle
+        courtesy = VIEW.analyze_session(session("""> status
+● All 18 checks passed cleanly. Let me know if you need anything else!
+>
+GPT-6-Astra high · examples/SampleMech
+""", "codex"))
+        self.assertEqual(courtesy["status"], "idle")
+        self.assertIsNone(courtesy["agent_message"])
+
+        # Multi-sentence final paragraph where sentence 1 asks approval and sentence 2 explains policy
+        codex_approve = VIEW.analyze_session(session("""› check status
+• Public #2 transport fixes; 508 tests passed.
+Approve merging #2 and #226? Your standing Git rule requires explicit approval for each merge.
+Worked for 34m 17s • 7:07 PM
+» Ask Codex to do anything
+GPT-6-Astra ultra Fast · examples/SampleMech · Main [default]
+""", "codex"))
+        self.assertEqual(codex_approve["status"], "idle")
+        self.assertIn("agent-message", codex_approve["flags"])
+        self.assertEqual(codex_approve["agent_message"], "Approve merging #2 and #226?")
+
+        # Imperative "Reply go to start..." and "Ready for merge approval..."
+        reply_go = VIEW.analyze_session(session("""> check queue
+• Zero collision with open PRs.
+Reply go to start PR-Next-1 (#552) now (and tell me if you meant all Phase 1 PRs).
+────────────────
+>
+────────────────
+? for shortcuts Gemini 4 Argon · high
+""", "agy"))
+        self.assertEqual(reply_go["status"], "idle")
+        self.assertIn("agent-message", reply_go["flags"])
+        self.assertIn("Reply go to start PR-Next-1", reply_go["agent_message"])
+
+        ready_approval = VIEW.analyze_session(session("""› review PR
+• Independent re-reviews passed; 625 tests passed locally and in CI.
+Ready for merge approval, required separately by your AGENTS.md.
+Worked for 17m 44s • 7:02 PM
+» Ask Codex to do anything
+GPT-6-Astra ultra Fast · examples/SampleMech
+""", "codex"))
+        self.assertEqual(ready_approval["status"], "idle")
+        self.assertIn("agent-message", ready_approval["flags"])
+
+    def test_active_running_states_across_agy_claude_and_codex_without_false_positives(self):
+        # 1. Antigravity active command + task strip + esc to cancel footer
+        agy_cmd = VIEW.analyze_session(session("""○ Thought for 12.4s (Checking unit tests)
+● Explored 1 file (fleet_view.py)
+⣷ Running command...
+└ Tip: Use /help to browse agent skills.
+────────────────
+>
+────────────────
+● [19:13:44] python3 -B tests/run_suite.py running
+────────────────
+esc to cancel Gemini 4 Argon · high · 1 task(s) · /tasks
+""", "agy", title="dashboard"))
+        self.assertEqual(agy_cmd["status"], "Working")
+        self.assertEqual(agy_cmd["activity"], "Running command...")
+        self.assertIn("task-present", agy_cmd["flags"])
+
+        # 2. Antigravity active file read / streaming without background task
+        agy_read = VIEW.analyze_session(session("""● Explored 2 files (REPORT.md, schema.yaml)
+⢿ Reading file...
+└ Tip: Use /help to browse agent skills.
+────────────────
+>
+────────────────
+esc to cancel Gemini 4 Argon · high
+""", "agy"))
+        self.assertEqual(agy_read["status"], "Working")
+        self.assertEqual(agy_read["activity"], "Reading file...")
+
+        # 3. Antigravity 4-option approval still beats esc to cancel footer
+        agy_app4 = VIEW.analyze_session(session("""Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation
+  3. Yes, and always allow (Persist to settings.json)
+  4. No, cancel
+↑/↓ Navigate · tab Amend
+esc to cancel Gemini 4 Argon · high · 1 task(s) · /tasks
+""", "agy", skip_permissions=False))
+        self.assertEqual(agy_app4["status"], "APPROVAL")
+        self.assertTrue(agy_app4["agy_work_fixable"])
+        self.assertEqual(agy_app4["keystroke_hint"], "1 allow once · 2–3 always-allow · 4/esc cancel")
+
+        # 4. Claude Code active whimsical spinner + foreground bash + subagent tree below footer
+        claude_active = VIEW.analyze_session(session("""● Checking open PR checks
+(ctrl+b to run in background)
+✽ Undulating… (13s · ↓ 295 tokens)
+────────────────
+❯
+────────────────
+[PERSONAL] sample@example.invalid · Claude Opus 5.5
+⏵⏵ auto mode on · PR #582 · 2 shells · ← 1 agent
+⏺ main
+◯ general-purpose Scanning step 4.2 runner scripts… 13m 45s · ↓ 249.1k tokens
+""", "claude"))
+        self.assertEqual(claude_active["status"], "Working")
+        self.assertEqual(claude_active["timer"], {"kind": "turn", "text": "13s"})
+        self.assertEqual(claude_active["activity"], "Checking open PR checks")
+
+        # 5. Claude Code completed turn ("✻ Cooked for 4m 57s · done 7:05 PM") stays idle, not Working
+        claude_done = VIEW.analyze_session(session("""● All checks recorded in report.md.
+✻ Cooked for 4m 57s · done 7:05 PM
+※ recap: All checks recorded; next step awaits user go-ahead.
+new task? /clear to save 110k tokens
+────────────────
+❯
+────────────────
+[PERSONAL] sample@example.invalid · Claude Opus 5.5
+⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent
+""", "claude"))
+        self.assertEqual(claude_done["status"], "idle")
+        self.assertIsNone(claude_done["agent_message"])
+        self.assertNotIn("Cooked for", claude_done["activity"] or "")
+
+        # 6. Claude History N/M top rule with wrapped unsent composer prompt -> draft + pasted-prompt
+        claude_hist = VIEW.analyze_session(session("""● Updated section K heading.
+✻ Crunched for 36s · done 6:41 PM
+─── History 98/100 ────────────────
+❯ ok and what about the remaining comments, do we have a prioritized and
+assessed list
+───────────────────────────────────
+[PERSONAL] sample@example.invalid · Claude Opus 5.5
+""", "claude"))
+        self.assertEqual(claude_hist["status"], "UNKNOWN")
+        self.assertIn("draft", claude_hist["flags"])
+        self.assertIn("pasted-prompt", claude_hist["flags"])
+        self.assertIn("prioritized and assessed list", claude_hist["composer_text"] or "")
+
+        # 7. Codex active status verb ("Exploring" / "Waiting for background terminal") with └ subline
+        codex_bg = VIEW.analyze_session(session("""• Started validation build.
+• Waiting for background terminal (31m 30s • esc to interrupt) · 1 background terminal …
+  └ python3 scripts/validate.py --strict
+» Ask Codex to do anything
+GPT-6-Astra ultra Fast · examples/SampleMech
+""", "codex"))
+        self.assertEqual(codex_bg["status"], "Working")
+        self.assertEqual(codex_bg["timer"], {"kind": "turn", "text": "31m 30s"})
+
+        # 8. Prose mentioning "(press esc to interrupt)" above idle composer MUST NOT trigger Working
+        prose_esc = VIEW.analyze_session(session("""• You can stop a long run (press esc to interrupt) if needed.
+» Ask Codex to do anything
+GPT-6-Astra high · examples/SampleMech
+""", "codex"))
+        self.assertEqual(prose_esc["status"], "idle")
+
+        # 9. Claude Code active /goal banner ("◎ /goal active (6m)") -> Pursuing goal + goal timer
+        claude_goal = VIEW.analyze_session(session("""● Running next validation batch on SampleMech
+✽ Quantumizing… (22s · ↓ 480 tokens)
+◎ /goal active (6m)
+────────────────
+❯
+────────────────
+[PERSONAL] sample@example.invalid · Claude Opus 5.5
+⏵⏵ auto mode on · PR #12
+""", "claude"))
+        self.assertEqual(claude_goal["status"], "Pursuing goal")
+        self.assertEqual(claude_goal["timer"], {"kind": "goal", "text": "6m"})
+
+        # 10. Codex plural "Reviewing 2 approval requests" with multi-line wrapped `└` preview
+        codex_app_plural = VIEW.analyze_session(session("""• Reviewing 2 approval requests (2m 47s • esc to interrupt)
+  └ [path] -lc "ssh -o BatchMode=yes remote-worker
+    git -C /opt/sample/repo status --short"
+» Ask Codex to do anything
+GPT-6-Astra ultra Fast · examples/SampleMech
+""", "codex"))
+        self.assertEqual(codex_app_plural["status"], "APPROVAL")
+        self.assertIn("approval-review", codex_app_plural["flags"])
+        self.assertEqual(codex_app_plural["timer"], {"kind": "prompt", "text": "2m 47s"})
+        self.assertEqual(codex_app_plural["keystroke_hint"], "Approve in TUI · esc interrupts")
+
+        # 11. Claude multi-line AskUserQuestion menu with wrapped option descriptions + "4. Chat about this"
+        claude_ask_multiline = VIEW.analyze_session(session("""Which fallback order should SampleMech use when the primary lookup misses?
+❯ 1. Keep it (Recommended)
+     Preserve existing local cache order and log a warning when remote metadata is absent
+     across multi-sheet imports.
+  2. Strict fail
+     Raise an error immediately so upstream callers handle missing records explicitly.
+  3. Type something.
+────────────────
+  4. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel
+[PERSONAL] sample@example.invalid · Claude Opus 5.5
+""", "claude"))
+        self.assertEqual(claude_ask_multiline["status"], "QUESTION")
+        self.assertEqual(claude_ask_multiline["keystroke_hint"], "1–4 or ↑/↓ + Enter")
+
+        # 12. Antigravity inline CLI feedback rating prompt ("[1] Good [2] Fine [3] Bad [0] Skip")
+        agy_rate = VIEW.analyze_session(session("""● Completed schema check.
+────────────────
+>
+────────────────
+How's the CLI experience so far?
+  [1] Good   [2] Fine   [3] Bad   [0] Skip
+? for shortcuts Gemini 4 Argon · high
+""", "agy"))
+        self.assertEqual(agy_rate["status"], "QUESTION")
+        self.assertEqual(agy_rate["keystroke_hint"], "0 skip · 1–3 rate CLI")
+
 
 if __name__ == "__main__":
     unittest.main()

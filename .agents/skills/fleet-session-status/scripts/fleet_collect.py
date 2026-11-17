@@ -288,18 +288,77 @@ def explicit_session_id(agent, tokens):
     return session_id_evidence(agent, tokens)[0]
 
 
+SAFE_FLAG_VALUE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,128}$")
+
+
+def skip_permissions_evidence(agent, tokens, ambiguous=False, raw_len=0):
+    """Return True/False when agy --dangerously-skip-permissions is proven, else None."""
+    if agent != "agy" or ambiguous:
+        return None
+    safe_value_flags = {
+        "--project", "--model", "-m", "--effort", "--agent", "--mode",
+        "--permission-mode", "--profile", "--local-provider", "--add-dir", "--cd", "-C",
+    }
+    safe_bool_flags = {
+        "--no-daemon", "--no-alt-screen", "--sandbox", "--remote-control",
+        "--verbose", "-c", "--continue", "--last", "--disable-slash-commands",
+    }
+    saw_true = False
+    saw_false = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"--dangerously-skip-permissions", "--dangerously-skip-permissions=true"}:
+            saw_true = True
+            index += 1
+            continue
+        if token in {"--no-dangerously-skip-permissions", "--dangerously-skip-permissions=false"}:
+            saw_false = True
+            index += 1
+            continue
+        if token in safe_bool_flags:
+            index += 1
+            continue
+        if "=" in token and token.startswith("--"):
+            flag, value = token.split("=", 1)
+            if flag == "--conversation" and UUID.fullmatch(value):
+                index += 1
+                continue
+            if flag in safe_value_flags and SAFE_FLAG_VALUE.fullmatch(value) and not value.startswith("-"):
+                index += 1
+                continue
+            return None
+        if token in safe_value_flags:
+            if index + 1 >= len(tokens):
+                return None
+            value = tokens[index + 1]
+            if not SAFE_FLAG_VALUE.fullmatch(value) or value.startswith("-"):
+                return None
+            index += 2
+            continue
+        return None
+    if saw_true and saw_false:
+        return None
+    if saw_true:
+        return True
+    if saw_false:
+        return False
+    return None if raw_len >= 4096 else False
+
+
 def argv_identity(text, executable):
     # ps text is not shell syntax: interpreting literal quotes or backslashes
     # would manufacture option tokens that were never present in argv.
     tokens = text.split()
     ambiguous = any(character in text for character in ("'", '"', "\\"))
     if not tokens:
-        return {"agent": None, "session_id": None, "service": False, "argv_parsed": False}
+        return {"agent": None, "session_id": None, "service": False, "argv_parsed": False,
+                "skip_permissions": None}
     offset = 0
     wrapper = executable in RUNTIMES
     if wrapper:
         if len(tokens) < 2:
-            return {"agent": None, "session_id": None, "service": False}
+            return {"agent": None, "session_id": None, "service": False, "skip_permissions": None}
         offset = 1
     name = Path(tokens[offset]).name
     aliases = {"codex-work": "codex", "codex-personal": "codex",
@@ -313,12 +372,13 @@ def argv_identity(text, executable):
         elif executable in AGENTS:
             agent = executable
         else:
-            return {"agent": None, "session_id": None, "service": False}
+            return {"agent": None, "session_id": None, "service": False, "skip_permissions": None}
     rest = tokens[offset + 1:]
     service = bool(rest and rest[0] in {"app-server", "app-server-daemon", "remote-control", "mic-serve", "mcp"})
     session_id, inheritable = (None, False) if ambiguous else session_id_evidence(agent, rest)
+    skip_perm = None if service else skip_permissions_evidence(agent, rest, ambiguous=ambiguous, raw_len=len(text))
     return {"agent": agent, "session_id": session_id, "service": service,
-            "session_id_inheritable": inheritable}
+            "session_id_inheritable": inheritable, "skip_permissions": skip_perm}
 
 
 def parse_arguments(text, processes, requested):
@@ -367,12 +427,20 @@ def logical_agents(processes, identities):
         identity = identities.get(pid, {})
         kind = identity.get("agent") or (process["executable"] if process["executable"] in AGENTS else None)
         if kind and not identity.get("service"):
-            candidates[pid] = {**process, "agent": kind, "session_id": identity.get("session_id"), "errors": list(process.get("errors", []))}
+            skip_perm = identity.get("skip_permissions") if pid in identities and identity.get("argv_parsed", True) else None
+            candidates[pid] = {
+                **process,
+                "agent": kind,
+                "session_id": identity.get("session_id"),
+                "skip_permissions": skip_perm,
+                "errors": list(process.get("errors", [])),
+            }
     wrappers = set()
     for pid, row in candidates.items():
         if row["executable"] not in AGENTS:
             continue
         inherited = []
+        wrapper_pids = []
         trusted = identities.get(pid, {}).get("session_id_inheritable", True)
         for ancestor in list(ancestors(pid, processes))[1:]:
             # A native parent is another logical session, even if it has its own
@@ -384,6 +452,7 @@ def logical_agents(processes, identities):
                 break
             if candidate and candidate["agent"] == row["agent"] and candidate["executable"] in RUNTIMES:
                 wrappers.add(ancestor)
+                wrapper_pids.append(ancestor)
                 trusted = trusted and identities.get(ancestor, {}).get("session_id_inheritable", True)
                 if candidate.get("session_id"):
                     inherited.append(candidate["session_id"])
@@ -395,6 +464,16 @@ def logical_agents(processes, identities):
         elif len(ids) > 1:
             row["session_id"] = None
             row["errors"].append("session_id_ambiguous")
+        if row["agent"] == "agy" and wrapper_pids:
+            chain_pids = [pid] + wrapper_pids
+            if any(p not in identities or not identities[p].get("argv_parsed", True) for p in chain_pids):
+                row["skip_permissions"] = None
+            else:
+                perm_vals = [identities[p].get("skip_permissions") for p in chain_pids]
+                if any(val is None for val in perm_vals) or len(set(perm_vals)) != 1:
+                    row["skip_permissions"] = None
+                else:
+                    row["skip_permissions"] = perm_vals[0]
     return [row for pid, row in sorted(candidates.items()) if pid not in wrappers]
 
 
@@ -626,9 +705,11 @@ def collect(health_report=None, runner=None):
     for agent in agents:
         row = {key: agent[key] for key in ("agent", "pid", "ppid", "tty", "started_at", "age_seconds", "session_id")}
         row.update({"session_id_source": "argv" if row["session_id"] else None,
+                    "skip_permissions": agent.get("skip_permissions"),
                     "cwd": cwds.get(row["pid"], ""), "screen": "", "title": "",
                     "target": {"transport": "process"}, "errors": list(agent["errors"])})
         if row["pid"] not in identities:
+            row["skip_permissions"] = None
             row["errors"].append("argv_identity_unavailable")
         pane = attached[row["pid"]]
         if pane:
@@ -672,7 +753,7 @@ def collect(health_report=None, runner=None):
                 break
             result["sessions"].append({"agent": pane["command"], "pid": None, "ppid": None,
                 "tty": pane["tty"], "started_at": None, "age_seconds": None, "cwd": pane["cwd"],
-                "session_id": None, "session_id_source": None,
+                "session_id": None, "session_id_source": None, "skip_permissions": None,
                 "target": {"transport": "tmux", "pane": pane["pane"], "tmux_session": pane["tmux_session"],
                            "tmux_sessions": pane["tmux_sessions"],
                            "window": pane["window"], "tmux_window_id": pane["tmux_window_id"]},

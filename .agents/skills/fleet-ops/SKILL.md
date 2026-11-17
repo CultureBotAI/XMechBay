@@ -19,15 +19,21 @@ behind the thresholds and actions are in the
 ```bash
 S=.agents/skills/fleet-ops/scripts/fleet_ops.py
 python3 $S observe                                   # live: sessions, resources, GitHub backlog
-python3 $S observe --dashboard-url http://127.0.0.1:8765   # reuse a running fleet dashboard's sessions
+python3 $S observe --dashboard-url http://127.0.0.1:8765   # reuse a running fleet dashboard's /api/status
+python3 $S observe --dashboard-html .local/fleet-reports/dashboard-latest.html   # reuse a saved dashboard HTML export
+python3 $S observe --status-json path/to/status.json # reuse a saved /api/status JSON payload
 python3 $S observe --no-issues                       # skip GitHub
 # offline example with the synthetic fixtures:
 python3 $S --config examples/fleet-ops.json observe --snapshot examples/fleet-snapshot.json \
   --resources-json examples/fleet-ops-resources.json --issues-json examples/fleet-ops-issues.json --out .local/fleet-ops/runs/example
 ```
 
-- **Sessions** come from the `fleet-session-status` collector (same roles and
-  states as the dashboard). Screen states are observations, not proof of work.
+- **Sessions** come from the `fleet-session-status` collector, a live dashboard
+  (`--dashboard-url`), a rendered dashboard HTML snapshot (`--dashboard-html`,
+  parsing `<script id="initial-payload">`), a saved `/api/status` JSON file
+  (`--status-json`), or an offline fixture (`--snapshot`); these four session
+  source flags are mutually exclusive. Screen states are observations, not proof
+  of work.
 - **Resources** come from `host_resources_probe.py`, run locally or piped over
   SSH to the system Python. It only reads, bounds every `du` with a timeout and
   reports a timeout as unknown, never as zero (fleet-ops raises an observation
@@ -46,7 +52,7 @@ findings first; the backlog rows can be long.
 
 | Owner | Gets | Examples |
 |---|---|---|
-| **user** | Decisions only the user can make | merges, human prompts across any role (approval, question, sign-in, trust, update), unsent composer drafts on claws/MechBay, usage limits, supervisor (`claw`/`mechbay`) or non-Mech stalls, starting a missing claw, dormant Mechs |
+| **user** | Decisions only the user can make | merges, all three human-blocker classes across any role (`keystroke` TUI prompts including `subagent-approval` and the `agy_work_fixable` subset fixable via `agy-work -c`; `agent_message` end-of-turn plain-text questions/approvals; `pasted_prompt` / unsent composer drafts not running), usage limits, supervisor (`claw`/`mechbay`) or non-Mech stalls, starting a missing claw, dormant Mechs |
 | **claw** (role-routed or explicit owner) | Mech work, read-only closure review, or host-local hygiene | `discovery_supervisor`: bounded discovery/add-record work in `discover` lane; `stewardship_supervisor`: stalls, pauses, failing PRs, PR/issue backlog batching in `steward` lane; `infrastructure_supervisor`: systemic CI cohorts (`infra` lane) and pinned bootstrap Mechs (`pinned` lane); `closure_steward`: read-only diff review of unapproved green PRs and stale-draft triage; `fleet_maintainer`: reachable same-host session/storage hygiene |
 | **XMechBay maintenance** | Coordinator-owned observability, cross-host hygiene, unreachable hosts, and unmaintained hosts | unreachable hosts (`reachable: false`), failed resource probes, Coordinator GitHub query failures, cross-host duplicate-loop hygiene, and host observability/resource/durability/hygiene findings on hosts without a live `fleet_maintainer` claw |
 
@@ -76,8 +82,12 @@ python3 $S plan .local/fleet-ops/runs/<run>
 
 This writes `plan/briefs/<claw>.md` (the claw's findings with evidence and the
 standing rules), `plan/goals/<claw>.txt` (under 1000 characters, pointing at the
-brief), `plan/DECISIONS.md`, `plan/MAINTENANCE.md` and `plan/DISPATCH.md` with
-the exact copy and paste commands. It sends nothing.
+brief), `plan/DECISIONS.md` (ordered into high-leverage human action buckets:
+pasted/unsent prompts not running -> `agy-work -c` approval stalls -> interactive
+TUI keystrokes -> plain-text agent messages awaiting reply -> supervisor/claw
+stalls -> merges & fleet scope, plus prepared claw brief readiness),
+`plan/MAINTENANCE.md` and `plan/DISPATCH.md` with the exact copy and paste
+commands. It sends nothing.
 
 ## 3b. Interpret, recommend, and draft systemic issues (read-only)
 
@@ -97,13 +107,14 @@ python3 $S recommend .local/fleet-ops/runs/<run> --no-github
 `recommend` recomputes findings under the active `--config` thresholds and
 aggregates per-host observability (`tmux_probe_failed`, detached `P*` session
 clusters, `agent_discovery_partial`, missing/stale/degraded `port-watch`
-health), claw supervision readiness (composer drafts, multi-claw role routing,
-missing claws, manifest vs `CANONICAL_MECHS` drift), workflow bottlenecks (mass
-CI check-failure cohorts such as >=50% failing PRs in one repository, >100-PR
-GraphQL truncation, multi-Mech publication stalls), and host capacity/durability
-(swap saturation + multi-host duplicate loops + session sprawl, Codex rollout
-growth, low free-disk headroom, `tmp-state` guard state, Claude 30-day
-transcript deletion).
+health), claw and permission supervision readiness (composer drafts, awaiting
+user replies, plain-`agy` approval stalls fixable via `agy-work` /
+`R-AGY-WORK-PERMISSIONS`, multi-claw role routing, missing claws, manifest vs
+`CANONICAL_MECHS` drift), workflow bottlenecks (mass CI check-failure cohorts
+such as >=50% failing PRs in one repository, >100-PR GraphQL truncation,
+multi-Mech publication stalls), and host capacity/durability (swap saturation +
+multi-host duplicate loops + session sprawl, Codex rollout growth, low free-disk
+headroom, `tmp-state` guard state, Claude 30-day transcript deletion).
 
 It queries paginated open issues read-only across `infra_repos`
 (`CultureBotAI/XMechBay`, `CultureBotAI/culturebotai-claw`) and any Mech
@@ -136,10 +147,13 @@ explicit yes/no approval in the current conversation.
      session/window selector such as `claw-primary:steward`) or per-claw
      `tmux_session` only after reading the screens and confirming which claw
      owns the Mechs;
-   - a claw session with an unsent composer draft (`human_block_kind: "draft"`),
-     a human prompt (`APPROVAL`, `QUESTION`, `SIGN-IN`, `TRUST-PROMPT`,
-     `UPDATE-PROMPT`), or `Goal hit usage limits` is left unresolved so pasting
-     never merges a goal into unsent text or a blocked prompt;
+   - a claw session with an unsent composer draft or pasted prompt not running
+     (`human_block_kind: "draft"` / `"pasted_prompt"`), a human prompt
+     (`APPROVAL`, `QUESTION`, `SIGN-IN`, `TRUST-PROMPT`, `UPDATE-PROMPT`, or
+     `subagent-approval`), an end-of-turn agent message awaiting user reply
+     (`human_block_kind: "agent_message"`), or `Goal hit usage limits` is left
+     unresolved so pasting never merges a goal into unsent text or a blocked
+     session;
    - a Terminal claw must be tab 1, and the plan's first command lists the
      window so you can check that its selected tab has the claw's tty, because
      `mac-term.sh paste` types into the selected tab;

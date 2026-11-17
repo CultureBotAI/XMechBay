@@ -521,6 +521,59 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(tabs, [])
         self.assertEqual(errors, ["terminal_probe_failed"])
 
+    def test_agy_skip_permissions_evidence_proves_true_false_and_rejects_spoofing(self):
+        # Plain agy launches prove skip_permissions is False
+        plain = COLLECTOR.argv_identity("agy --project sample-mech-1234abcd -c", "agy")
+        self.assertIs(plain["skip_permissions"], False)
+
+        # Standard agy-work launch proves skip_permissions is True
+        agy_work = COLLECTOR.argv_identity(
+            "agy --project sample-mech-1234abcd --dangerously-skip-permissions "
+            "--conversation=11111111-1111-4111-8111-111111111111",
+            "agy",
+        )
+        self.assertIs(agy_work["skip_permissions"], True)
+
+        # Prompt flags, positional prompt text, option-value collision, quotes, or conflicting flags yield None
+        spoof_cases = [
+            "agy --project --dangerously-skip-permissions",
+            "agy -p --dangerously-skip-permissions",
+            "agy --prompt=--dangerously-skip-permissions",
+            "agy explain --dangerously-skip-permissions",
+            'agy --project "sample" --dangerously-skip-permissions',
+            "agy --dangerously-skip-permissions --no-dangerously-skip-permissions",
+        ]
+        for cmd in spoof_cases:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(COLLECTOR.argv_identity(cmd, "agy")["skip_permissions"])
+
+        # Non-agy agents return None for skip_permissions
+        self.assertIsNone(
+            COLLECTOR.argv_identity("claude --dangerously-skip-permissions", "claude")["skip_permissions"]
+        )
+        self.assertIsNone(
+            COLLECTOR.argv_identity("codex --dangerously-bypass-approvals-and-sandbox", "codex")["skip_permissions"]
+        )
+
+        # Missing argv or conflicting wrapper/child evidence yields None
+        procs = {
+            10: {"pid": 10, "ppid": 1, "tty": "ttys001", "age_seconds": 60,
+                 "started_at": "2026-01-01T00:00:00+00:00", "errors": [], "executable": "zsh", "executable_path": "/bin/zsh"},
+            11: {"pid": 11, "ppid": 10, "tty": "ttys001", "age_seconds": 60,
+                 "started_at": "2026-01-01T00:00:00+00:00", "errors": [], "executable": "agy", "executable_path": "/usr/local/bin/agy"},
+            12: {"pid": 12, "ppid": 1, "tty": "ttys002", "age_seconds": 60,
+                 "started_at": "2026-01-01T00:00:00+00:00", "errors": [], "executable": "agy", "executable_path": "/usr/local/bin/agy"},
+        }
+        identities = {
+            10: COLLECTOR.argv_identity("zsh /usr/local/bin/agy --dangerously-skip-permissions", "zsh"),
+            11: COLLECTOR.argv_identity("agy --project sample-mech", "agy"),
+            # 12 intentionally missing from identities -> argv_identity_unavailable
+        }
+        # Wrapper True + child False conflicts -> None; pid 12 missing argv -> None
+        logical = {row["pid"]: row for row in COLLECTOR.logical_agents(procs, identities)}
+        self.assertIsNone(logical[11]["skip_permissions"])
+        self.assertIsNone(logical[12]["skip_permissions"])
+
 
 if __name__ == "__main__":
     unittest.main()

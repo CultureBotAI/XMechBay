@@ -35,20 +35,54 @@ bash scripts/fleet-dashboard.sh --snapshot examples/fleet-snapshot.json
 Dashboard guarantees:
 - Binds exclusively to loopback (`127.0.0.1`, `localhost`, or `::1`), sets a
   strict `Content-Security-Policy` with zero external requests, and validates
-  `Host`, `Origin`, and a per-process `X-MechBay-Token` on `POST /api/refresh`.
+  `Host`, `Origin`, and a per-process `X-MechBay-Token` on `POST /api/refresh`
+  and `POST /api/focus-terminal`.
   When an open tab hits `403 invalid_csrf_token` after a local server restart,
   the UI reloads once (with a 30s loop cooldown), restores view/filter state,
-  and completes the refresh—or surfaces a manual **Reload page** action if
-  session storage or the cooldown prevents automatic reload.
+  and completes the refresh or pending M1 Terminal jump—or surfaces a manual
+  **Reload page** action if session storage or the cooldown prevents automatic
+  reload.
+- Clicking a live local **M1** session row (or M1 spotlight card / matrix pill /
+  detail action) switches local `Terminal.app` directly to that exact window and
+  tab (`POST /api/focus-terminal`, matching live `tty` and active `tmux`
+  pane/window so recycled window IDs, grouped `xmb-view-*` viewers, or multi-window
+  sessions never focus a tab displaying a different session, un-minimizing if
+  needed, and refusing if `Terminal.app` is not already running) while sending
+  **zero input** to any session; clicking `▸`/`▾` on an M1 row toggles details in
+  place without switching apps, and non-M1 (`m5`, `intel`, remote SSH, cached, or
+  snapshot) rows never attempt local `Terminal.app` switching.
 - Coalesces concurrent **Update** clicks into one single-flight collection sweep
   and never opens Excel or sends input to sessions.
+- Detects active turns (`Working`, `🟢 ▶ work`) from dedicated live TUI cues across
+  all three CLIs—Codex interruptible status lines (`(<elapsed> · esc to interrupt)`),
+  Claude Code active spinners (`✽ … (<elapsed> · tokens)`), foreground bash hints,
+  and live subagent progress trees below the footer, plus Antigravity braille
+  spinners (`⣷ …`), running task strips, and `esc to cancel` active-turn footers—while
+  keeping human prompts (`APPROVAL`, `QUESTION`, etc.) at higher precedence and never
+  promoting historical prose or completed `· done` turns.
 - Surfaces a dedicated top-of-page **Needs Human Input** spotlight banner (plus
-  browser-tab count badge, clickable per-Mac input pills, and keyboard shortcut
-  `i`) listing every live session waiting on a blocking prompt (`APPROVAL`,
-  `QUESTION`, `SIGN-IN`, `TRUST-PROMPT`, `UPDATE-PROMPT`, including numbered or
-  cursor-highlighted TUI menus and Codex `Reviewing approval request` waits) or
-  an unsent single-/multi-line composer draft, sorted prompt-first and longest
-  wait first, with one-click jump-and-expand to the target row.
+  browser-tab count badge, clickable per-Mac input pills, sub-category filter
+  chips, and keyboard shortcut `i`) that cleanly separates three distinct
+  human-blocker classes:
+  1. **Interactive TUI questions & keystrokes (`keystroke`):** `APPROVAL`,
+     `QUESTION`, `SIGN-IN`, `TRUST-PROMPT`, and `UPDATE-PROMPT` modals, showing
+     both the prompt question and the exact keystrokes required (`⌨ 1 or Enter
+     allow · 2 deny · f diff · ↑/↓`, `ctrl+k approve · alt+j manage`,
+     `1–N or ↑/↓ + Enter`, etc.), plus an explicit **`⚡ Fixable by agy-work`**
+     subset badge and filter (`agy-work -c`) when OS `ps` evidence proves an
+     `agy` session on `APPROVAL` was launched without
+     `--dangerously-skip-permissions` (`skip_permissions: false`), distinguished
+     from `agy` sessions already running `agy-work` (`skip_permissions: true`,
+     stopped on a standing Ask rule) and from `QUESTION`/non-`agy` prompts.
+  2. **Coding-agent plain-text messages (`agent_message`):** sessions idle at an
+     empty composer whose final assistant paragraph asks a question or requests
+     explicit confirmation/action in plain text (`💬 Type reply + Enter`), while
+     excluding Esc-interrupted turns (`Interrupted · What should ... do instead?`)
+     and generic polite sign-offs.
+  3. **Pasted / unsent prompts that are NOT running (`pasted_prompt`):** single-
+     or multi-line text or `[Pasted text ...]` sitting unsubmitted in the
+     composer (`⌨ Press Enter to run · clear to discard`), surfacing the
+     sanitized composer prompt (`❯ ...`) rather than stale prior-turn output.
 - Groups sessions by role (`1 · MechBay Sessions`, `2 · Claw Sessions`,
   `3 · Mech Sessions`) by default, placing companion or unmatched repositories
   in an **Other Observed Sessions** drawer that stays collapsed when clear but

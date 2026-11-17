@@ -179,7 +179,7 @@ def validate_snapshot(snapshot):
             raise ValueError("snapshot_agent_invalid")
         if row.get("pid") is None:
             if ("agent_process_unverified" not in row.get("errors", []) or row.get("session_id") is not None
-                    or row.get("started_at") is not None):
+                    or row.get("started_at") is not None or row.get("skip_permissions") is not None):
                 raise ValueError("snapshot_process_invalid")
         else:
             if type(row.get("pid")) is not int or row["pid"] <= 0 or row["pid"] in seen:
@@ -201,6 +201,9 @@ def validate_snapshot(snapshot):
         if sid is not None and (not isinstance(sid, str) or not UUID.fullmatch(sid)
                                 or row.get("session_id_source") != "argv"):
             raise ValueError("snapshot_session_id_unverified")
+        skip_perm = row.get("skip_permissions")
+        if skip_perm is not None and type(skip_perm) is not bool:
+            raise ValueError("snapshot_identity_invalid")
         target = row.get("target")
         if not isinstance(target, dict) or target.get("transport") not in {"tmux", "terminal", "process"}:
             raise ValueError("snapshot_target_invalid")
@@ -314,7 +317,7 @@ def normalize_host(key, label, snapshot, max_health_age=120, source="ssh", now=N
     rows = []
     for session in snapshot["sessions"]:
         row = analyze_session(session, role_overrides=role_overrides)
-        for field in ("agent", "pid", "tty", "started_at", "age_seconds", "session_id", "session_id_source"):
+        for field in ("agent", "pid", "tty", "started_at", "age_seconds", "session_id", "session_id_source", "skip_permissions"):
             row[field] = session.get(field)
         row["session_id_current_verified"] = False
         # Targets contain only transport selectors, never titles, screens or argv.
