@@ -32,13 +32,73 @@ MENU_NAV_HINT = re.compile(
     re.I,
 )
 DURATION = re.compile(r"\d+(?:\.\d+)?\s*(?:days?|hours?|minutes?|seconds?|[dhms])(?:\s*\d+(?:\.\d+)?\s*(?:days?|hours?|minutes?|seconds?|[dhms]))*", re.I)
-PATH_TEXT = re.compile(r"(?<![\w:/])(?:~/|/|[A-Za-z]:\\)[^\s<>\[\]{}()'\";,]+")
+PATH_TEXT = re.compile(r"(?<![\w:/↑←→↓])(?:~/|/(?![↓→\s])|[A-Za-z]:\\)[^\s<>\[\]{}()'\";,]+")
 EMAIL = re.compile(r"[\w.+\-]+@(?:[\w\-]+\.)+[A-Za-z]{2,}")
 SECRET = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_\-]{20,})\b")
 UUID = re.compile(r"\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b", re.I)
 RULE = re.compile(r"^[\s─━═┄┈\-_|│┃┌┐└┘├┤┬┴┼╭╮╰╯]+$")
+BOX_TOP_RULE = re.compile(
+    r"^(?:[\s─━═┄┈\-_|│┃┌┐└┘├┤┬┴┼╭╮╰╯]+|[─━═]{2,}\s*(?:History\s+\d+/\d+|Draft|Prompt)\s*[─━═]{2,})$",
+    re.I,
+)
+SPINNER_PREFIX = r"[•●○⏺✻✽✶✢✳◐◓◑◒◯◌\u2800-\u28ff]"
+AGY_TASK_STRIP = re.compile(r"^[•●○]\s*\[\d{2}:\d{2}:\d{2}\]\s+.+\s+running$", re.I)
+AGY_BRAILLE_ACTIVE = re.compile(r"^[\u2800-\u28ff]\s+\S")
+CLAUDE_DONE_LINE = re.compile(
+    r"^(?:[✻✽✶✢✳•●○⏺]+\s*)?(?:Worked|Churned|Baked|Cogitated|Cooked|Brewed|Saut[eé]ed|Crunched)\s+for\b",
+    re.I,
+)
+CLAUDE_GOAL_ACTIVE = re.compile(r"^[◎◉●•]?\s*/goal\s+active(?:\s*\(([^)]*)\))?\s*$", re.I)
+CLAUDE_ACTIVE_SPINNER = re.compile(
+    r"^[✻✽✶✢✳◐◓◑◒\u2800-\u28ff]\s+[A-Z][A-Za-z0-9 _/\-]{1,48}(?:…|\.\.\.)(?:\s*\([^)]*\))?$"
+)
+CLAUDE_ACTIVE_SUBAGENT = re.compile(
+    r"^[◯◌◐◓◑◒\u2800-\u28ff]\s+\S.+?\b\d+(?:\.\d+)?\s*(?:days?|hours?|minutes?|seconds?|[dhms])\b.*[↓↑]\s*[\d.]+k?\s*tokens\b",
+    re.I,
+)
+INTERRUPTIBLE_STATUS = re.compile(
+    r"^(?:[•●○⏺✻✽✶✢✳◐◓◑◒\u2800-\u28ff]+\s*)?[A-Z][^\n(]{1,72}"
+    r"\((?:[^)]*[·•]\s*)?esc to (?:interrupt|cancel)(?:\s*[·•][^)]*)?\)",
+    re.I,
+)
 PLACEHOLDER = re.compile(r"(?:Ask Codex to do anything|Type a message|Ask anything|What would you like to do\?)", re.I)
-SLASH_COMMAND = re.compile(r"/(?:quit|exit|resume|goal|btw|artifact|tasks|diff|model|help|context|status|continue)$")
+PASTED_CHIP = re.compile(r"\[(?:Pasted (?:text|content|image)\b|\d+\s+lines\s+pasted\b|Image #\d+)", re.I)
+INTERRUPTED_LINE = re.compile(
+    r"^(?:[⎿└├╰•●○⏺✻]\s*)*Interrupted(?:\s+by\s+user|\s*[·•—-]\s*What should\b|$)",
+    re.I,
+)
+COURTESY_SIGNOFF = re.compile(
+    r"\b(?:let me know if (?:you (?:need|have|want) any(?:thing| other| further)?|there(?:'s| is) anything else)|"
+    r"feel free to (?:ask|let me know|reach out)|happy to (?:help|assist|elaborate)|hope (?:this|that) helps)\b",
+    re.I,
+)
+UI_TRAILER_LINE = re.compile(
+    r"^(?:[•●○⏺✻✽✶✢✳└├┬╰※✔]+\s*)?(?:(?:Worked|Churned|Baked|Cogitated|Cooked|Brewed|Saut[eé]ed|Crunched)\s+for\b|"
+    r"\d+\s+artifacts?\s*·|\d+\s+background terminals?\b|Commands:|Usage:|Tip:|\? for shortcuts|"
+    r"← for agents|Error ID:|Resume with\b|agy --conversation|\+?\s*\d+ lines?\s*\([^)]*to expand\)|"
+    r"recap:|↳\s*recap:|new task\?\s*(?:/clear|\[path\])\b|Update installed\b|"
+    r"↓\s*Back to bottom\b|enter/esc latest\b|"
+    r"context\s+(?:left|remaining)|\d+(?:\.\d+)?%\s+context)",
+    re.I,
+)
+EXPLICIT_AGENT_ACTION = re.compile(
+    r"(?:^|\b)Yes/No Question\s*:|"
+    r"(?:^|(?<=[.!?]\s))Approve\s+(?:merging|the\b|this\b|these\b|opening\b|creating\b|running\b|pushing\b|deleting\b|closing\b|applying\b|PR\b|#\d+)|"
+    r"\b(?:Ready for|Awaiting)\s+(?:your\s+)?(?:merge\s+|explicit\s+)?approval\b|"
+    r"\bDo you (?:approve|authorize|want|prefer|wish)\b|"
+    r"\bWould you (?:like|prefer|want)\b|"
+    r"\b(?:Shall|Should|May|Can) (?:I|we) (?:proceed|merge|open|create|push|commit|delete|remove|run|apply|send|continue|start|update|close|relaunch|branch|build|fix|implement|file|clean|drop|revert|deploy)\b|"
+    r"\bReply\s+[\"'“”`]?(?:yes|no|go|approve|confirm|proceed|continue|ok|1|2|a|b)\b(?:\s+to\s+\w+|\s+if\b|\s+or\b|\s*[.,;:)—-]|$)|"
+    r"\bsay\s+[\"'“”`][A-Za-z0-9 _\-]{2,32}[\"'“”`](?:\s+and\b|\s+to\b|\s+if\b|\s*[.,;:])|"
+    r"\bPlease (?:confirm|approve|reply|choose|select|specify|indicate|tell me|advise|decide|authorize|run|re-run|authenticate|sign in|provide|paste)\b|"
+    r"\b(?:Waiting|Paused|Blocked|Stopping)\s+(?:for|on|until)\s+your\s+(?:approval|confirmation|go-ahead|input|reply|response|decision|answer|authorization|choice|direction|instructions?)\b|"
+    r"\b(?:Let me know|Tell me)\s+(?:whether|which|what|how|when|before I|if\s+(?:you|we|I)\b)|"
+    r"\bChoose\s+(?:option|between|one of)\b",
+    re.I,
+)
+SLASH_COMMAND = re.compile(
+    r"/(?:quit|exit|resume|goal|btw|artifact|tasks|diff|model|help|context|status|continue|clear|compact|clean|ps|permissions|review)$"
+)
 METRIC = re.compile(r"\b\d+(?:/\d+)?(?:\s+(?:completed|merged|open|reviewed|validated|passing|failed))*\s+(?:records?|PRs?|batches|goals?|cycles?|tests?|reviews?|Mechs?|repositories)\b", re.I)
 OPTIONAL_ABSENCE = {"tmux_executable_unavailable", "terminal_not_running"}
 KNOWN_ERRORS = {
@@ -397,17 +457,21 @@ def _is_menu_choice(line, lines=None, idx=None):
         return True
     if lines is None or idx is None or not COMPOSER.match(line):
         return False
-    after = lines[idx + 1:min(len(lines), idx + 6)]
+    after = []
+    for ln in lines[idx + 1:min(len(lines), idx + 18)]:
+        if _is_footer(ln, True) or re.match(r"^[>›❯»]\s*(?:$|\D)", ln):
+            break
+        after.append(ln)
     before = lines[max(0, idx - 3):idx]
     if re.match(r"^[>›❯»]\s*\d+[.)]\s+\S", line):
         if any(MENU_NAV_HINT.search(ln) for ln in after):
             return True
-        neighbors = before[-2:] + after[:2]
+        neighbors = before[-2:] + after[:6]
         if (any(re.match(r"^\d+[.)]\s+\S", nb) for nb in neighbors)
                 and any(re.search(r"(?:^\?\s+|\?\s*$|\b(?:Select|Choose|Which|Question|Questions|Trust|Allow|Update available|Sign in)\b)", b, re.I) for b in before)):
             return True
     if re.match(r"^[❯›]\s+\S", line) and not PLACEHOLDER.search(line):
-        for ln in after:
+        for ln in after[:6]:
             if RULE.fullmatch(ln) or _is_footer(ln, True):
                 break
             if MENU_NAV_HINT.search(ln):
@@ -419,29 +483,33 @@ def _is_composer_line(line, lines=None, idx=None):
     return bool(COMPOSER.match(line)) and not _is_menu_choice(line, lines, idx)
 
 
-def _composer(lines, footer_index):
+def _composer_details(lines, footer_index):
     indices = [i for i, line in enumerate(lines) if _is_composer_line(line, lines, i)]
     if not indices:
-        return None, False, False
+        return None, False, False, None, False
     index = indices[-1]
     content = COMPOSER.match(lines[index]).group(1).strip(" │▏")
     placeholder = bool(PLACEHOLDER.fullmatch(content))
     end = footer_index if footer_index is not None and footer_index > index else len(lines)
     raw_slice = lines[index + 1:end]
-    remainder = [line for line in raw_slice
-                 if not RULE.fullmatch(line) and not line.startswith(("? for shortcuts", "← for agents"))]
+    remainder = [
+        line for line in raw_slice
+        if not RULE.fullmatch(line)
+        and not line.startswith(("? for shortcuts", "← for agents", "enter/esc latest"))
+        and not AGY_TASK_STRIP.match(line)
+    ]
     empty = (not content or placeholder) and not remainder
     drafted = False
+    box_lines = []
     if content and not placeholder:
         if not remainder:
             drafted = True
         elif footer_index is not None and footer_index > index:
-            has_opening_rule = index > 0 and bool(RULE.fullmatch(lines[index - 1]))
-            box_lines = []
+            has_opening_rule = index > 0 and bool(BOX_TOP_RULE.fullmatch(lines[index - 1]))
             after_rule = []
             seen_rule = False
             for line in raw_slice:
-                if line.startswith(("? for shortcuts", "← for agents")):
+                if line.startswith(("? for shortcuts", "← for agents", "enter/esc latest")) or AGY_TASK_STRIP.match(line):
                     continue
                 if RULE.fullmatch(line):
                     seen_rule = True
@@ -451,34 +519,62 @@ def _composer(lines, footer_index):
                 else:
                     box_lines.append(line)
             framed_box = has_opening_rule and seen_rule
-            codex_box = (not seen_rule) and lines[index][:1] in {"›", "»"} and len(box_lines) <= 6
+            codex_box = (not seen_rule) and lines[index][:1] in {"›", "»"} and len(box_lines) <= 12
             if (box_lines and not after_rule and (framed_box or codex_box)
-                    and not any(re.match(r"^[•●○⏺✻⡿⣯⣻⢿⣟└├┬╰┃]", ln) for ln in box_lines)
-                    and not any(re.match(r"(?:Worked for\b|Goal\b|Commands:|Usage:|Tip:)", ln, re.I) for ln in box_lines)):
+                    and not any(re.match(r"^" + SPINNER_PREFIX + r"|^[└├┬╰┃⎿※]", ln) for ln in box_lines)
+                    and not any(re.match(r"(?:(?:Worked|Churned|Baked|Cogitated|Cooked|Brewed|Saut[eé]ed|Crunched)\s+for\b|Goal\b|Commands:|Usage:|Tip:)", ln, re.I) for ln in box_lines)):
                 drafted = True
-    return index, empty, drafted
+    composer_raw = None
+    is_pasted = False
+    if drafted:
+        parts = [content] + [ln.strip(" │▏") for ln in box_lines if ln.strip(" │▏")]
+        composer_raw = " ".join(parts).strip()
+        is_pasted = bool(PASTED_CHIP.search(composer_raw) or box_lines or len(composer_raw) >= 80)
+    return index, empty, drafted, composer_raw, is_pasted
+
+
+def _composer(lines, footer_index):
+    return _composer_details(lines, footer_index)[:3]
 
 
 def _approval_status(lines, composer_index):
     """Detect dedicated active approval-wait status line immediately above composer."""
-    if composer_index is not None:
-        preceding = [line for line in lines[max(0, composer_index - 3):composer_index]
-                     if not RULE.fullmatch(line)]
-    else:
-        preceding = [line for line in lines[-6:] if not RULE.fullmatch(line)]
-    if preceding:
-        text = re.sub(r"^[•●○⏺✻⡿⣯⣻⢿⣟]+\s*", "", preceding[-1])
-        if re.match(r"Reviewing approval request\s*\([^)]*esc to interrupt[^)]*\)", text, re.I):
+    end = composer_index if composer_index is not None else len(lines)
+    window = [ln for ln in lines[max(0, end - 10):end] if not BOX_TOP_RULE.fullmatch(ln)]
+    if not window:
+        return ""
+    idx = len(window) - 1
+    while idx >= 0:
+        ln = window[idx]
+        if re.match(r"^└\s", ln) or re.match(r"^\+?\s*\d+\s+lines?\s*\([^)]*to expand\)", ln, re.I):
+            idx -= 1
+            continue
+        # Skip wrapped continuation lines belonging to an immediately preceding `└` sub-block.
+        if not re.match(r"^" + SPINNER_PREFIX + r"|^[>›❯»]", ln) and any(
+            re.match(r"^└\s", prev) for prev in window[max(0, idx - 4):idx]
+        ):
+            idx -= 1
+            continue
+        text = re.sub(r"^" + SPINNER_PREFIX + r"+\s*", "", ln).strip()
+        if re.match(r"Reviewing (?:\d+\s+)?approval requests?\s*\([^)]*esc to interrupt[^)]*\)", text, re.I):
             return text
+        break
     return ""
 
 
 def _prompt(lines, composer_index, empty):
-    tail = "\n".join(lines[-20:])
+    if composer_index is not None:
+        before = lines[:composer_index]
+        prev_composers = [i for i, ln in enumerate(before) if _is_composer_line(ln, before, i)]
+        after_prev = before[prev_composers[-1] + 1:] if prev_composers else before
+        preceding = [ln for ln in after_prev if not RULE.fullmatch(ln)][-8:]
+        overlay_text = "\n".join(preceding + lines[composer_index + 1:])
+    else:
+        overlay_text = "\n".join(lines[-20:])
     # A subagent permission overlay can precede the main agent's empty composer.
-    if re.search(r"ctrl\+k\s+(?:to\s+)?approve|(?:^|\n)(?:self|subagent) needs approval\b", tail, re.I):
+    if re.search(r"(?:^|\n)\s*(?:ctrl\+k\s+(?:to\s+)?approve\b|(?:self|subagent) needs approval\b)", overlay_text, re.I):
         return "APPROVAL", ["subagent-approval"]
-    if re.search(r"⇧← to answer|to navigate questions|to submit answer", tail, re.I):
+    if re.search(r"(?:^|\n)\s*(?:⇧← to answer\b|(?:←/→|↑/↓|Tab)\s+to navigate questions\b|Enter to submit answer\b)", overlay_text, re.I):
         return "QUESTION", []
     if _approval_status(lines, composer_index):
         return "APPROVAL", ["approval-review"]
@@ -498,13 +594,169 @@ def _prompt(lines, composer_index, empty):
                      r"Run this command\?|Navigate\s*·\s*f\s+full diff|approval request|"
                      r"(?:^|\n)\s*[>›❯»]?\s*\d+[.)]\s+(?:Yes,\s*(?:allow|proceed|and don't ask)|No,\s*(?:deny|and tell))\b"),
         ("QUESTION", r"Queued follow-up|How's the CLI experience|Switch to (?:gpt-|claude-|gemini-)|"
-                     r"Type your answer|(?:^|\n)\s*(?:Question|Questions)\s*[:(]|"
+                     r"Type your answer|Enter to select\s*·\s*↑/↓\s*(?:to\s+)?navigate|"
+                     r"(?:^|\n)\s*\d+[.)]\s+(?:Type something\.|Chat about this)\b|"
+                     r"(?:^|\n)\s*(?:Question|Questions)\s*[:(]|"
                      r"(?:^|\n)\s*\?\s+(?:Which|.*question)|"
                      r"(?:^|\n)\s*(?:Select|Choose) (?:an? option|one of the following)"),
     ):
         if re.search(expression, text, re.I):
             return state, ["usage-limit"] if "Switch to " in text else []
     return None, []
+
+
+def _keystroke_hint(status, flags, lines, composer_index):
+    """Derive concise required user keystrokes from the active TUI prompt."""
+    flag_set = set(flags or ())
+    if status not in {"APPROVAL", "QUESTION", "SIGN-IN", "TRUST-PROMPT", "UPDATE-PROMPT"} and "subagent-approval" not in flag_set:
+        return None
+    prompt_scope = "\n".join(lines[max(0, composer_index - 8):] if composer_index is not None else lines[-20:])
+    active_scope = "\n".join(lines[composer_index + 1:] if composer_index is not None else lines[-20:])
+    if "subagent-approval" in flag_set:
+        return "ctrl+k approve · alt+j manage" if re.search(r"\balt\+j\b", prompt_scope, re.I) else "ctrl+k approve"
+    if "approval-review" in flag_set:
+        return "Approve in TUI · esc interrupts"
+    if re.search(r"⇧← to answer", prompt_scope, re.I):
+        return "⇧← focus question · ↑/↓ + Enter"
+    if re.search(r"\[1\]\s+\w+.*\[0\]\s+Skip", active_scope, re.I):
+        return "0 skip · 1–3 rate CLI"
+    nums = [int(m) for m in re.findall(r"(?:^|\n)\s*[>›❯»]?\s*(\d+)[.)]\s+\S", active_scope) if 1 <= int(m) <= 9]
+    if nums:
+        max_n = max(nums)
+        if status == "APPROVAL":
+            if re.search(r"\bf\s+full diff\b", active_scope, re.I):
+                return "1 or Enter allow · 2 deny · f diff · ↑/↓"
+            if max_n == 4:
+                return "1 allow once · 2–3 always-allow · 4/esc cancel"
+            if max_n >= 3 or re.search(r"don't ask again", active_scope, re.I):
+                return "1 allow once · 2 session-allow · 3/esc deny"
+            return "1 or Enter allow · 2 deny · ↑/↓"
+        if status == "QUESTION":
+            return ("1–" + str(max_n) + " or ↑/↓ + Enter") if max_n >= 2 else "1 or Enter confirm"
+        if status == "TRUST-PROMPT":
+            return "1 or Enter trust · 2/esc cancel"
+        if status == "UPDATE-PROMPT":
+            return ("1–" + str(max_n) + " or ↑/↓ + Enter") if max_n >= 2 else "Enter confirm · esc skip"
+        return ("1–" + str(max_n) + " or ↑/↓ + Enter") if max_n >= 2 else "1 or Enter confirm"
+    if MENU_NAV_HINT.search(active_scope):
+        if re.search(r"Space to (?:select|toggle)", active_scope, re.I):
+            return "↑/↓ move · Space toggle · Enter submit"
+        return "↑/↓ select · Enter confirm"
+    if re.search(r"Type your answer", active_scope, re.I):
+        return "Type answer + Enter"
+    fallbacks = {
+        "APPROVAL": "y / Enter approve · n / esc deny",
+        "QUESTION": "↑/↓ + Enter or type answer",
+        "SIGN-IN": "Enter / complete browser sign-in",
+        "TRUST-PROMPT": "Enter trust folder · esc cancel",
+        "UPDATE-PROMPT": "Enter update or skip",
+    }
+    return fallbacks.get(status, "Inspect terminal to respond")
+
+
+def _extract_trailing_question_or_action(paragraph_text):
+    text = private_text(paragraph_text, 360)
+    if not text or COURTESY_SIGNOFF.search(text) or INTERRUPTED_LINE.search(text):
+        return None
+    sentences = [seg.strip() for seg in re.split(r"(?<=[.!?])\s+", text) if seg.strip()]
+    tail_sent = sentences[-1] if sentences else text
+    if COURTESY_SIGNOFF.search(tail_sent):
+        return None
+    if EXPLICIT_AGENT_ACTION.search(tail_sent):
+        return private_text(tail_sent, 110)
+    for sent in reversed(sentences[:-1]):
+        if not COURTESY_SIGNOFF.search(sent) and EXPLICIT_AGENT_ACTION.search(sent):
+            return private_text(sent, 110)
+    if EXPLICIT_AGENT_ACTION.search(text):
+        return private_text(text, 110)
+    if re.search(r"\?[\s\"'”’)*_`]*$", tail_sent):
+        words = tail_sent.split()
+        if len(words) >= 3 or re.match(r"^(?:Approve|Proceed|Continue|Merge|Ready|Confirm)\b", tail_sent, re.I):
+            return private_text(tail_sent, 110)
+    return None
+
+
+def _agent_end_message(lines, composer_index):
+    """Detect plain-text assistant message at end of response awaiting user action."""
+    if composer_index is None or composer_index <= 0:
+        return None
+    before = lines[:composer_index]
+    prev_composers = [i for i, ln in enumerate(before) if _is_composer_line(ln, before, i)]
+    if prev_composers:
+        prev = prev_composers[-1]
+        turn = list(before[prev + 1:])
+        # If the previous user prompt was framed by RULE lines, advance past its closing RULE
+        # so a multi-line user question with empty/interrupted output never spoofs assistant prose.
+        if prev > 0 and BOX_TOP_RULE.fullmatch(before[prev - 1]):
+            for j, ln in enumerate(turn[:14]):
+                if RULE.fullmatch(ln):
+                    turn = turn[j + 1:]
+                    break
+    else:
+        turn = list(before[-24:])
+    # Strip multi-line auto-generated recap trailers following turn-completion timing lines.
+    scan_start = max(0, len(turn) - 12)
+    for k in range(scan_start, len(turn) - 1):
+        if CLAUDE_DONE_LINE.match(turn[k]) and re.match(r"^(?:※\s*recap:|↳\s*recap:)", turn[k + 1], re.I):
+            turn = turn[:k]
+            break
+    while turn:
+        last = turn[-1]
+        if BOX_TOP_RULE.fullmatch(last) or _is_footer(last) or UI_TRAILER_LINE.match(last):
+            turn.pop()
+            continue
+        break
+    if not turn:
+        return None
+    if any(INTERRUPTED_LINE.match(ln) for ln in turn[-3:]):
+        return None
+    last_raw = turn[-1]
+    if re.match(r"^(?:```|~~~|[\}\]]+[,.]?\s*$|\|.*\|$)", last_raw):
+        return None
+    # Reconstruct final paragraph (up to 4 wrapped prose lines).
+    para_lines = []
+    for ln in reversed(turn[-6:]):
+        if RULE.fullmatch(ln) or re.match(r"^(?:```|~~~|#+\s|\|.*\|$)", ln):
+            break
+        is_bullet = bool(re.match(r"^(?:[•●○⏺✻\-*]|\d+[.)])\s+", ln))
+        cleaned = re.sub(r"^(?:[•●○⏺✻\-*]+)\s*", "", ln).strip()
+        if not cleaned:
+            break
+        para_lines.append(cleaned)
+        if is_bullet or len(para_lines) >= 4:
+            break
+    if para_lines:
+        para = " ".join(reversed(para_lines))
+        direct = _extract_trailing_question_or_action(para)
+        if direct:
+            return direct
+    # Shape B: user-directed question/confirmation immediately followed by 1-5 short option/detail bullets.
+    list_count = 0
+    idx = len(turn) - 1
+    while idx >= 0 and list_count < 5:
+        ln = turn[idx]
+        if re.match(r"^(?:[-*•●]|\d+[.)])\s+\S", ln) and len(ln) <= 140:
+            list_count += 1
+            idx -= 1
+        else:
+            break
+    if 1 <= list_count <= 5 and idx >= 0:
+        lead_lines = []
+        for j in range(idx, max(-1, idx - 3), -1):
+            ln = turn[j]
+            if RULE.fullmatch(ln) or re.match(r"^(?:```|~~~|#+\s)", ln):
+                break
+            is_b = bool(re.match(r"^[•●○⏺✻\-*]\s+", ln))
+            lead_lines.append(re.sub(r"^[•●○⏺✻\-*]+\s*", "", ln).strip())
+            if is_b:
+                break
+        lead = " ".join(reversed(lead_lines)).strip()
+        if (lead and not re.match(r"^(?:Why|How did|What happened)\b", lead, re.I)
+                and re.search(r"\b(?:you|your|approve|authorize|confirm|proceed|shall I|should I|should we|may I|can I|which)\b", lead, re.I)):
+            extracted = _extract_trailing_question_or_action(lead)
+            if extracted:
+                return extracted
+    return None
 
 
 def _activity(lines, composer_index, footer_index, status, current_input=True):
@@ -528,13 +780,19 @@ def _activity(lines, composer_index, footer_index, status, current_input=True):
         is_choice = _is_menu_choice(line, tail_candidates, rel_idx)
         if is_choice:
             continue
-        bullet = bool(re.match(r"^[•●○⏺✻⡿⣯⣻⢿⣟]", line))
-        line = re.sub(r"^[•●○⏺✻⡿⣯⣻⢿⣟└├┬╰]+\s*", "", line)
-        if (RULE.fullmatch(line) or _is_footer(line) or MENU_NAV_HINT.search(line)
-                or _is_composer_line(line, tail_candidates, rel_idx)
+        raw_line = line
+        bullet = bool(re.match(r"^" + SPINNER_PREFIX, line))
+        line = re.sub(r"^(?:" + SPINNER_PREFIX + r"|[└├┬╰✔])+\s*", "", line)
+        if (BOX_TOP_RULE.fullmatch(raw_line) or RULE.fullmatch(line) or _is_footer(line) or MENU_NAV_HINT.search(line)
+                or _is_composer_line(raw_line, tail_candidates, rel_idx)
                 or (is_human_prompt and re.match(r"^\d+[.)]\s+\S", line))
+                or re.match(r"^[✻✽✶✢✳◐◓◑◒]\s+[A-Za-z\-]+(?:…|\.\.\.)", raw_line)
+                or CLAUDE_GOAL_ACTIVE.match(raw_line)
+                or line == "(ctrl+b to run in background)"
                 or re.match(r"(?:Error ID:|Resume with|agy --conversation|\? for shortcuts|"
-                            r"ctrl\+|alt\+|esc to |Verbosity|summaries\.|┃|\[\d+\]:|Worked for\b|"
+                            r"ctrl\+|alt\+|esc to |Verbosity|summaries\.|┃|\[\d+\]:|"
+                            r"(?:Worked|Churned|Baked|Cogitated|Cooked|Brewed|Saut[eé]ed|Crunched)\s+for\b|"
+                            r"new task\?\s*(?:/clear|\[path\])\b|Update installed\b|↓\s*Back to bottom\b|"
                             r"\d+ artifacts?\s*·|\d+ more lines\b|Tip:|Commands:|Usage:|"
                             r"← for agents|Keyboard shortcuts:)", line, re.I)
                 or re.match(r"\+?\s*\d+ lines?\s*\([^)]*to expand\)", line)
@@ -542,7 +800,7 @@ def _activity(lines, composer_index, footer_index, status, current_input=True):
                 or UUID.fullmatch(line.strip(".,\"'"))
                 or re.fullmatch(r"\S+\.(?:json|jsonl|yaml|yml|md|csv|tsv)[,.]?", line, re.I)
                 or re.search(r"\b(?:GCP Project|Signed in as|account:)\b", line, re.I)
-                or re.fullmatch(r"(?:Pursuing goal|Goal [\w ]+|Working)\s*\([^)]*\)", line)):
+                or re.fullmatch(r"(?:Pursuing goal|Goal [\w ]+|Working)\s*\([^)]*\)(?:\s*[·•]\s*esc to (?:interrupt|cancel))?", line, re.I)):
             continue
         thought = re.search(r"Thought for [^(]+\(([^)]+)\)", line)
         if thought:
@@ -558,7 +816,7 @@ def _activity(lines, composer_index, footer_index, status, current_input=True):
         text = private_text(paragraph, 400)
         if (re.fullmatch(r"(?:true|false|null|json|yaml|md|[0-9a-f]{12,}|\[(?:path|id)\])[,.]?", text, re.I)
                 or len(text.split()) < 3 and not METRIC.search(text)
-                and not re.match(r"(?:Report|Completed|Finished|Reviewed|Validated|Saved|Waiting|Running)\b", text, re.I)
+                and not re.match(r"(?:Report|Completed|Finished|Reviewed|Validated|Saved|Waiting|Running|Reading|Thinking|Exploring|Editing|Searching|Writing|Checking|Testing|Analyzing)\b", text, re.I)
                 and not re.fullmatch(r"[A-Z][A-Z0-9_ -]{2,}", text)):
             continue
         metrics = METRIC.findall(text)
@@ -579,18 +837,41 @@ def _activity(lines, composer_index, footer_index, status, current_input=True):
 def _timer(footer, status, working_status, approval_status=""):
     is_goal = status in {"Pursuing goal", "Goal paused", "Goal stalled", "Goal achieved", "Goal hit usage limits"}
     if status == "APPROVAL" and approval_status:
-        match = re.search(r"Reviewing approval request\s*\(([^)]*)\)", approval_status, re.I)
+        match = re.search(r"Reviewing (?:\d+\s+)?approval requests?\s*\(([^)]*)\)", approval_status, re.I)
         if match:
             duration_match = DURATION.search(match.group(1))
             if duration_match:
                 return {"kind": "prompt", "text": duration_match.group(0).strip()}
-    text = footer if is_goal else working_status if status == "Working" else ""
-    expression = GOAL.pattern if is_goal else r"Working|Running|Reconnecting"
-    match = re.search(r"(?:" + expression + r")\s*\(([^)]*)\)", text, re.I)
-    if not match:
-        return None
-    duration_match = DURATION.search(match.group(1))
-    return {"kind": "goal" if is_goal else "turn", "text": duration_match.group(0).strip()} if duration_match else None
+    if is_goal:
+        match = re.search(r"(?:" + GOAL.pattern + r")\s*\(([^)]*)\)", footer, re.I)
+        if not match:
+            return None
+        duration_match = DURATION.search(match.group(1))
+        return {"kind": "goal", "text": duration_match.group(0).strip()} if duration_match else None
+    if status == "Working" and working_status:
+        legacy = re.search(r"^(?:Working|Running|Reconnecting)\s*\(([^)]*)\)", working_status, re.I)
+        if legacy:
+            inner = legacy.group(1).strip()
+            if DURATION.fullmatch(inner) or re.search(r"\besc to (?:interrupt|cancel)\b|\btokens\b", inner, re.I):
+                duration_match = DURATION.search(inner)
+                if duration_match:
+                    return {"kind": "turn", "text": duration_match.group(0).strip()}
+        for inner in re.findall(r"\(([^)]*)\)", working_status):
+            if re.search(r"\besc to (?:interrupt|cancel)\b|\btokens\b", inner, re.I):
+                duration_match = DURATION.search(inner)
+                if duration_match:
+                    return {"kind": "turn", "text": duration_match.group(0).strip()}
+        ellip = re.search(r"(?:…|\.\.\.)\s*\(([^)]*)\)$", working_status)
+        if ellip and DURATION.fullmatch(ellip.group(1).strip()):
+            return {"kind": "turn", "text": ellip.group(1).strip()}
+        sub_dur = re.search(
+            r"\b(" + DURATION.pattern + r")\s*[·•]\s*[↓↑]\s*[\d.]+k?\s*tokens\b",
+            working_status,
+            re.I,
+        )
+        if sub_dur:
+            return {"kind": "turn", "text": sub_dur.group(1).strip()}
+    return None
 
 
 def _context(lines):
@@ -606,6 +887,15 @@ def _context(lines):
 
 def _goal_footer(lines, footer_index, composer_index):
     """Read goal state only from the current model footer or its wrapped status."""
+    if composer_index is not None and composer_index > 0:
+        for ln in reversed(lines[max(0, composer_index - 4):composer_index]):
+            if BOX_TOP_RULE.fullmatch(ln):
+                continue
+            claude_goal = CLAUDE_GOAL_ACTIVE.match(ln)
+            if claude_goal:
+                inner = (claude_goal.group(1) or "").strip()
+                return "Pursuing goal (" + inner + ")" if inner else "Pursuing goal"
+            break
     if footer_index is None or composer_index is not None and footer_index < composer_index:
         return ""
     footer = lines[footer_index]
@@ -627,21 +917,62 @@ def _goal_footer(lines, footer_index, composer_index):
 
 def _working_status(lines, footer_index, composer_index):
     """Accept dedicated current UI status, never a phrase inside prior prose."""
-    end = min(len(lines), footer_index + 4) if footer_index is not None else len(lines)
+    end = min(len(lines), footer_index + 8) if footer_index is not None else len(lines)
     start = composer_index + 1 if composer_index is not None else max(0, end - 6)
-    candidates = lines[start:end]
-    # Codex draws its interrupt/status line immediately above a blank composer.
-    if composer_index is not None:
-        preceding = [line for line in lines[max(0, composer_index - 3):composer_index]
-                     if not RULE.fullmatch(line)]
-        if preceding and re.search(r"\besc to interrupt\b", preceding[-1], re.I):
-            candidates = [preceding[-1]] + candidates
-    for line in reversed(candidates):
-        text = re.sub(r"^[•●○⏺✻⡿⣯⣻⢿⣟]+\s*", "", line)
+    below_candidates = lines[start:end]
+
+    # Inspect the active status slot immediately above the composer, skipping only
+    # box rules and subordinate tool/tip trailers (never past completed prose bullets).
+    above_candidates = []
+    if composer_index is not None and composer_index > 0:
+        scan_floor = max(0, composer_index - 6)
+        for idx in range(composer_index - 1, scan_floor - 1, -1):
+            ln = lines[idx]
+            if BOX_TOP_RULE.fullmatch(ln) or CLAUDE_GOAL_ACTIVE.match(ln):
+                continue
+            if (re.match(r"^└\s", ln)
+                    or re.match(r"^\+?\s*\d+\s+lines?\s*\([^)]*to expand\)", ln, re.I)
+                    or re.match(r"^(?:[•●○]\s*)?(?:Commands:|Usage:|Tip:)", ln, re.I)
+                    or UUID.fullmatch(ln.strip())):
+                continue
+            if ln == "(ctrl+b to run in background)":
+                above_candidates.append(ln)
+                continue
+            above_candidates.append(ln)
+            break
+
+    for line in above_candidates:
+        stripped = re.sub(r"^" + SPINNER_PREFIX + r"+\s*", "", line).strip()
+        if re.match(r"Reviewing (?:\d+\s+)?approval requests?\b", stripped, re.I):
+            continue
+        if INTERRUPTIBLE_STATUS.match(line):
+            return stripped
+        if CLAUDE_ACTIVE_SPINNER.match(line) and not CLAUDE_DONE_LINE.match(line) and " done " not in (" " + stripped.lower() + " "):
+            return stripped
+        if AGY_BRAILLE_ACTIVE.match(line):
+            return stripped
+        if re.match(r"^[•●○⏺✻\u2800-\u28ff]+\s*Running\s*\(.+\)$", line):
+            return stripped
+        if re.match(r"^(?:[✻✽✶✢✳⏺•●○\u2800-\u28ff]+\s*)?Waiting for \d+ background agents? to finish\b", line, re.I):
+            return stripped
+        if line == "(ctrl+b to run in background)":
+            return "Running foreground command (ctrl+b)"
+
+    for line in reversed(below_candidates):
+        text = re.sub(r"^" + SPINNER_PREFIX + r"+\s*", "", line).strip()
         if re.fullmatch(r"(?:Working|Running|Reconnecting)\s*\([^)]*\)(?:\s*[·•]\s*esc to interrupt)?", text, re.I):
+            return text
+        if INTERRUPTIBLE_STATUS.match(line) and not re.match(r"Reviewing (?:\d+\s+)?approval requests?\b", text, re.I):
             return text
         if re.fullmatch(r"\d+\s+task\(s\)\s+running", text, re.I):
             return text
+        if CLAUDE_ACTIVE_SUBAGENT.match(line):
+            return text
+
+    if (footer_index is not None
+            and (composer_index is None or footer_index > composer_index)
+            and re.match(r"^esc to cancel\s+", lines[footer_index], re.I)):
+        return "Working (esc to cancel)"
     return ""
 
 
@@ -655,7 +986,7 @@ def analyze_session(session, role_overrides=None):
     footer_index = footer_indices[-1] if footer_indices else None
     footer = lines[footer_index] if footer_index is not None else ""
     model, compact = _model(footer)
-    index, empty, drafted = _composer(lines, footer_index)
+    index, empty, drafted, composer_raw, is_pasted = _composer_details(lines, footer_index)
     approval_status = _approval_status(lines, index)
     status, flags = _prompt(lines, index, empty)
     recent = "\n".join(lines[-6:])
@@ -673,8 +1004,36 @@ def analyze_session(session, role_overrides=None):
             status = "idle"
         else:
             status = "UNKNOWN"
-    if drafted and status == "UNKNOWN":
+    composer_text = None
+    if drafted and status in {"UNKNOWN", "Goal achieved", "Goal paused", "Goal stalled", "Goal hit usage limits"}:
         flags.append("draft")
+        if is_pasted:
+            flags.append("pasted-prompt")
+        if composer_raw:
+            composer_text = private_text(composer_raw, 110)
+    keystroke_hint = _keystroke_hint(status, flags, lines, index)
+    agent_kind = session.get("agent")
+    skip_perm = session.get("skip_permissions")
+    if agent_kind == "agy" and status == "APPROVAL":
+        if skip_perm is False:
+            agy_work_fixable = True
+            agy_work_status = "fixable"
+            flags.append("agy-work-fixable")
+        elif skip_perm is True:
+            agy_work_fixable = False
+            agy_work_status = "already_enabled"
+            flags.append("agy-work-active")
+        else:
+            agy_work_fixable = False
+            agy_work_status = "unverified"
+    else:
+        agy_work_fixable = False
+        agy_work_status = "not_applicable"
+    agent_message = None
+    if status == "idle" and empty and not drafted and index is not None:
+        agent_message = _agent_end_message(lines, index)
+        if agent_message:
+            flags.append("agent-message")
     if background_task:
         flags.append("background-task")
     elif task_present:
@@ -690,14 +1049,21 @@ def analyze_session(session, role_overrides=None):
     home_only = re.fullmatch(r"/(?:Users|home)/[^/]+", cwd)
     repo = "(home)" if home_only else (PurePath(cwd).name if cwd else "unknown")
     context = _context(lines)
-    stable_activity = DURATION.sub("<elapsed>", activity or "") if re.match(r"(?:Thinking|Working|Running|Reconnecting|Thought for|Reviewing approval request)\b", activity or "", re.I) else activity
+    stable_activity = DURATION.sub("<elapsed>", activity or "") if re.match(r"(?:Thinking|Working|Running|Reconnecting|Thought for|Reviewing (?:\d+\s+)?approval requests?)\b", activity or "", re.I) else activity
     evidence = {"status": status, "model": model, "activity": stable_activity,
                 "context": context, "flags": sorted(flags)}
+    if composer_text is not None:
+        evidence["composer_text"] = composer_text
+    if agent_message is not None:
+        evidence["agent_message"] = agent_message
     fingerprint = hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
     role_info = classify_session_role(session, overrides=role_overrides)
     return {"status": status, "model": model, "model_compact": compact,
             "timer": _timer(goal_footer or footer, status, working_status, approval_status), "activity": activity,
             "activity_source": "screen" if activity else None, "context": context,
+            "composer_text": composer_text, "keystroke_hint": keystroke_hint,
+            "agent_message": agent_message,
+            "agy_work_fixable": agy_work_fixable, "agy_work_status": agy_work_status,
             "evidence_fingerprint": fingerprint, "flags": flags,
             "repo_label": private_text(repo or "unknown", 40),
             "role": role_info["role"],
@@ -761,13 +1127,25 @@ STATE_SYMBOL_SPEC = {
 }
 
 
+_M1_HOST_RE = re.compile(r"(?:^|[^a-z0-9])m1(?:\s*(?:pro|max|ultra))?(?:$|[^a-z0-9])")
+_M5_HOST_RE = re.compile(r"(?:^|[^a-z0-9])m5(?:\s*(?:pro|max|ultra))?(?:$|[^a-z0-9])")
+_RESERVED_HOST_GLYPHS = frozenset({"M1", "M5", "IN"})
+
+
+def is_m1_host(host_key, host_label=""):
+    key_low = str(host_key or "").strip().lower()
+    label_low = str(host_label or "").strip().lower()
+    combined = key_low + " " + label_low
+    return bool(_M1_HOST_RE.search(combined))
+
+
 def host_symbol(host_key, host_label="", stale=False):
     key_low = str(host_key or "").strip().lower()
     label_low = str(host_label or "").strip().lower()
     combined = key_low + " " + label_low
-    if re.search(r"\bm1\b", combined):
+    if _M1_HOST_RE.search(combined):
         tone, dot, glyph, rank = "purple", "🟣", "M1", 10
-    elif re.search(r"\bm5\b", combined):
+    elif _M5_HOST_RE.search(combined):
         tone, dot, glyph, rank = "blue", "🔷", "M5", 20
     elif "intel" in combined:
         tone, dot, glyph, rank = "orange", "🔶", "IN", 30
@@ -775,10 +1153,14 @@ def host_symbol(host_key, host_label="", stale=False):
         parts = [part for part in re.split(r"[^A-Za-z0-9]+", str(host_key or "H")) if part]
         if len(parts) >= 2 and len(parts[-1]) == 1:
             glyph = (parts[0][0] + parts[-1]).upper()
+            if glyph in _RESERVED_HOST_GLYPHS:
+                glyph = (parts[0][:2] + parts[-1]).upper()
         elif parts:
             glyph = parts[0][:3].upper()
         else:
             glyph = "MAC"
+        if glyph in _RESERVED_HOST_GLYPHS:
+            glyph = glyph + "H"
         tone, dot, rank = "teal", "⚪", 40
     short = glyph + ("◌" if stale else "")
     detail = str(host_label or host_key or "Host")
@@ -818,16 +1200,39 @@ def session_symbols(row, host_key="", host_label="", host_stale=False):
 
     flags = set(row.get("flags") or [])
     errors = set(row.get("errors") or [])
+    ks_hint = row.get("keystroke_hint")
+    is_agy_fixable = bool(
+        row.get("agy_work_fixable")
+        or "agy-work-fixable" in flags
+        or (agent == "agy" and status == "APPROVAL" and row.get("skip_permissions") is False)
+    )
     if status in {"APPROVAL", "QUESTION", "SIGN-IN", "TRUST-PROMPT", "UPDATE-PROMPT"} or "subagent-approval" in flags:
-        guard = {"tone": "yellow", "dot": "🟡", "glyph": "▲", "short": "prompt",
-                 "detail": "Human prompt active — never send automated input", "rank": 10}
+        if is_agy_fixable:
+            g_detail = "AGY approval prompt (fixable via agy-work -c)"
+            if ks_hint:
+                g_detail += " · keys: " + str(ks_hint)
+            guard = {"tone": "yellow", "dot": "🟡", "glyph": "⚡", "short": "agy-wk",
+                     "detail": g_detail, "rank": 8}
+        else:
+            g_detail = "Human prompt active — never send automated input"
+            if ks_hint:
+                g_detail += " (" + str(ks_hint) + ")"
+            guard = {"tone": "yellow", "dot": "🟡", "glyph": "▲", "short": "prompt",
+                     "detail": g_detail, "rank": 10}
+    elif "agent-message" in flags or row.get("agent_message"):
+        guard = {"tone": "purple", "dot": "🟣", "glyph": "💬", "short": "reply",
+                 "detail": "Agent message at end of response awaits user reply", "rank": 15}
     elif "network-retry" in flags or "last-error" in flags:
         short = "retry" if "network-retry" in flags else "error"
         guard = {"tone": "red", "dot": "🔴", "glyph": "⚡", "short": short,
                  "detail": "Network retry or connection/quota error noted on screen", "rank": 20}
     elif "draft" in flags:
-        guard = {"tone": "orange", "dot": "🟠", "glyph": "✎", "short": "draft",
-                 "detail": "Unsent text drafted in composer", "rank": 30}
+        if "pasted-prompt" in flags:
+            guard = {"tone": "orange", "dot": "🟠", "glyph": "📋", "short": "pasted",
+                     "detail": "Pasted/multi-line prompt in composer — NOT running (press Enter)", "rank": 28}
+        else:
+            guard = {"tone": "orange", "dot": "🟠", "glyph": "✎", "short": "draft",
+                     "detail": "Unsent prompt in composer — NOT running (press Enter)", "rank": 30}
     elif "screen-unavailable" in flags or "agent_process_unverified" in errors:
         guard = {"tone": "slate", "dot": "⚫", "glyph": "◌", "short": "blind",
                  "detail": "Screen or OS agent process unverified", "rank": 40}
@@ -949,8 +1354,22 @@ def _state(row):
     timer = row.get("timer")
     if isinstance(timer, dict) and timer.get("text"):
         text += " · " + str(timer["text"])
-    notes = {"network-retry": "retry", "draft": "draft", "last-error": "last error", "screen-unavailable": "no screen", "background-task": "task", "task-present": "task present"}
-    for flag in row.get("flags", []):
+    flag_list = list(row.get("flags", []))
+    flag_set = set(flag_list)
+    notes = {
+        "agy-work-fixable": "agy-work fixable",
+        "agent-message": "awaiting reply",
+        "network-retry": "retry",
+        "pasted-prompt": "pasted not running",
+        "draft": "draft",
+        "last-error": "last error",
+        "screen-unavailable": "no screen",
+        "background-task": "task",
+        "task-present": "task present",
+    }
+    for flag in flag_list:
+        if flag == "draft" and "pasted-prompt" in flag_set:
+            continue
         if flag in notes:
             text += " · " + notes[flag]
     return text

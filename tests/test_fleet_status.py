@@ -618,6 +618,31 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("--snapshot", proc.stdout)
 
+    def test_skip_permissions_validation_and_normalization(self):
+        for valid in (True, False, None):
+            snap = snapshot()
+            snap["sessions"][0]["agent"] = "agy"
+            snap["sessions"][0]["skip_permissions"] = valid
+            report = FLEET.normalize_host("a", "Host A", snap)
+            self.assertIs(report["sessions"][0]["skip_permissions"], valid)
+
+        for invalid in ("false", 1, []):
+            bad = snapshot()
+            bad["sessions"][0]["skip_permissions"] = invalid
+            with self.assertRaisesRegex(ValueError, "snapshot_identity_invalid"):
+                FLEET.validate_snapshot(bad)
+
+        unverified = snapshot()
+        unverified["sessions"][0].update({
+            "pid": None,
+            "started_at": None,
+            "session_id": None,
+            "skip_permissions": False,
+            "errors": ["agent_process_unverified"],
+        })
+        with self.assertRaisesRegex(ValueError, "snapshot_process_invalid"):
+            FLEET.validate_snapshot(unverified)
+
 
 if __name__ == "__main__":
     unittest.main()

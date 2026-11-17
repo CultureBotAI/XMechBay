@@ -876,6 +876,8 @@ class HardeningEdgeCaseTests(unittest.TestCase):
                 session("h1", "mech", "AlphaMech", "Goal stalled", target="P1", transport="process"),
                 session("h1", "mech", "BetaMech", "Goal stalled", target="P2", transport="process"),
                 session("h1", "mech", "GammaMech", "Goal stalled", target="P3", transport="process"),
+                session("h1", "mech", "DeltaMech", "APPROVAL", target="T4/1", agent="agy",
+                        skip_permissions=False, agy_work_fixable=True, agy_work_status="fixable"),
                 session("h2", "mech", "AlphaMech", "idle", target="T2/1"),
                 session("h2", "mech", "BetaMech", "idle", target="T3/1"),
             ],
@@ -916,7 +918,7 @@ class HardeningEdgeCaseTests(unittest.TestCase):
                                                          open_index=seeded_idx, source_mode="file")
             untracked = [r["rule"] for r in second_pass if r["tracking"]["status"] != "tracked"]
             self.assertEqual(untracked, [], guard)
-        self.assertEqual(len(seen_rules), 12)
+        self.assertEqual(len(seen_rules), 13)
 
     def test_null_host_claw_does_not_match_null_session_and_missing_run_dir_not_created(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1273,6 +1275,218 @@ class TwoFleetRoleRoutingTests(unittest.TestCase):
         self.assertEqual(by_title["h2: session collection partial (tmux_probe_failed)"]["owner"], {"kind": "xmechbay", "key": "maintenance"})
         self.assertNotIn("StaleMech: 1 green PRs awaiting closure-steward diff review", by_title)
         self.assertEqual(by_title["StaleMech: 1 draft PRs untouched for 14+ days"]["owner"], {"kind": "claw", "key": "live-steward"})
+
+
+class DashboardBlockerAndHtmlTests(unittest.TestCase):
+    def test_observe_dashboard_html_extracts_payload_and_guards_errors(self):
+        sys.path.insert(0, str(OPS.STATUS_SCRIPTS))
+        import fleet_dashboard
+
+        payload = example_payload()
+        payload["sessions"][0]["activity"] = "Check </script> tag safety & escaping"
+        html_doc = fleet_dashboard.render_dashboard_html(payload, csrf_token="", static_export=True)
+        extracted = OPS.extract_dashboard_html_payload(html_doc)
+        self.assertEqual(len(extracted["sessions"]), len(payload["sessions"]))
+        self.assertEqual(extracted["sessions"][0]["activity"], "Check </script> tag safety & escaping")
+
+        slash_escaped = '<!doctype html><script id="initial-payload" type="application/json">{"sessions":[{"activity":"a<\\/script>b"}]}</script>'
+        self.assertEqual(OPS.extract_dashboard_html_payload(slash_escaped)["sessions"][0]["activity"], "a</script>b")
+
+        for bad_html in ("<html><body>no script</body></html>",
+                         '<script id="initial-payload">{bad json}</script>',
+                         '<script id="initial-payload">["not-an-object"]</script>',
+                         '<script id="initial-payload">{"hosts": []}</script>'):
+            with self.assertRaises(SystemExit):
+                OPS.extract_dashboard_html_payload(bad_html)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_path = tmp_path / "fleet-ops.json"
+            data = json.loads((EXAMPLES / "fleet-ops.json").read_text())
+            data["fleet_status_config"] = str(EXAMPLES / "fleet-hosts.json")
+            cfg_path.write_text(json.dumps(data))
+            html_path = tmp_path / "dashboard-latest.html"
+            html_path.write_text(html_doc)
+            run = tmp_path / "run-html"
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = OPS.main([
+                    "--config", str(cfg_path), "observe",
+                    "--dashboard-html", str(html_path),
+                    "--resources-json", str(EXAMPLES / "fleet-ops-resources.json"),
+                    "--no-issues", "--out", str(run),
+                ])
+                self.assertEqual(rc, 0)
+                with self.assertRaises(SystemExit):
+                    OPS.main([
+                        "--config", str(cfg_path), "observe",
+                        "--dashboard-html", str(html_path),
+                        "--dashboard-url", "http://127.0.0.1:8765",
+                        "--no-issues", "--out", str(tmp_path / "run-conflict"),
+                    ])
+            saved = json.loads((run / "sessions.json").read_text())
+            self.assertEqual(len(saved["sessions"]), len(payload["sessions"]))
+
+    def test_three_way_human_blockers_decisions_order_dispatch_guards_and_agy_work_rec(self):
+        cfg = config(
+            infra_repos={"xmechbay": "example-org/XMechBay", "claw": "example-org/claw"},
+            claws={
+                "claw-pasted": {"host": "h1", "repo": "claw-pasted", "mechs": ["AlphaMech"]},
+                "claw-reply": {"host": "h1", "repo": "claw-reply", "mechs": ["BetaMech"]},
+                "claw-subapproval": {"host": "h1", "repo": "claw-sub", "mechs": ["GammaMech"]},
+                "claw-ready": {"host": "h2", "repo": "claw-ready", "mechs": ["*"]},
+            },
+            mech_owner={},
+            thresholds={"idle_sessions_warn": 2},
+        )
+        rows = [
+            # Claws blocked by pasted prompt, agent message, and subagent approval vs ready claw
+            session("h1", "claw", "claw-pasted", "idle", repo="claw-pasted", target="T1/1",
+                    human_block_kind="pasted_prompt", is_pasted_prompt=True, flags=["draft", "pasted-prompt"],
+                    composer_text="[Pasted text #1 +18 lines]"),
+            session("h1", "claw", "claw-reply", "idle", repo="claw-reply", target="T2/1",
+                    human_block_kind="agent_message", flags=["agent-message"],
+                    agent_message="Should I open the PR for BetaMech?"),
+            session("h1", "claw", "claw-sub", "Working", repo="claw-sub", target="T3/1",
+                    flags=["subagent-approval"], keystroke_hint="1 / 2 / 3"),
+            session("h2", "claw", "claw-ready", "idle", repo="claw-ready", target="T4/1"),
+            # Mechs with all 3 human blocker classes + agy-work fixable vs already enabled
+            session("h1", "mech", "AlphaMech", "APPROVAL", target="T10/1", agent="agy",
+                    human_block_kind="keystroke", skip_permissions=False,
+                    agy_work_fixable=True, agy_work_status="fixable",
+                    keystroke_hint="1 / y / n", activity="Allow run_command pytest?"),
+            session("h1", "mech", "BetaMech", "APPROVAL", target="T11/1", agent="agy",
+                    human_block_kind="keystroke", skip_permissions=True,
+                    agy_work_fixable=False, agy_work_status="already_enabled",
+                    keystroke_hint="y / n", activity="Approve git push origin --delete?"),
+            session("h2", "mech", "GammaMech", "idle", target="%1", tmux="fleet", window="gamma",
+                    human_block_kind="agent_message", flags=["agent-message"],
+                    agent_message="Ready to merge PR #42; reply yes or no."),
+            session("h2", "mech", "DeltaMech", "UNKNOWN", target="T12/1",
+                    human_block_kind="pasted_prompt", is_pasted_prompt=True, flags=["draft", "pasted-prompt"],
+                    composer_text="Audit open curation issues\nand summarize priorities"),
+            session("h2", "mech", "EpsilonMech", "idle", target="T13/1",
+                    human_block_kind="pasted_prompt", is_pasted_prompt=False, flags=["draft"],
+                    composer_text="check status"),
+            session("h2", "mech", "StalledMech", "Goal stalled", target="T14/1"),
+            # Non-Mech session with agent_message
+            session("h2", "other", "ExampleTool", "idle", target="T15/1",
+                    human_block_kind="agent_message", flags=["agent-message"],
+                    agent_message="Confirm export target directory?"),
+        ]
+        payload = {
+            "mode": "live",
+            "generated_at": "2026-11-16T23:00:00Z",
+            "hosts": [{"key": "h1", "reachable": True, "errors": [], "health": {"status": "ok", "process_status": "ok"}},
+                      {"key": "h2", "reachable": True, "errors": [], "health": {"status": "ok", "process_status": "ok"}}],
+            "canonical_mechs": ["AlphaMech", "BetaMech", "GammaMech", "DeltaMech", "EpsilonMech", "StalledMech", "DormantMech"],
+            "sessions": rows,
+        }
+        issues = {
+            "StalledMech": {
+                "repo": "example-org/StalledMech", "open_issues": 1, "open_prs": 1,
+                "prs": [{"number": 7, "title": "Green PR", "draft": False, "updated_at": "2026-11-16T00:00:00Z",
+                         "mergeable": "MERGEABLE", "review": None, "checks": "SUCCESS"}],
+            }
+        }
+        findings = OPS.analyze(payload, {}, issues, cfg)
+        by_title = {f["title"]: f for f in findings}
+
+        # Human-blocked Mechs do not trigger false "no session is working", and blocked idle rows do not count as idle sprawl
+        for m in ("AlphaMech", "BetaMech", "GammaMech", "DeltaMech", "EpsilonMech"):
+            self.assertNotIn(f"{m}: no session is working", by_title)
+        self.assertFalse(any("idle Mech/claw sessions" in t for t in by_title), list(by_title))
+
+        # Verify owners and tailored actions across all 3 blocker classes
+        alpha_f = by_title["AlphaMech on h1 waits for a human (APPROVAL)"]
+        self.assertEqual(alpha_f["owner"], {"kind": "user", "key": "prompt"})
+        self.assertTrue(alpha_f["evidence"]["agy_work_fixable"])
+        self.assertIn("agy-work -c", alpha_f["action"])
+        self.assertIn("1 / y / n", alpha_f["action"])
+
+        beta_f = by_title["BetaMech on h1 waits for a human (APPROVAL)"]
+        self.assertFalse(beta_f["evidence"].get("agy_work_fixable", False))
+        self.assertIn("already running agy-work, stopped on a standing Ask rule", beta_f["action"])
+
+        gamma_f = by_title["GammaMech on h2 awaits a user reply (%1)"]
+        self.assertEqual(gamma_f["owner"], {"kind": "user", "key": "agent-message"})
+        self.assertIn("tmux fleet:gamma", gamma_f["action"])
+        self.assertIn("Ready to merge PR #42", gamma_f["action"])
+
+        delta_f = by_title["DeltaMech on h2 has a pasted prompt not running (T12/1)"]
+        self.assertEqual(delta_f["owner"], {"kind": "user", "key": "draft"})
+        self.assertIn("NOT running", delta_f["action"])
+
+        eps_f = by_title["EpsilonMech on h2 has an unsent composer draft (T13/1)"]
+        self.assertEqual(eps_f["owner"], {"kind": "user", "key": "draft"})
+
+        other_f = by_title["other session ExampleTool on h2 awaits a user reply (T15/1)"]
+        self.assertEqual(other_f["owner"], {"kind": "user", "key": "agent-message"})
+
+        # Verify REPORT.md annotations and Human blockers summary
+        report = OPS.render_report("run-hb", payload, {}, issues, findings, cfg)
+        self.assertIn("Human blockers: 9 (3 keystroke/TUI prompts [1 fixable via agy-work -c], 3 agent messages awaiting reply, 3 pasted/unsent composer prompts).", report)
+        self.assertIn("h1: APPROVAL [agy-work fixable]", report)
+        self.assertIn("h2: idle [awaiting reply]", report)
+        self.assertIn("h2: UNKNOWN [pasted not running]", report)
+        self.assertIn("h2: idle [draft]", report)
+
+        # Verify choose_target guards on pasted_prompt, agent_message, and subagent-approval claws
+        for c_key, expected_reason in (
+            ("claw-pasted", "has a pasted prompt not running"),
+            ("claw-reply", "awaits a user reply"),
+            ("claw-subapproval", "waits for a human (subagent-approval)"),
+        ):
+            t_list = OPS.claw_targets(payload, cfg["claws"][c_key])
+            chosen, reason = OPS.choose_target(t_list, cfg["claws"][c_key], "fleet")
+            self.assertIsNone(chosen, c_key)
+            self.assertIn(expected_reason, reason)
+
+        # Verify plan() DECISIONS.md ordering and prepared claw brief summary
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / "run-hb"
+            run.mkdir()
+            (run / "sessions.json").write_text(json.dumps(payload))
+            (run / "issues.json").write_text(json.dumps(issues))
+            (run / "findings.json").write_text(json.dumps(findings))
+            summary = OPS.plan(run, cfg)
+            self.assertTrue(summary["claws"]["claw-ready"]["target_resolved"])
+            decisions_md = (run / "plan/DECISIONS.md").read_text()
+            headings = [line for line in decisions_md.splitlines() if line.startswith("## ")]
+            self.assertEqual(headings, [
+                "## 1. Pasted / unsent prompts not running (press Enter or clear)",
+                "## 2. Antigravity approvals fixable via agy-work -c",
+                "## 3. Interactive TUI prompts & keystrokes",
+                "## 4. Agent messages awaiting your plain-text reply",
+                "## 5. PR merges & fleet scope",
+                "## Prepared claw briefs (`DISPATCH.md`)",
+            ])
+            self.assertIn("Ready for canary-first dispatch after approval: `claw-ready`", decisions_md)
+
+            rec_summary = OPS.recommend(run, cfg, open_issues_json=None, no_github=True)
+            self.assertGreaterEqual(rec_summary["total"], 2)
+            full_recs = json.loads((run / "recommendations/recommendations.json").read_text())["recommendations"]
+            by_rule = {r["rule"]: r for r in full_recs}
+            self.assertIn("R-AGY-WORK-PERMISSIONS", by_rule)
+            self.assertEqual(by_rule["R-AGY-WORK-PERMISSIONS"]["evidence"]["count"], 1)
+            self.assertEqual(by_rule["R-CLAW-DISPATCH"]["evidence"]["reply_claws"], ["h1:T2/1"])
+            drafts_md = (run / "recommendations/ISSUE_DRAFTS.md").read_text()
+            self.assertNotIn("@", drafts_md)
+            self.assertNotIn("h1", drafts_md)
+            self.assertNotIn("h2", drafts_md)
+
+        # Non-subagent keystroke_prompt row preserves its own status/PROMPT label in choose_target
+        non_sub_payload = {
+            "sessions": [
+                session("h1", "claw", "claw-custom", "idle", repo="claw-custom", target="T9/1",
+                        human_block_kind="keystroke", flags=[]),
+            ],
+        }
+        non_sub_claw = {"host": "h1", "repo": "claw-custom"}
+        non_sub_targets = OPS.claw_targets(non_sub_payload, non_sub_claw)
+        chosen_ns, reason_ns = OPS.choose_target(non_sub_targets, non_sub_claw, "fleet")
+        self.assertIsNone(chosen_ns)
+        self.assertNotIn("subagent-approval", reason_ns)
+        self.assertIn("waits for a human (idle)", reason_ns)
 
 
 if __name__ == "__main__":

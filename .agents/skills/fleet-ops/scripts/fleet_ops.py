@@ -203,17 +203,39 @@ def fleet_repos(config: dict) -> dict:
 
 # --------------------------------------------------------------------------- collection
 
+INITIAL_PAYLOAD_RE = re.compile(
+    r"<script\b[^>]*\bid=[\"']initial-payload[\"'][^>]*>(.*?)</script>",
+    re.I | re.S,
+)
+
+
+def extract_dashboard_html_payload(html_text: str) -> dict:
+    """Extract the embedded `/api/status` JSON payload from a rendered dashboard HTML file."""
+    match = INITIAL_PAYLOAD_RE.search(str(html_text or ""))
+    if not match:
+        raise SystemExit("dashboard HTML missing <script id='initial-payload'> JSON payload")
+    try:
+        payload = json.loads(match.group(1))
+    except ValueError as exc:
+        raise SystemExit(f"dashboard HTML initial-payload is not valid JSON: {exc}")
+    if not isinstance(payload, dict) or not isinstance(payload.get("sessions"), list):
+        raise SystemExit("dashboard HTML initial-payload must be a JSON object with a sessions list")
+    return payload
+
+
 def collect_sessions(args, config: dict) -> dict:
-    if args.status_json:
+    if getattr(args, "status_json", None):
         return json.loads(Path(args.status_json).read_text())
-    if args.dashboard_url:
+    if getattr(args, "dashboard_html", None):
+        return extract_dashboard_html_payload(Path(args.dashboard_html).read_text())
+    if getattr(args, "dashboard_url", None):
         with urllib.request.urlopen(args.dashboard_url.rstrip("/") + "/api/status", timeout=120) as response:
             return json.loads(response.read().decode())
     sys.path.insert(0, str(STATUS_SCRIPTS))
     import fleet_dashboard  # noqa: E402  (sibling skill; shares its collector)
-    status_config = None if args.snapshot else resolve_path(config, config.get("fleet_status_config"))
+    status_config = None if getattr(args, "snapshot", None) else resolve_path(config, config.get("fleet_status_config"))
     reports, meta = fleet_dashboard.collect_dashboard_reports(
-        config_path=status_config, snapshot_path=args.snapshot)
+        config_path=status_config, snapshot_path=getattr(args, "snapshot", None))
     return fleet_dashboard.build_dashboard_payload(reports, mode=meta["mode"], role_overrides=meta["role_overrides"])
 
 
@@ -733,7 +755,155 @@ def resource_findings(resources: dict, config: dict, by_mech: dict, mechs=(), is
 
 
 def has_composer_draft(row: dict) -> bool:
-    return row.get("human_block_kind") == "draft" or "draft" in (row.get("flags") or ())
+    flags = set(row.get("flags") or ())
+    return (
+        row.get("human_block_kind") in ("draft", "pasted_prompt")
+        or bool(row.get("is_pasted_prompt"))
+        or bool(flags & {"draft", "pasted-prompt"})
+    )
+
+
+def is_pasted_prompt_row(row: dict) -> bool:
+    return bool(row.get("is_pasted_prompt")) or "pasted-prompt" in (row.get("flags") or ())
+
+
+def is_agent_message_row(row: dict) -> bool:
+    return (
+        row.get("human_block_kind") == "agent_message"
+        or "agent-message" in (row.get("flags") or ())
+        or bool(str(row.get("agent_message") or "").strip())
+    )
+
+
+def is_keystroke_prompt_row(row: dict) -> bool:
+    status = str(row.get("status") or "")
+    return (
+        status.startswith(HUMAN_PROMPTS)
+        or row.get("human_block_kind") in ("keystroke", "prompt")
+        or "subagent-approval" in (row.get("flags") or ())
+    )
+
+
+def is_agy_work_fixable_row(row: dict) -> bool:
+    status = str(row.get("status") or "")
+    return (
+        bool(row.get("agy_work_fixable"))
+        or "agy-work-fixable" in (row.get("flags") or ())
+        or (row.get("agent") == "agy" and status.startswith("APPROVAL") and row.get("skip_permissions") is False)
+    )
+
+
+def human_block_category(row: dict) -> str | None:
+    if is_keystroke_prompt_row(row):
+        return "keystroke"
+    if is_agent_message_row(row):
+        return "agent_message"
+    if has_composer_draft(row):
+        return "pasted_prompt"
+    return None
+
+
+def compact_snippet(value: object, limit: int = 140) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    if not cleaned:
+        return ""
+    return cleaned if len(cleaned) <= limit else cleaned[:limit - 1].rstrip() + "…"
+
+
+def target_display(row: dict) -> str:
+    target = str(row.get("target_short") or "?")
+    t_sess = row.get("tmux_session")
+    t_win = row.get("tmux_window")
+    if isinstance(t_sess, str) and t_sess:
+        win_part = f":{t_win}" if isinstance(t_win, str) and t_win else ""
+        return f"{target} (tmux {t_sess}{win_part})"
+    return target
+
+
+def blocker_evidence(row: dict, base_where: dict, category: str) -> dict:
+    ev = dict(base_where)
+    ev["human_block_kind"] = category
+    if row.get("tmux_session"):
+        ev["tmux_session"] = row["tmux_session"]
+    if row.get("tmux_window"):
+        ev["tmux_window"] = row["tmux_window"]
+    wait_sec = row.get("wait_seconds")
+    if isinstance(wait_sec, (int, float)) and not isinstance(wait_sec, bool) and wait_sec >= 0:
+        ev["wait_seconds"] = int(wait_sec)
+    if category == "keystroke":
+        ks = compact_snippet(row.get("keystroke_hint"), 80)
+        if ks:
+            ev["keystroke_hint"] = ks
+        if is_agy_work_fixable_row(row):
+            ev["agy_work_fixable"] = True
+            ev["agy_work_status"] = "fixable"
+        elif row.get("agy_work_status") and row.get("agy_work_status") != "not_applicable":
+            ev["agy_work_status"] = row["agy_work_status"]
+        elif row.get("agent") == "agy" and row.get("skip_permissions") is True:
+            ev["agy_work_status"] = "already_enabled"
+        preview = compact_snippet(row.get("activity"), 140)
+        if preview:
+            ev["prompt_preview"] = preview
+    elif category == "agent_message":
+        msg = compact_snippet(row.get("agent_message") or row.get("activity"), 160)
+        if msg:
+            ev["agent_message"] = msg
+    elif category == "pasted_prompt":
+        ev["is_pasted_prompt"] = is_pasted_prompt_row(row)
+        comp = compact_snippet(row.get("composer_text"), 140)
+        if comp:
+            ev["composer_text"] = comp
+    return ev
+
+
+def build_human_blocker_finding(row: dict, subject: str, role: str | None, host: str | None,
+                                mech: str | None, base_where: dict, category: str) -> dict:
+    status = str(row.get("status") or "")
+    loc = target_display(row)
+    ev = blocker_evidence(row, base_where, category)
+    if category == "keystroke":
+        flags = set(row.get("flags") or ())
+        prompt_label = status if status.startswith(HUMAN_PROMPTS) else ("subagent-approval" if "subagent-approval" in flags else (status or "PROMPT"))
+        ks = ev.get("keystroke_hint")
+        preview = ev.get("prompt_preview")
+        suffix = f" Prompt: {preview}" if preview else ""
+        if ev.get("agy_work_fixable"):
+            action = (
+                f"Plain agy without skip-permissions at {loc}: answer in TUI ({ks or '1 / Enter'}) "
+                f"or exit cleanly and relaunch with `agy-work -c` so routine approvals stop blocking.{suffix}"
+            )
+        elif ev.get("agy_work_status") == "already_enabled":
+            ks_part = f"; keys: {ks}" if ks else ""
+            action = (
+                f"Only the user answers approval, question, sign-in, trust or update prompts "
+                f"({loc}{ks_part}; already running agy-work, stopped on a standing Ask rule).{suffix}"
+            )
+        else:
+            ks_part = f"; keys: {ks}" if ks else ""
+            loc_part = f" ({loc}{ks_part})" if loc and loc != "?" else ""
+            action = f"Only the user answers approval, question, sign-in, trust or update prompts{loc_part}.{suffix}"
+        return finding("warning", "activity", f"{subject} on {host} waits for a human ({prompt_label})",
+                       action, owner("user", "prompt"), host, mech, ev)
+    if category == "agent_message":
+        msg = ev.get("agent_message")
+        suffix = f" Message: {msg}" if msg else ""
+        action = f"Agent finished its turn at {loc} with a plain-text question or approval request; read the message and type your reply + Enter.{suffix}"
+        return finding("warning", "activity", f"{subject} on {host} awaits a user reply ({row.get('target_short')})",
+                       action, owner("user", "agent-message"), host, mech, ev)
+    is_pasted = bool(ev.get("is_pasted_prompt"))
+    comp = ev.get("composer_text")
+    suffix = f" Composer: {comp}" if comp else ""
+    title_kind = "has a pasted prompt not running" if is_pasted else "has an unsent composer draft"
+    if role in ("claw", "mechbay"):
+        action = f"Send or clear the unsent text in the composer at {loc} (press Enter to run or clear to discard) before pasting a fleet-ops goal.{suffix}"
+        cat_name = "delegation"
+    else:
+        action = f"Prompt text sits unsubmitted in the composer at {loc} and is NOT running: inspect the prompt and press Enter to submit or clear to discard.{suffix}"
+        cat_name = "activity"
+    return finding("warning", cat_name, f"{subject} on {host} {title_kind} ({row.get('target_short')})",
+                   action, owner("user", "draft"), host, mech, ev)
 
 
 def is_blind_process_row(row: dict) -> bool:
@@ -821,41 +991,56 @@ def activity_findings(payload: dict, config: dict, by_mech: dict, issues: dict |
     if live is None:
         live = live_claws(payload.get("sessions"), config)
     sessions = [r for r in (payload.get("sessions") or []) if isinstance(r, dict) and not r.get("stale_cached")]
-    for row in sessions:  # prompts, stalls, usage stops and composer drafts on supervisor or non-Mech sessions need direct attention
+    for row in sessions:  # prompts, stalls, usage stops, agent messages and composer drafts on supervisor or non-Mech sessions need direct attention
         status, role, host = str(row.get("status", "")), row.get("role"), row.get("host_key")
+        if role not in ("claw", "mechbay", "other"):
+            continue
         where = {"target": row.get("target_short"), "agent": row.get("agent")}
-        if role in ("claw", "mechbay", "other") and status.startswith(HUMAN_PROMPTS):
-            out.append(finding("warning", "activity", f"{role} session {row.get('project_label')} on {host} waits for a human ({status})",
-                               "Only the user answers approval, question, sign-in, trust or update prompts.", owner("user", "prompt"), host, evidence=where))
-        elif role in ("claw", "mechbay", "other") and status.startswith("Goal stalled"):
-            label = f"non-Mech session {row.get('project_label')}" if role == "other" else f"{role} session {row.get('project_label')}"
+        role_subj = f"{role} session {row.get('project_label')}"
+        if is_keystroke_prompt_row(row):
+            out.append(build_human_blocker_finding(row, role_subj, role, host, None, where, "keystroke"))
+        elif status.startswith("Goal stalled"):
+            label = f"non-Mech session {row.get('project_label')}" if role == "other" else role_subj
             action = ("Inspect the session directly or register the repository in the fleet manifest if it is a fleet Mech."
                       if role == "other" else "Inspect the supervisor session directly and clear or restart the stalled goal before delegating.")
             out.append(finding("warning", "activity", f"{label} on {host}: goal stalled",
                                action, owner("user", "stalled-other" if role == "other" else "stalled-supervisor"), host, evidence=where))
-        elif role in ("claw", "mechbay", "other") and status.startswith("Goal hit usage limits"):
-            label = f"non-Mech session {row.get('project_label')}" if role == "other" else f"{role} session {row.get('project_label')}"
+        elif status.startswith("Goal hit usage limits"):
+            label = f"non-Mech session {row.get('project_label')}" if role == "other" else role_subj
             out.append(finding("warning", "activity", f"{label} on {host} hit usage limits",
                                "Decide whether and when to resume; resumes spend usage.", owner("user", "usage"), host, evidence=where))
-        if role in ("claw", "mechbay") and has_composer_draft(row):
-            out.append(finding("warning", "delegation", f"{role} session {row.get('project_label')} on {host} has an unsent composer draft ({row.get('target_short')})",
-                               "Send or clear the unsent text in the composer before pasting a fleet-ops goal.", owner("user", "draft"), host, evidence=where))
+        if not is_keystroke_prompt_row(row):
+            if is_agent_message_row(row):
+                out.append(build_human_blocker_finding(row, role_subj, role, host, None, where, "agent_message"))
+            elif has_composer_draft(row):
+                out.append(build_human_blocker_finding(row, role_subj, role, host, None, where, "pasted_prompt"))
     for mech, rows in sorted(by_mech.items()):
         for row in rows:
             status, host = str(row.get("status", "")), row.get("host_key")
             where = {"host": host, "target": row.get("target_short"), "agent": row.get("agent")}
-            if status.startswith(HUMAN_PROMPTS):
-                out.append(finding("warning", "activity", f"{mech} on {host} waits for a human ({status})",
-                                   "Only the user answers approval, question, sign-in, trust or update prompts.", owner("user", "prompt"), host, mech, where))
+            if is_keystroke_prompt_row(row):
+                out.append(build_human_blocker_finding(row, mech, "mech", host, mech, where, "keystroke"))
             elif status.startswith("Goal hit usage limits"):
                 out.append(finding("warning", "activity", f"{mech} on {host} hit usage limits", "Decide whether and when to resume; resumes spend usage.", owner("user", "usage"), host, mech, where))
             elif status.startswith("Goal stalled"):
                 out.append(finding("warning", "activity", f"{mech} on {host}: goal stalled", "Diagnose the stall from authoritative state (ledger, receipts, GitHub); repair with verified facts or report the blocker.", mech_owner(mech, by_mech, config, live=live, issues=issues), host, mech, where))
             elif status.startswith("Goal paused"):
                 out.append(finding("info", "activity", f"{mech} on {host}: goal paused", "Propose resume or close with the reason; do not resume without approval.", mech_owner(mech, by_mech, config, live=live, issues=issues), host, mech, where))
+            if not is_keystroke_prompt_row(row):
+                if is_agent_message_row(row):
+                    out.append(build_human_blocker_finding(row, mech, "mech", host, mech, where, "agent_message"))
+                elif has_composer_draft(row):
+                    out.append(build_human_blocker_finding(row, mech, "mech", host, mech, where, "pasted_prompt"))
         states = [str(r.get("status", "")) for r in rows]
-        flagged = any(s.startswith(("Goal stalled", "Goal paused", "Goal hit usage limits") + HUMAN_PROMPTS) for s in states)
-        unknown = any(s.upper().startswith("UNKNOWN") for s in states)  # an unreadable screen is not "not working"
+        flagged = any(
+            s.startswith(("Goal stalled", "Goal paused", "Goal hit usage limits") + HUMAN_PROMPTS)
+            or human_block_category(r) is not None
+            for r, s in zip(rows, states)
+        )
+        unknown = any(
+            s.upper().startswith("UNKNOWN") and human_block_category(r) is None
+            for r, s in zip(rows, states)
+        )  # an unreadable screen is not "not working"
         if rows and not flagged and not unknown and not any(s.startswith(("Pursuing goal", "Working")) for s in states):
             m_owner = mech_owner(mech, by_mech, config, live=live, issues=issues)
             lane = mech_lane_label(mech, config, issues=issues) if has_role_routing(config) else "unknown"
@@ -881,7 +1066,7 @@ def activity_findings(payload: dict, config: dict, by_mech: dict, issues: dict |
             out.append(finding("critical", "delegation", f"claw {key} has no live session on {c_host}",
                                action, owner("user", "claws"), c_host))
     host_sessions = [r for r in sessions if isinstance(r.get("host_key"), str) and r.get("host_key")]
-    idle = Counter(r["host_key"] for r in host_sessions if str(r.get("status")) == "idle" and r.get("role") in ("mech", "claw"))
+    idle = Counter(r["host_key"] for r in host_sessions if str(r.get("status")) == "idle" and human_block_category(r) is None and r.get("role") in ("mech", "claw"))
     for host, count in sorted(idle.items()):
         if count >= t["idle_sessions_warn"]:
             out.append(finding("info", "hygiene", f"{host}: {count} idle Mech/claw sessions",
@@ -990,6 +1175,20 @@ def mech_lane_label(mech: str, config: dict, issues: dict | None = None) -> str:
     return mech_mode(mech, (issues or {}).get(mech), config["thresholds"])
 
 
+def session_state_cell(row: dict) -> str:
+    host = row.get("host_key")
+    status = row.get("status")
+    cat = human_block_category(row)
+    if cat == "keystroke" and is_agy_work_fixable_row(row):
+        return f"{host}: {status} [agy-work fixable]"
+    if cat == "agent_message":
+        return f"{host}: {status} [awaiting reply]"
+    if cat == "pasted_prompt":
+        tag = "pasted not running" if is_pasted_prompt_row(row) else "draft"
+        return f"{host}: {status} [{tag}]"
+    return f"{host}: {status}"
+
+
 def render_report(run_id: str, payload: dict, resources: dict, issues: dict, findings: list, config: dict) -> str:
     lines = [f"# Fleet operations report {run_id}", "",
              f"Sessions observed {payload.get('generated_at')} ({payload.get('mode')}); resources and backlog collected for this run. "
@@ -1014,6 +1213,16 @@ def render_report(run_id: str, payload: dict, resources: dict, issues: dict, fin
     live = live_claws(live_rows, config)
     role_mode = has_role_routing(config)
     lines += ["", "## Activity", "", f"Session tones: {', '.join(f'{k} {v}' for k, v in sorted(tones.items()))}."]
+    hb_counts = Counter(human_block_category(r) for r in live_rows if human_block_category(r) is not None)
+    agy_fixable_total = sum(1 for r in live_rows if human_block_category(r) == "keystroke" and is_agy_work_fixable_row(r))
+    hb_total = sum(hb_counts.values())
+    if hb_total:
+        agy_note = f" [{agy_fixable_total} fixable via agy-work -c]" if agy_fixable_total else ""
+        lines.append(
+            f"Human blockers: {hb_total} ({hb_counts['keystroke']} keystroke/TUI prompts{agy_note}, "
+            f"{hb_counts['agent_message']} agent messages awaiting reply, "
+            f"{hb_counts['pasted_prompt']} pasted/unsent composer prompts)."
+        )
     if role_mode:
         lines += ["", "### Claw roles", ""]
         for key, claw in sorted(config["claws"].items()):
@@ -1022,13 +1231,13 @@ def render_report(run_id: str, payload: dict, resources: dict, issues: dict, fin
                 lines.append(f"- `{key}` ({claw.get('host')}): {roles_txt}")
         lines += ["", "| Mech | Lane | Sessions (host: state) | Responsible claw |", "|---|---|---|---|"]
         for mech in sorted(set(by_mech) | {m for m in (payload.get("canonical_mechs") or []) if isinstance(m, str) and m}):
-            states = ", ".join(f"{r.get('host_key')}: {r.get('status')}" for r in by_mech.get(mech, [])) or "none"
+            states = ", ".join(session_state_cell(r) for r in by_mech.get(mech, [])) or "none"
             lane = mech_lane_label(mech, config, issues=issues)
             lines.append(f"| {mech} | {lane} | {states} | {claw_for_mech(mech, by_mech, config, live, issues=issues) or 'unassigned'} |")
     else:
         lines += ["", "| Mech | Sessions (host: state) | Responsible claw |", "|---|---|---|"]
         for mech in sorted(set(by_mech) | {m for m in (payload.get("canonical_mechs") or []) if isinstance(m, str) and m}):
-            states = ", ".join(f"{r.get('host_key')}: {r.get('status')}" for r in by_mech.get(mech, [])) or "none"
+            states = ", ".join(session_state_cell(r) for r in by_mech.get(mech, [])) or "none"
             lines.append(f"| {mech} | {states} | {claw_for_mech(mech, by_mech, config, live, issues=issues) or 'unassigned'} |")
     if issues:
         lines += ["", "## Backlog", "", "| Mech | Repository | Open issues | Open PRs | Drafts | Failing checks |", "|---|---|---:|---:|---:|---:|"]
@@ -1132,11 +1341,22 @@ def claw_targets(payload: dict, claw: dict) -> list:
             transport = "terminal"
         else:
             continue  # process-only rows (P123) cannot receive guarded input
+        status_str = str(r.get("status") or "")
+        flags_set = set(r.get("flags") or ())
+        prompt_label = (
+            status_str
+            if status_str.startswith(HUMAN_PROMPTS)
+            else ("subagent-approval" if "subagent-approval" in flags_set else (status_str or "PROMPT"))
+        )
         out.append({"target": target, "transport": transport,
                     "window": int(match.group(1)) if match else None, "tab": int(match.group(2)) if match else None,
                     "tmux_session": r.get("tmux_session"), "tmux_window": r.get("tmux_window"),
                     "tty": r.get("tty"), "pid": r.get("pid"), "status": r.get("status"),
-                    "has_draft": has_composer_draft(r)})
+                    "has_draft": has_composer_draft(r),
+                    "is_pasted_prompt": is_pasted_prompt_row(r),
+                    "has_agent_message": is_agent_message_row(r),
+                    "is_keystroke_prompt": is_keystroke_prompt_row(r),
+                    "keystroke_prompt_label": prompt_label})
     return out
 
 
@@ -1216,13 +1436,78 @@ def choose_target(targets: list, claw: dict, controller_session: str):
     if chosen["transport"] == "terminal" and chosen["tab"] != 1:
         return None, f"claw is in tab {chosen['tab']} of window {chosen['window']}; mac-term pastes into the selected tab, so deliver by hand"
     if chosen.get("has_draft"):
+        if chosen.get("is_pasted_prompt"):
+            return None, f"claw {chosen['target']} has a pasted prompt not running; send or clear it before pasting"
         return None, f"claw {chosen['target']} has an unsent composer draft; send or clear it before pasting"
     c_status = str(chosen.get("status") or "")
-    if c_status.startswith(HUMAN_PROMPTS):
-        return None, f"claw {chosen['target']} waits for a human ({c_status}); answer or clear the prompt before pasting"
+    if chosen.get("is_keystroke_prompt") or c_status.startswith(HUMAN_PROMPTS):
+        prompt_name = chosen.get("keystroke_prompt_label") or (
+            c_status if c_status.startswith(HUMAN_PROMPTS) else (c_status or "PROMPT")
+        )
+        return None, f"claw {chosen['target']} waits for a human ({prompt_name}); answer or clear the prompt before pasting"
+    if chosen.get("has_agent_message"):
+        return None, f"claw {chosen['target']} awaits a user reply to its last message; reply before pasting a new goal"
     if c_status.startswith("Goal hit usage limits"):
         return None, f"claw {chosen['target']} hit usage limits; decide whether to resume before pasting"
     return chosen, "resolved"
+
+
+def render_decisions_md(decisions: list, claw_summary: dict) -> str:
+    lines = ["# Decisions for the user", ""]
+    if not decisions:
+        lines.append("No user decisions required in this run.")
+        return "\n".join(lines) + "\n"
+    lines += [
+        "Recommended continuation order: (1) submit or clear pasted prompts that are not running, "
+        "(2) relaunch plain `agy` approval stalls with `agy-work -c`, (3) answer remaining TUI prompts and agent messages, "
+        "(4) restore any missing/stalled claws, then (5) canary-dispatch prepared claw briefs in `DISPATCH.md` and review merge candidates.",
+        "",
+    ]
+    buckets = [
+        ("Pasted / unsent prompts not running (press Enter or clear)",
+         lambda f: f["owner"].get("key") == "draft"),
+        ("Antigravity approvals fixable via agy-work -c",
+         lambda f: f["owner"].get("key") == "prompt" and bool((f.get("evidence") or {}).get("agy_work_fixable"))),
+        ("Interactive TUI prompts & keystrokes",
+         lambda f: f["owner"].get("key") == "prompt" and not bool((f.get("evidence") or {}).get("agy_work_fixable"))),
+        ("Agent messages awaiting your plain-text reply",
+         lambda f: f["owner"].get("key") == "agent-message"),
+        ("Supervisor stalls, missing claws & usage limits",
+         lambda f: f["owner"].get("key") in ("claws", "stalled-supervisor", "stalled-other", "usage")),
+        ("PR merges & fleet scope",
+         lambda _: True),
+    ]
+    remaining = list(decisions)
+    section_num = 0
+    for heading, predicate in buckets:
+        matched = [f for f in remaining if predicate(f)]
+        if not matched:
+            continue
+        matched_ids = {f["id"] for f in matched}
+        remaining = [f for f in remaining if f["id"] not in matched_ids]
+        section_num += 1
+        lines.append(f"## {section_num}. {heading}")
+        lines.append("")
+        for f in matched:
+            lines.append(f"- [{f['severity']}] {f['id']} {f['title']}. {f['action']}")
+        lines.append("")
+    if claw_summary:
+        ready = [k for k, v in sorted(claw_summary.items()) if v.get("target_resolved")]
+        blocked = [k for k, v in sorted(claw_summary.items()) if not v.get("target_resolved")]
+        lines.append("## Prepared claw briefs (`DISPATCH.md`)")
+        lines.append("")
+        if ready:
+            ready_text = ", ".join(
+                f"`{k}` ({claw_summary[k]['findings']} findings)" for k in ready
+            )
+            lines.append(f"- Ready for canary-first dispatch after approval: {ready_text}.")
+        if blocked:
+            blocked_text = ", ".join(
+                f"`{k}` ({claw_summary[k]['reason']})" for k in blocked
+            )
+            lines.append(f"- Waiting on target resolution or blocker clearance before dispatch: {blocked_text}.")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def plan(run_dir: Path, config: dict) -> dict:
@@ -1285,7 +1570,7 @@ def plan(run_dir: Path, config: dict) -> dict:
         summary["claws"][key] = {"findings": len(items), "targets": len(targets), "target_resolved": chosen is not None, "reason": reason}
     decisions = [f for f in findings if f["owner"]["kind"] == "user"]
     maintenance = [f for f in findings if f["owner"]["kind"] == "xmechbay"]
-    write_private_file(out / "DECISIONS.md", "# Decisions for the user\n\n" + "".join(f"- [{f['severity']}] {f['id']} {f['title']}. {f['action']}\n" for f in decisions))
+    write_private_file(out / "DECISIONS.md", render_decisions_md(decisions, summary["claws"]))
     write_private_file(out / "MAINTENANCE.md", "# XMechBay maintenance\n\n" + "".join(f"- [{f['severity']}] {f['id']} {f['title']}. {f['action']}\n" for f in maintenance))
     write_private_file(out / "DISPATCH.md", "\n".join(dispatch) + "\n")
     summary.update(user_decisions=len(decisions), maintenance=len(maintenance))
@@ -1749,17 +2034,21 @@ def synthesize_recommendations(payload: dict, resources: dict, issues: dict, fin
             open_index, open_errors, source_mode, private_terms=private_terms,
         ))
 
-    # 4. Claw dispatch readiness: composer drafts, multi-claw ambiguity, missing claws
+    # 4. Claw dispatch readiness: composer drafts, awaiting replies, multi-claw ambiguity, missing claws
     draft_claws = [f"{r.get('host_key')}:{r.get('target_short')}" for r in live_sessions
                    if r.get("role") == "claw" and isinstance(r.get("host_key"), str) and r.get("host_key") and has_composer_draft(r)]
+    reply_claws = [f"{r.get('host_key')}:{r.get('target_short')}" for r in live_sessions
+                   if r.get("role") == "claw" and isinstance(r.get("host_key"), str) and r.get("host_key") and is_agent_message_row(r)]
     claws_per_host = Counter(r["host_key"] for r in live_sessions
                              if r.get("role") == "claw" and isinstance(r.get("host_key"), str) and r.get("host_key"))
     multi_claw_hosts = {h: c for h, c in sorted(claws_per_host.items()) if c >= 2}
     dead_claws = [k for k, c in sorted(config["claws"].items()) if not claw_matching_targets(payload, c)]
-    if draft_claws or multi_claw_hosts or dead_claws:
+    if draft_claws or reply_claws or multi_claw_hosts or dead_claws:
         parts = []
         if draft_claws:
             parts.append(f"{len(draft_claws)} live claw session(s) hold unsent composer drafts")
+        if reply_claws:
+            parts.append(f"{len(reply_claws)} live claw session(s) await a user reply")
         if multi_claw_hosts:
             parts.append(f"{len(multi_claw_hosts)} host(s) run multiple concurrent claw sessions")
         if dead_claws:
@@ -1769,9 +2058,9 @@ def synthesize_recommendations(payload: dict, resources: dict, issues: dict, fin
             "R-CLAW-DISPATCH", "P1", "supervision",
             "Claw dispatch requires role-status identity and live controllable supervisor sessions",
             (f"{signal_summary}. Static window `target_hint` IDs drift when Terminal or tmux restarts, "
-             "and missing or ambiguous supervisor sessions block automated delegation."),
+             "and missing, blocked or ambiguous supervisor sessions block automated delegation."),
             "Publish machine-readable claw role/status files so `fleet-ops` can route findings and resolve targets by role rather than static window hints, retire duplicate coordinator claws, and ensure configured claws run in named tmux sessions.",
-            {"draft_claws": draft_claws, "multi_claw_hosts": multi_claw_hosts, "dead_claws": dead_claws},
+            {"draft_claws": draft_claws, "reply_claws": reply_claws, "multi_claw_hosts": multi_claw_hosts, "dead_claws": dead_claws},
             [xmb, claw_repo],
             [("label claw sessions by role",), ("route findings by claw role",), ("role and status file",), ("claw", "status file*")],
             xmb,
@@ -2009,6 +2298,33 @@ def synthesize_recommendations(payload: dict, resources: dict, issues: dict, fin
             open_index, open_errors, source_mode, private_terms=private_terms,
         ))
 
+    # 12. Antigravity sessions launched without agy-work stalling on routine approvals
+    agy_fixable_rows = [r for r in live_sessions if is_agy_work_fixable_row(r)]
+    if agy_fixable_rows:
+        agy_targets = [f"{r.get('host_key')}:{r.get('target_short')}" for r in agy_fixable_rows]
+        agy_hosts = sorted({str(r.get("host_key") or "") for r in agy_fixable_rows if r.get("host_key")})
+        agy_projects = sorted({str(r.get("project_label") or "?") for r in agy_fixable_rows})[:20]
+        recs.append(build_recommendation(
+            "R-AGY-WORK-PERMISSIONS", "P1", "supervision",
+            "Antigravity sessions launched without agy-work stall on routine tool approvals",
+            (f"{len(agy_fixable_rows)} live Antigravity session(s) across {max(len(agy_hosts), 1)} host(s) are blocked on `APPROVAL` "
+             "with `skip_permissions = false` (`agy_work_fixable`). Plain `agy` launches stop on routine approved tool calls that "
+             "`agy-work` (`--dangerously-skip-permissions` paired with standing Ask rules) handles cleanly."),
+            "Launch and resume supervised Antigravity working loops via `agy-work` / `agy-work -c` while keeping destructive and outbound operations on standing Ask rules.",
+            {"count": len(agy_fixable_rows), "hosts": agy_hosts, "targets": agy_targets[:20], "projects": agy_projects},
+            [xmb],
+            [("agy-work", "approval*"), ("agy-work", "permission*"), ("skip-permissions", "agy"), ("plain agy", "approval*")],
+            xmb,
+            "agy-permissions / fleet-ops: launch working Antigravity loops via agy-work to avoid routine approval stalls",
+            (f"### Problem\n"
+             f"`fleet-ops` observed {len(agy_fixable_rows)} live Antigravity session(s) across {max(len(agy_hosts), 1)} host(s) "
+             f"blocked on `APPROVAL` prompts with `skip_permissions = false` (`agy_work_fixable`).\n\n"
+             f"### Proposed fix\n"
+             f"- Ensure launcher helpers and operator runbooks start or resume supervised Antigravity working loops via `agy-work` / `agy-work -c`.\n"
+             f"- Preserve standing Ask rules for destructive filesystem/Git operations and outbound communications while eliminating routine read/test approval stalls."),
+            open_index, open_errors, source_mode, private_terms=private_terms,
+        ))
+
     recs.sort(key=lambda r: (PRIORITY_ORDER.get(r["priority"], 9), r["theme"], r["rule"]))
     for idx, rec in enumerate(recs, 1):
         rec["id"] = f"R{idx:02d}"
@@ -2148,9 +2464,11 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     obs = sub.add_parser("observe", help="collect sessions, resources and backlog; write findings and REPORT.md")
     obs.add_argument("--out", type=Path, help="run directory (default .local/fleet-ops/runs/<UTC>)")
-    obs.add_argument("--snapshot", type=Path, help="offline fleet-session-status fixture instead of live collection")
-    obs.add_argument("--status-json", type=Path, help="use a saved /api/status payload")
-    obs.add_argument("--dashboard-url", help="read sessions from a running dashboard, e.g. http://127.0.0.1:8765")
+    obs_src = obs.add_mutually_exclusive_group()
+    obs_src.add_argument("--snapshot", type=Path, help="offline fleet-session-status fixture instead of live collection")
+    obs_src.add_argument("--status-json", type=Path, help="use a saved /api/status payload")
+    obs_src.add_argument("--dashboard-html", type=Path, help="extract sessions from a rendered dashboard HTML file (e.g. dashboard-latest.html)")
+    obs_src.add_argument("--dashboard-url", help="read sessions from a running dashboard, e.g. http://127.0.0.1:8765")
     obs.add_argument("--resources-json", type=Path, help="use saved probe results {host: probe} instead of probing")
     obs.add_argument("--issues-json", type=Path, help="use saved backlog data instead of querying GitHub")
     obs.add_argument("--no-issues", action="store_true", help="skip the GitHub backlog")

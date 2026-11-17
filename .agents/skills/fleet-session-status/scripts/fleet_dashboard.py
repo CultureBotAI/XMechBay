@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -50,6 +51,7 @@ from fleet_view import (
     classify_session_role,
     duration,
     host_symbol,
+    is_m1_host,
     mech_color_key,
     private_text,
     session_symbols,
@@ -192,10 +194,36 @@ def _parse_duration_seconds(text):
     return int(total) if matched and math.isfinite(total) else -1
 
 
-def _human_block_metadata(status, raw_flags, is_stale_cached):
+def _default_keystroke_hint(status, flag_set):
+    if "subagent-approval" in flag_set:
+        return "ctrl+k approve"
+    if "approval-review" in flag_set:
+        return "Approve in TUI · esc interrupts"
+    defaults = {
+        "APPROVAL": "1 / y / Enter approve · 2 / n / esc deny",
+        "QUESTION": "1–N or ↑/↓ + Enter",
+        "SIGN-IN": "Enter / complete browser sign-in",
+        "TRUST-PROMPT": "1 / Enter trust · esc cancel",
+        "UPDATE-PROMPT": "Enter update or skip",
+    }
+    return defaults.get(status, "Inspect terminal to respond")
+
+
+def _human_block_metadata(raw_row, status, raw_flags, is_stale_cached):
+    empty = {
+        "kind": None,
+        "action_label": None,
+        "keystroke_hint": None,
+        "agy_work_fixable": False,
+        "agy_work_status": "not_applicable",
+        "agy_work_hint": None,
+        "is_pasted_prompt": False,
+    }
     if is_stale_cached:
-        return None, None
+        return empty
     flag_set = set(raw_flags or ())
+    agent = str(raw_row.get("agent") or "?")
+    skip_perm = raw_row.get("skip_permissions")
     if status in HUMAN_PROMPT_STATES or "subagent-approval" in flag_set:
         if "subagent-approval" in flag_set:
             label = "Approve subagent command"
@@ -213,13 +241,82 @@ def _human_block_metadata(status, raw_flags, is_stale_cached):
             label = "Dismiss CLI update prompt"
         else:
             label = "Respond to prompt"
-        return "prompt", label
-    if "draft" in flag_set:
-        return "draft", "Send or clear unsent draft"
-    return None, None
+        raw_ks = raw_row.get("keystroke_hint")
+        ks_hint = private_text(raw_ks, 64) if isinstance(raw_ks, str) and raw_ks.strip() else _default_keystroke_hint(status, flag_set)
+        agy_fixable = False
+        agy_status = "not_applicable"
+        agy_hint = None
+        if agent == "agy" and status == "APPROVAL":
+            if raw_row.get("agy_work_fixable") is True or "agy-work-fixable" in flag_set or skip_perm is False:
+                agy_fixable = True
+                agy_status = "fixable"
+                agy_hint = "Plain agy without skip-permissions — relaunch with agy-work -c to bypass routine approvals"
+            elif raw_row.get("agy_work_status") == "already_enabled" or "agy-work-active" in flag_set or skip_perm is True:
+                agy_fixable = False
+                agy_status = "already_enabled"
+                agy_hint = "Already running agy-work (--dangerously-skip-permissions); stopped on a standing Ask rule"
+            else:
+                agy_fixable = False
+                agy_status = "unverified"
+        return {
+            "kind": "keystroke",
+            "action_label": label,
+            "keystroke_hint": ks_hint,
+            "agy_work_fixable": agy_fixable,
+            "agy_work_status": agy_status,
+            "agy_work_hint": agy_hint,
+            "is_pasted_prompt": False,
+        }
+    if "agent-message" in flag_set or bool(raw_row.get("agent_message")):
+        return {
+            "kind": "agent_message",
+            "action_label": "Agent message needs reply",
+            "keystroke_hint": "Type reply + Enter",
+            "agy_work_fixable": False,
+            "agy_work_status": "not_applicable",
+            "agy_work_hint": None,
+            "is_pasted_prompt": False,
+        }
+    if "draft" in flag_set or "pasted-prompt" in flag_set:
+        is_pasted = bool("pasted-prompt" in flag_set or raw_row.get("is_pasted_prompt"))
+        return {
+            "kind": "pasted_prompt",
+            "action_label": "Pasted prompt — NOT running" if is_pasted else "Unsent prompt — NOT running",
+            "keystroke_hint": "Press Enter to run · clear to discard",
+            "agy_work_fixable": False,
+            "agy_work_status": "not_applicable",
+            "agy_work_hint": None,
+            "is_pasted_prompt": is_pasted,
+        }
+    return empty
 
 
-def _enrich_session(raw_row, host_key, host_label, host_stale, role_overrides, cached_age_text=None):
+_TTY_NAME_RE = re.compile(r"^tty[A-Za-z0-9]{1,12}$")
+_TMUX_SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+_TMUX_PANE_ID_RE = re.compile(r"^%\d{1,8}$")
+
+
+def _normalize_tty_name(value):
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if cleaned.startswith("/dev/"):
+        cleaned = cleaned[5:]
+    if _TTY_NAME_RE.fullmatch(cleaned):
+        return cleaned
+    return None
+
+
+def _enrich_session(
+    raw_row,
+    host_key,
+    host_label,
+    host_stale,
+    role_overrides,
+    cached_age_text=None,
+    host_source="ssh",
+    mode="live",
+):
     role, raw_project, raw_stream = _resolve_row_role(raw_row, role_overrides)
     project_label = private_text(raw_project, 48)
     stream_label = private_text(raw_stream, 48) if raw_stream else None
@@ -235,6 +332,23 @@ def _enrich_session(raw_row, host_key, host_label, host_stale, role_overrides, c
         loc_short = "T" + str(target["window_id"]) + "/" + str(target.get("tab", 1))
     else:
         loc_short = "P" + str(raw_row.get("pid") or "?")
+
+    raw_win_id = target.get("window_id")
+    window_id = raw_win_id if isinstance(raw_win_id, int) and not isinstance(raw_win_id, bool) and raw_win_id >= 1 else None
+    raw_tab = target.get("tab")
+    tab_index = raw_tab if isinstance(raw_tab, int) and not isinstance(raw_tab, bool) and raw_tab >= 1 else None
+    transport_str = str(target.get("transport") or "process")
+    norm_tty = _normalize_tty_name(raw_row.get("tty"))
+    raw_pane = target.get("pane")
+    tmux_pane = raw_pane.strip() if isinstance(raw_pane, str) and _TMUX_PANE_ID_RE.fullmatch(raw_pane.strip()) else None
+
+    raw_lookup_sessions = []
+    raw_primary_tmux = target.get("tmux_session")
+    if isinstance(raw_primary_tmux, str) and _TMUX_SESSION_NAME_RE.fullmatch(raw_primary_tmux):
+        raw_lookup_sessions.append(raw_primary_tmux)
+    for raw_item in (target.get("tmux_sessions") or [])[:64]:
+        if isinstance(raw_item, str) and _TMUX_SESSION_NAME_RE.fullmatch(raw_item) and raw_item not in raw_lookup_sessions:
+            raw_lookup_sessions.append(raw_item)
 
     sid = raw_row.get("session_id")
     launch_short = sid[:8] if isinstance(sid, str) and len(sid) >= 8 else None
@@ -270,16 +384,42 @@ def _enrich_session(raw_row, host_key, host_label, host_stale, role_overrides, c
     ctx_num = float(ctx_pct) if isinstance(ctx_pct, (int, float)) and not isinstance(ctx_pct, bool) and math.isfinite(ctx_pct) else 999.0
 
     memberships = [private_text(item, 48) for item in (target.get("tmux_sessions") or [])[:8] if isinstance(item, str)]
-    raw_flags_list = [item for item in (raw_row.get("flags") or [])[:8] if isinstance(item, str)]
+    raw_flags_list = [item for item in (raw_row.get("flags") or [])[:16] if isinstance(item, str)]
     flags = [private_text(item, 32) for item in raw_flags_list]
     errors = _error_codes(raw_row.get("errors", []))
     status_str = str(raw_row.get("status") or "UNKNOWN")
-    human_block_kind, human_action_label = _human_block_metadata(status_str, raw_flags_list, is_stale_cached)
+    hb_meta = _human_block_metadata(raw_row, status_str, raw_flags_list, is_stale_cached)
+    composer_text = (
+        private_text(raw_row["composer_text"], 120)
+        if not is_stale_cached and isinstance(raw_row.get("composer_text"), str) and raw_row["composer_text"].strip()
+        else None
+    )
+    agent_message = (
+        private_text(raw_row["agent_message"], 120)
+        if not is_stale_cached and isinstance(raw_row.get("agent_message"), str) and raw_row["agent_message"].strip()
+        else None
+    )
+
+    is_m1_local = (
+        mode == "live"
+        and host_source == "local"
+        and not stale
+        and is_m1_host(host_key, host_label)
+        and symbols["mac"].get("glyph") == "M1"
+    )
+    can_focus_terminal = bool(
+        is_m1_local
+        and (
+            (transport_str == "terminal" and norm_tty is not None)
+            or (transport_str == "tmux" and bool(raw_lookup_sessions) and (tmux_pane is not None or norm_tty is not None))
+        )
+    )
 
     return {
         "row_id": host_key + ":" + str(raw_row.get("pid") or loc_short) + ":" + str(raw_row.get("started_at") or ""),
         "host_key": host_key,
         "host_label": private_text(host_label, 64),
+        "host_source": host_source,
         "stale_cached": is_stale_cached,
         "cached_age_text": cached_age_text,
         "role": role,
@@ -289,10 +429,15 @@ def _enrich_session(raw_row, host_key, host_label, host_stale, role_overrides, c
         "color_key": mech_color_key(project_label, role),
         "target_short": private_text(loc_short, 24),
         "target_full": private_text(target_label(raw_row), 48),
-        "transport": str(target.get("transport") or "process"),
+        "transport": transport_str,
+        "window_id": window_id,
+        "tab_index": tab_index,
+        "can_focus_terminal": can_focus_terminal,
+        "tmux_pane": tmux_pane,
         "tmux_session": private_text(target.get("tmux_session") or "", 40) if target.get("tmux_session") else None,
         "tmux_window": private_text(target.get("window") or "", 40) if target.get("window") else None,
         "tmux_sessions": memberships,
+        "tmux_lookup_sessions": raw_lookup_sessions,
         "pid": raw_row.get("pid") if isinstance(raw_row.get("pid"), int) else None,
         "tty": private_text(raw_row.get("tty") or "", 24),
         "launch_short": launch_short,
@@ -301,8 +446,15 @@ def _enrich_session(raw_row, host_key, host_label, host_stale, role_overrides, c
         "model": private_text(raw_row.get("model") or "", 64) if raw_row.get("model") else None,
         "model_compact": private_text(raw_row.get("model_compact") or "", 36) if raw_row.get("model_compact") else None,
         "status": status_str,
-        "human_block_kind": human_block_kind,
-        "human_action_label": human_action_label,
+        "human_block_kind": hb_meta["kind"],
+        "human_action_label": hb_meta["action_label"],
+        "keystroke_hint": hb_meta["keystroke_hint"],
+        "agy_work_fixable": hb_meta["agy_work_fixable"],
+        "agy_work_status": hb_meta["agy_work_status"],
+        "agy_work_hint": hb_meta["agy_work_hint"],
+        "is_pasted_prompt": hb_meta["is_pasted_prompt"],
+        "composer_text": composer_text,
+        "agent_message": agent_message,
         "wait_seconds": wait_seconds,
         "up_text": duration(age_sec),
         "up_seconds": up_num,
@@ -329,8 +481,10 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
     changed_now = 0
     live_sessions_count = 0
     cached_sessions_count = 0
-    human_prompt_count = 0
-    human_draft_count = 0
+    human_keystroke_count = 0
+    human_agy_work_count = 0
+    human_message_count = 0
+    human_pasted_count = 0
     mechs_present = set()
     mechs_active = set()
 
@@ -399,18 +553,32 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
 
         host_state_dots = Counter()
         host_roles = Counter()
-        host_human_prompts = 0
-        host_human_drafts = 0
+        host_human_keystrokes = 0
+        host_human_agy_work = 0
+        host_human_messages = 0
+        host_human_pasted = 0
         for raw_row in host_raw_sessions:
             if not isinstance(raw_row, dict):
                 continue
             enriched = _enrich_session(
-                raw_row, key, label, (not reachable or stale_snap), role_overrides, cached_age_text=cached_age_text
+                raw_row,
+                key,
+                label,
+                (not reachable or stale_snap),
+                role_overrides,
+                cached_age_text=cached_age_text,
+                host_source=source,
+                mode=mode,
             )
             sessions.append(enriched)
             all_role_counts[enriched["role"]] += 1
             host_roles[enriched["role"]] += 1
-            dot = STATE_DISPLAY.get(enriched["status"], STATE_DISPLAY["UNKNOWN"]).split()[0]
+            if not enriched["stale_cached"] and enriched["human_block_kind"] == "pasted_prompt":
+                dot = "🟠"
+            elif not enriched["stale_cached"] and enriched["human_block_kind"] == "agent_message":
+                dot = "🟣"
+            else:
+                dot = STATE_DISPLAY.get(enriched["status"], STATE_DISPLAY["UNKNOWN"]).split()[0]
             host_state_dots[dot] += 1
 
             if enriched["stale_cached"]:
@@ -424,23 +592,42 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
 
             live_sessions_count += 1
             live_role_counts[enriched["role"]] += 1
-            tone_counts[enriched["symbols"]["state"]["tone"]] += 1
+            hb_kind = enriched["human_block_kind"]
+            st_tone = enriched["symbols"]["state"]["tone"]
+            if hb_kind == "keystroke":
+                tone_counts["yellow"] += 1
+            elif hb_kind in {"agent_message", "pasted_prompt"}:
+                if st_tone == "red":
+                    tone_counts["red"] += 1
+            else:
+                tone_counts[st_tone] += 1
             if (raw_row.get("delta") or {}).get("kind") == "changed":
                 changed_now += 1
-
-            hb_kind = enriched["human_block_kind"]
-            if hb_kind in {"prompt", "draft"}:
-                if hb_kind == "prompt":
-                    host_human_prompts += 1
-                    human_prompt_count += 1
+            if hb_kind in {"keystroke", "agent_message", "pasted_prompt"}:
+                if hb_kind == "keystroke":
+                    host_human_keystrokes += 1
+                    human_keystroke_count += 1
+                    if enriched["agy_work_fixable"]:
+                        host_human_agy_work += 1
+                        human_agy_work_count += 1
+                elif hb_kind == "agent_message":
+                    host_human_messages += 1
+                    human_message_count += 1
                 else:
-                    host_human_drafts += 1
-                    human_draft_count += 1
+                    host_human_pasted += 1
+                    human_pasted_count += 1
                 human_input.append({
                     "row_id": enriched["row_id"],
                     "kind": hb_kind,
                     "status": enriched["status"],
                     "action_label": enriched["human_action_label"],
+                    "keystroke_hint": enriched["keystroke_hint"],
+                    "agy_work_fixable": enriched["agy_work_fixable"],
+                    "agy_work_status": enriched["agy_work_status"],
+                    "agy_work_hint": enriched["agy_work_hint"],
+                    "is_pasted_prompt": enriched["is_pasted_prompt"],
+                    "composer_text": enriched["composer_text"],
+                    "agent_message": enriched["agent_message"],
                     "host_key": key,
                     "host_label": enriched["host_label"],
                     "mac": mac_sym,
@@ -450,6 +637,7 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
                     "color_key": enriched["color_key"],
                     "target_short": enriched["target_short"],
                     "target_full": enriched["target_full"],
+                    "can_focus_terminal": enriched["can_focus_terminal"],
                     "tmux_session": enriched["tmux_session"],
                     "tmux_window": enriched["tmux_window"],
                     "cli": enriched["symbols"]["cli"],
@@ -507,7 +695,7 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
                 "row_id": None,
             })
 
-        dot_order = ("🟢", "🟡", "🟠", "🔴", "🔵", "⚪", "⚫")
+        dot_order = ("🟢", "🟡", "🟣", "🟠", "🔴", "🔵", "⚪", "⚫")
         dot_summary = [{"dot": d, "count": host_state_dots[d]} for d in dot_order if host_state_dots[d]]
 
         inv_state = _inventory_state(coverage) if reachable else "unreachable"
@@ -522,6 +710,7 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
             if isinstance(raw_load, (int, float)) and not isinstance(raw_load, bool) and math.isfinite(raw_load) and raw_load >= 0
             else None
         )
+        host_human_total = host_human_keystrokes + host_human_messages + host_human_pasted
         host_cards.append({
             "key": key,
             "label": private_text(label, 64),
@@ -534,9 +723,13 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
             "session_count": len(host_raw_sessions) if reachable else None,
             "screens_text": (str(screens_read) + "/" + str(sessions_seen)) if reachable and screens_read is not None else "—",
             "dot_summary": dot_summary,
-            "human_prompt_count": host_human_prompts,
-            "human_draft_count": host_human_drafts,
-            "human_total_count": host_human_prompts + host_human_drafts,
+            "human_keystroke_count": host_human_keystrokes,
+            "human_agy_work_count": host_human_agy_work,
+            "human_message_count": host_human_messages,
+            "human_pasted_count": host_human_pasted,
+            "human_prompt_count": host_human_keystrokes,
+            "human_draft_count": host_human_pasted,
+            "human_total_count": host_human_total,
             "role_counts": {r: host_roles.get(r, 0) for r in ("mechbay", "claw", "mech", "other")},
             "health": {
                 "status": h_status,
@@ -556,10 +749,11 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
             "last_reachable": last_meta,
         })
 
+    kind_order = {"keystroke": 0, "agent_message": 1, "pasted_prompt": 2}
     sorted_human_input = sorted(
         human_input,
         key=lambda item: (
-            0 if item["kind"] == "prompt" else 1,
+            kind_order.get(item["kind"], 3),
             item["state"]["rank"],
             -item["wait_seconds"],
             item["mac"]["rank"],
@@ -567,6 +761,8 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
             item["target_short"],
         ),
     )[:64]
+
+    human_total_count = human_keystroke_count + human_message_count + human_pasted_count
 
     return {
         "schema_version": 1,
@@ -583,9 +779,13 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
             "hosts_unreachable": sum(1 for h in host_cards if not h["reachable"]),
             "live_sessions": live_sessions_count,
             "cached_sessions": cached_sessions_count,
-            "human_prompt_count": human_prompt_count,
-            "human_draft_count": human_draft_count,
-            "human_total_count": human_prompt_count + human_draft_count,
+            "human_keystroke_count": human_keystroke_count,
+            "human_agy_work_count": human_agy_work_count,
+            "human_message_count": human_message_count,
+            "human_pasted_count": human_pasted_count,
+            "human_prompt_count": human_keystroke_count,
+            "human_draft_count": human_pasted_count,
+            "human_total_count": human_total_count,
             "human_input": sorted_human_input,
             "role_counts_live": {r: live_role_counts.get(r, 0) for r in ("mechbay", "claw", "mech", "other")},
             "role_counts_all": {r: all_role_counts.get(r, 0) for r in ("mechbay", "claw", "mech", "other")},
@@ -986,6 +1186,10 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     margin-bottom: 11px;
     box-shadow: var(--shadow);
   }
+  .human-input-box.has-messages-only {
+    border-color: var(--tone-purple-bd);
+    border-left-color: #7c3aed;
+  }
   .human-input-box.has-drafts-only {
     border-color: var(--tone-orange-bd);
     border-left-color: #ea580c;
@@ -1012,7 +1216,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     justify-content: space-between;
     gap: 8px 12px;
     flex-wrap: wrap;
-    margin-bottom: 9px;
+    margin-bottom: 8px;
   }
   .human-input-title-wrap {
     display: flex;
@@ -1034,6 +1238,11 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     color: var(--tone-yellow-fg);
     border: 1px solid var(--tone-yellow-bd);
   }
+  .human-input-badge.is-message-only {
+    background: var(--tone-purple-bg);
+    color: var(--tone-purple-fg);
+    border-color: var(--tone-purple-bd);
+  }
   .human-input-badge.is-draft-only {
     background: var(--tone-orange-bg);
     color: var(--tone-orange-fg);
@@ -1048,9 +1257,48 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     padding: 5px 11px;
     font-size: 12px;
   }
+  .human-input-cats {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 9px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  .hic-cat-chip {
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 680;
+    padding: 3.5px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--line-strong);
+    background: var(--surface-2);
+    color: var(--ink);
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s;
+  }
+  .hic-cat-chip:hover {
+    border-color: var(--accent);
+  }
+  .hic-cat-chip[aria-pressed="true"] {
+    background: var(--ink);
+    color: var(--card);
+    border-color: var(--ink);
+  }
+  .hic-cat-chip.is-agy-chip {
+    border-color: var(--tone-teal-bd);
+    background: var(--tone-teal-bg);
+    color: var(--tone-teal-fg);
+  }
+  .hic-cat-chip.is-agy-chip[aria-pressed="true"] {
+    background: var(--tone-teal-fg);
+    color: var(--card);
+    border-color: var(--tone-teal-fg);
+  }
   .human-input-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
     gap: 8px;
   }
   .human-input-card {
@@ -1069,6 +1317,11 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     gap: 5px;
     transition: background 0.12s, border-color 0.12s, transform 0.08s;
   }
+  .human-input-card.is-agent-message {
+    border-color: var(--tone-purple-bd);
+    border-left-color: #7c3aed;
+  }
+  .human-input-card.is-pasted,
   .human-input-card.is-draft {
     border-color: var(--tone-orange-bd);
     border-left-color: #ea580c;
@@ -1086,6 +1339,13 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     align-items: center;
     justify-content: space-between;
     gap: 6px;
+    flex-wrap: wrap;
+  }
+  .hic-top-left {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex-wrap: wrap;
   }
   .hic-action {
     font-size: 11.5px;
@@ -1096,10 +1356,62 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     color: var(--tone-yellow-fg);
     border: 1px solid var(--tone-yellow-bd);
   }
+  .human-input-card.is-agent-message .hic-action {
+    background: var(--tone-purple-bg);
+    color: var(--tone-purple-fg);
+    border-color: var(--tone-purple-bd);
+  }
+  .human-input-card.is-pasted .hic-action,
   .human-input-card.is-draft .hic-action {
     background: var(--tone-orange-bg);
     color: var(--tone-orange-fg);
     border-color: var(--tone-orange-bd);
+  }
+  .hic-agy-badge {
+    font-size: 11px;
+    font-weight: 760;
+    padding: 2px 7px;
+    border-radius: 6px;
+    background: var(--tone-teal-bg);
+    color: var(--tone-teal-fg);
+    border: 1px solid var(--tone-teal-bd);
+    white-space: nowrap;
+  }
+  .hic-agy-active-badge {
+    font-size: 10.5px;
+    font-weight: 680;
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: var(--tone-slate-bg);
+    color: var(--tone-slate-fg);
+    border: 1px solid var(--tone-slate-bd);
+    white-space: nowrap;
+  }
+  .hic-key-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex-wrap: wrap;
+  }
+  .hic-keys {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1.5px 6.5px;
+    border-radius: 5px;
+    background: var(--card);
+    color: var(--ink);
+    border: 1px solid var(--line-strong);
+  }
+  .hic-agy-cmd {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 10.5px;
+    font-weight: 750;
+    padding: 1.5px 6px;
+    border-radius: 5px;
+    background: var(--tone-teal-bg);
+    color: var(--tone-teal-fg);
+    border: 1px solid var(--tone-teal-bd);
   }
   .hic-wait {
     font-size: 11.5px;
@@ -1184,6 +1496,12 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   }
   .host-card.has-human-input {
     border-color: var(--tone-yellow-bd);
+  }
+  .host-card.has-agent-message {
+    border-color: var(--tone-purple-bd);
+  }
+  .host-card.has-drafts-only {
+    border-color: var(--tone-orange-bd);
   }
   .host-head {
     display: flex;
@@ -1319,6 +1637,15 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   .rollup-tile.has-human-input .lbl,
   .rollup-tile.has-human-input .val {
     color: var(--tone-yellow-fg);
+  }
+  .rollup-tile.has-agent-message {
+    border-color: var(--tone-purple-bd);
+    border-left: 4px solid #7c3aed;
+    background: var(--tone-purple-bg);
+  }
+  .rollup-tile.has-agent-message .lbl,
+  .rollup-tile.has-agent-message .val {
+    color: var(--tone-purple-fg);
   }
   .rollup-tile.has-drafts-only {
     border-color: var(--tone-orange-bd);
@@ -1537,6 +1864,15 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   tr.session-row.is-human-prompt td:first-child {
     box-shadow: inset 4px 0 0 #eab308;
   }
+  tr.session-row.is-human-message {
+    background: rgba(124, 58, 237, 0.08);
+  }
+  tr.session-row.is-human-message:hover {
+    background: rgba(124, 58, 237, 0.14);
+  }
+  tr.session-row.is-human-message td:first-child {
+    box-shadow: inset 4px 0 0 #7c3aed;
+  }
   tr.session-row.is-human-draft {
     background: rgba(234, 88, 12, 0.08);
   }
@@ -1603,6 +1939,39 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     background: var(--surface-2);
     color: var(--muted);
     border: 1px solid var(--line);
+  }
+  .target-tag.is-terminal-link,
+  .hic-loc.is-terminal-link {
+    color: var(--tone-purple-fg);
+    border-color: var(--tone-purple-bd);
+    background: var(--tone-purple-bg);
+    font-weight: 720;
+  }
+  tr.session-row.is-m1-focusable:hover .target-tag.is-terminal-link,
+  .human-input-card.is-m1-focusable:hover .hic-loc.is-terminal-link {
+    border-color: var(--accent);
+  }
+  .row-expand-btn {
+    flex: none;
+    font: inherit;
+    font-size: 11px;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 4px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .row-expand-btn:hover {
+    color: var(--ink);
+    border-color: var(--accent);
+    background: var(--surface-2);
+  }
+  .detail-focus-btn {
+    margin-top: 3px;
+    font-size: 11.5px;
+    padding: 3px 9px;
   }
 
   /* Colored symbol pills */
@@ -1832,7 +2201,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       <span><b>State:</b> 🟢 ◎ goal · 🟢 ▶ work · 🟡 ! approve · 🟡 ? question · 🟡 🔑/🛡/↑ sign-in/trust/update · 🟠 ⏸ paused · 🔴 ✖ stalled · 🔴 ⊘ quota · 🔵 ✓ achieved · ⚪ ○ idle · ⚫ ? unknown</span>
     </div>
     <div class="legend-row">
-      <span><b>Guard:</b> 🟢 ● clear · 🟡 ▲ human prompt · 🟠 ✎ draft · 🔴 ⚡ retry/error · ⚫ ◌ blind</span>
+      <span><b>Guard:</b> 🟢 ● clear · 🟡 ⚡ agy-work fixable · 🟡 ▲ keystroke prompt · 🟣 💬 agent reply needed · 🟠 📋 pasted not running · 🟠 ✎ unsent draft · 🔴 ⚡ retry/error · ⚫ ◌ blind</span>
       <span><b>Δ:</b> 🟢 ◆ Δnow · 🔵 ◈ &lt;15m · ⚪ ◇ 15m–2h · 🟠 ◌ &ge;2h · ⚫ · first/Δ?</span>
       <span><b>Ctx:</b> 🟢 &ge;50% · 🟡 20–49% · 🔴 &lt;20%</span>
       <span><b>Ports:</b> 🟢 &lt;100 · 🟡 100–499 · 🟠 500–999 · 🔴 &ge;1000!</span>
@@ -1840,7 +2209,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       <span><b>Keys:</b> <code>i</code> Needs Input · <code>/</code> search · <code>r</code> Update</span>
     </div>
     <div class="legend-row">
-      <span><b>Observation contract:</b> <code>~</code> marks screen-reported text, never verified repository completion. <code>launch#</code> is shortened argv evidence; reconfirm current session ID before control. Clicking <b>Update</b> runs read-only probes only (zero input sent to sessions).</span>
+      <span><b>Observation contract:</b> <code>~</code> marks screen-reported text, never verified repository completion. <code>launch#</code> is shortened argv evidence; reconfirm current session ID before control. Clicking <b>Update</b> runs read-only probes only; clicking an <b>M1</b> session row switches local <code>Terminal.app</code> to that window and tab (zero input sent; non-M1 rows toggle details only).</span>
     </div>
   </footer>
 </div>
@@ -1856,6 +2225,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   let payload = JSON.parse(document.getElementById("initial-payload").textContent);
   let viewMode = "role";
   let stateFilter = "all";
+  let inputSubFilter = "all";
   let macFilter = "all";
   let searchQuery = "";
   let includeCached = true;
@@ -1867,6 +2237,8 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   const expandedRows = new Set();
 
   let refreshInFlight = false;
+  let focusInFlight = false;
+  let pendingPostReloadFocusRowId = null;
   let autoIntervalSec = 0;
   let nextAutoAt = 0;
   let themeMode = "auto";
@@ -1935,22 +2307,85 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
   }
 
-  function humanInputCounts() {
+  function humanInputCounts(forHostKey) {
+    const scopeHost = (typeof forHostKey === "string" && forHostKey) ? forHostKey : "all";
+    if (scopeHost !== "all") {
+      const hostObj = (payload.hosts || []).find(function(h) { return h.key === scopeHost; });
+      if (hostObj) {
+        const hk = typeof hostObj.human_keystroke_count === "number"
+          ? hostObj.human_keystroke_count
+          : (typeof hostObj.human_prompt_count === "number" ? hostObj.human_prompt_count : 0);
+        const ha = typeof hostObj.human_agy_work_count === "number" ? hostObj.human_agy_work_count : 0;
+        const hm = typeof hostObj.human_message_count === "number" ? hostObj.human_message_count : 0;
+        const hp = typeof hostObj.human_pasted_count === "number"
+          ? hostObj.human_pasted_count
+          : (typeof hostObj.human_draft_count === "number" ? hostObj.human_draft_count : 0);
+        const ht = typeof hostObj.human_total_count === "number" ? hostObj.human_total_count : (hk + hm + hp);
+        return {
+          keystrokes: hk,
+          prompts: hk,
+          agyWork: ha,
+          messages: hm,
+          pasted: hp,
+          drafts: hp,
+          total: ht,
+          hostLabel: hostObj.label || scopeHost
+        };
+      }
+    }
     const s = payload.stats || {};
     const tc = s.tone_counts || {};
-    const prompts = typeof s.human_prompt_count === "number" ? s.human_prompt_count : (tc.input || 0);
-    const drafts = typeof s.human_draft_count === "number" ? s.human_draft_count : 0;
-    const total = typeof s.human_total_count === "number" ? s.human_total_count : (prompts + drafts);
-    return {prompts: prompts, drafts: drafts, total: total};
+    const keystrokes = typeof s.human_keystroke_count === "number"
+      ? s.human_keystroke_count
+      : (typeof s.human_prompt_count === "number" ? s.human_prompt_count : (tc.input || 0));
+    const agyWork = typeof s.human_agy_work_count === "number" ? s.human_agy_work_count : 0;
+    const messages = typeof s.human_message_count === "number" ? s.human_message_count : 0;
+    const pasted = typeof s.human_pasted_count === "number"
+      ? s.human_pasted_count
+      : (typeof s.human_draft_count === "number" ? s.human_draft_count : 0);
+    const total = typeof s.human_total_count === "number"
+      ? s.human_total_count
+      : (keystrokes + messages + pasted);
+    return {
+      keystrokes: keystrokes,
+      prompts: keystrokes,
+      agyWork: agyWork,
+      messages: messages,
+      pasted: pasted,
+      drafts: pasted,
+      total: total,
+      hostLabel: null
+    };
   }
 
-  function setStateFilter(nextFilter) {
+  function setStateFilter(nextFilter, nextSubFilter) {
     stateFilter = nextFilter;
+    inputSubFilter = (nextFilter === "input" && nextSubFilter) ? nextSubFilter : "all";
     for (const b of document.querySelectorAll("[data-filter]")) {
       b.setAttribute("aria-pressed", String(b.getAttribute("data-filter") === stateFilter));
     }
     renderHumanInputBanner();
     renderMain();
+  }
+
+  function setInputSubFilter(sub) {
+    if (stateFilter === "input" && inputSubFilter === sub && sub !== "all") {
+      setStateFilter("input", "all");
+    } else if (sub === "all" && stateFilter !== "input") {
+      setStateFilter("input", "all");
+    } else if (sub === "all" && stateFilter === "input" && inputSubFilter === "all") {
+      setStateFilter("all");
+    } else {
+      setStateFilter("input", sub);
+    }
+  }
+
+  function isRowM1Focusable(row) {
+    if (!row || STATIC_EXPORT || window.location.protocol === "file:") return false;
+    if (!payload || payload.mode !== "live") return false;
+    if (row.stale_cached || !row.can_focus_terminal) return false;
+    const glyph = row.symbols && row.symbols.mac ? row.symbols.mac.glyph : (row.mac ? row.mac.glyph : "");
+    return glyph === "M1";
   }
 
   function jumpToSessionRow(rowId) {
@@ -1974,6 +2409,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     if (sess && !matchesFilters(sess)) {
       macFilter = "all";
       stateFilter = "all";
+      inputSubFilter = "all";
       searchQuery = "";
       const searchInput = document.getElementById("filter-search");
       if (searchInput) searchInput.value = "";
@@ -1990,21 +2426,27 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     if (target && typeof target.scrollIntoView === "function") {
       target.scrollIntoView({behavior: "smooth", block: "center"});
     }
+    if (sess && isRowM1Focusable(sess)) {
+      focusTerminalSession(sess);
+    }
   }
 
   function updateHeader() {
-    const counts = humanInputCounts();
-    if (counts.prompts > 0) {
+    const counts = humanInputCounts("all");
+    const scopedCounts = macFilter === "all" ? counts : humanInputCounts(macFilter);
+    if (counts.keystrokes > 0) {
       document.title = "🟡 (" + counts.total + " need input) XMechBay · Fleet Dashboard";
-    } else if (counts.drafts > 0) {
-      document.title = "🟠 (" + counts.drafts + " draft) XMechBay · Fleet Dashboard";
+    } else if (counts.messages > 0) {
+      document.title = "🟣 (" + counts.total + " need reply) XMechBay · Fleet Dashboard";
+    } else if (counts.pasted > 0) {
+      document.title = "🟠 (" + counts.pasted + " pasted not running) XMechBay · Fleet Dashboard";
     } else {
       document.title = "XMechBay · Local Fleet Session Dashboard";
     }
 
     for (const b of document.querySelectorAll("[data-filter]")) {
       if (b.getAttribute("data-filter") === "input") {
-        b.textContent = counts.total > 0 ? ("🟡 Needs Input (" + counts.total + ")") : "🟡 Needs Input";
+        b.textContent = scopedCounts.total > 0 ? ("🟡 Needs Input (" + scopedCounts.total + ")") : "🟡 Needs Input";
       }
     }
 
@@ -2032,20 +2474,59 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       " · " + (payload.duration_ms || 0) + " ms";
   }
 
+  function matchesSpotlightItemSubFilter(item) {
+    if (stateFilter !== "input" || inputSubFilter === "all") return true;
+    const kind = item.kind === "prompt" ? "keystroke" : (item.kind === "draft" ? "pasted_prompt" : item.kind);
+    if (inputSubFilter === "keystroke") return kind === "keystroke";
+    if (inputSubFilter === "agy_work") return kind === "keystroke" && Boolean(item.agy_work_fixable);
+    if (inputSubFilter === "agent_message") return kind === "agent_message";
+    if (inputSubFilter === "pasted_prompt") return kind === "pasted_prompt";
+    return true;
+  }
+
   function renderHumanInputBanner() {
     const box = document.getElementById("human-input-banner");
     if (!box) return;
     const s = payload.stats || {};
-    const items = Array.isArray(s.human_input) ? s.human_input : [];
-    const counts = humanInputCounts();
+    const allItems = Array.isArray(s.human_input) ? s.human_input : [];
+    const items = macFilter === "all"
+      ? allItems
+      : allItems.filter(function(item) { return item.host_key === macFilter; });
+    const counts = humanInputCounts(macFilter);
+    const fleetCounts = macFilter === "all" ? counts : humanInputCounts("all");
 
     if (!items.length && counts.total === 0) {
       box.className = "human-input-box is-clear";
+      if (macFilter !== "all") {
+        const hostName = counts.hostLabel || macFilter;
+        const otherNote = fleetCounts.total > 0
+          ? (" (" + fleetCounts.total + " waiting on other Macs)")
+          : "";
+        box.replaceChildren(
+          el("span", null, [
+            el("b", {text: "🟢 0 sessions waiting on human input on " + hostName}),
+            el("span", {text: " — no keystroke prompts, agent messages, or pasted prompts on this Mac" + otherNote})
+          ]),
+          el("button", {
+            type: "button",
+            className: "btn human-input-filter-btn",
+            text: "Show All Macs",
+            onClick: function() {
+              macFilter = "all";
+              renderMacFilterChips();
+              updateHeader();
+              renderHumanInputBanner();
+              renderMain();
+            }
+          })
+        );
+        return;
+      }
       const liveTotal = typeof s.live_sessions === "number" ? s.live_sessions : 0;
       box.replaceChildren(
         el("span", null, [
           el("b", {text: "🟢 0 sessions waiting on human input"}),
-          el("span", {text: " — no active prompts or unsent composer drafts across " + liveTotal + (liveTotal === 1 ? " live session" : " live sessions")})
+          el("span", {text: " — no keystroke prompts, agent messages, or pasted prompts sitting idle across " + liveTotal + (liveTotal === 1 ? " live session" : " live sessions")})
         ]),
         stateFilter === "input" ? el("button", {
           type: "button",
@@ -2057,22 +2538,38 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       return;
     }
 
-    const draftsOnly = counts.prompts === 0 && counts.drafts > 0;
-    box.className = "human-input-box" + (draftsOnly ? " has-drafts-only" : "");
+    const messagesOnly = counts.keystrokes === 0 && counts.messages > 0;
+    const draftsOnly = counts.keystrokes === 0 && counts.messages === 0 && counts.pasted > 0;
+    box.className = "human-input-box" +
+      (messagesOnly ? " has-messages-only" : (draftsOnly ? " has-drafts-only" : ""));
 
     const breakdownParts = [];
-    if (counts.prompts > 0) breakdownParts.push(counts.prompts + (counts.prompts === 1 ? " blocking prompt" : " blocking prompts"));
-    if (counts.drafts > 0) breakdownParts.push(counts.drafts + (counts.drafts === 1 ? " unsent composer draft" : " unsent composer drafts"));
+    if (counts.hostLabel) {
+      breakdownParts.push("on " + counts.hostLabel);
+    }
+    if (counts.keystrokes > 0) {
+      let ksPart = counts.keystrokes + (counts.keystrokes === 1 ? " keystroke prompt" : " keystroke prompts");
+      ksPart += " (" + counts.agyWork + "/" + counts.keystrokes + " fixable by agy-work)";
+      breakdownParts.push(ksPart);
+    }
+    if (counts.messages > 0) {
+      breakdownParts.push(counts.messages + (counts.messages === 1 ? " agent message awaiting reply" : " agent messages awaiting reply"));
+    }
+    if (counts.pasted > 0) {
+      breakdownParts.push(counts.pasted + (counts.pasted === 1 ? " pasted/unsent prompt not running" : " pasted/unsent prompts not running"));
+    }
     if (counts.total > items.length) breakdownParts.push("showing top " + items.length + " of " + counts.total);
     const subText = breakdownParts.join(" · ") + " — click a card to jump to session (key: i)";
+
+    const badgeCls = "human-input-badge" + (messagesOnly ? " is-message-only" : (draftsOnly ? " is-draft-only" : ""));
+    const badgeTxt = (messagesOnly
+      ? "🟣 Agent Messages Need Reply · "
+      : (draftsOnly ? "🟠 Pasted Prompts Not Running · " : "🟡 Needs Human Input · ")) + counts.total;
 
     const filterActive = stateFilter === "input";
     const head = el("div", {className: "human-input-head"}, [
       el("div", {className: "human-input-title-wrap"}, [
-        el("span", {
-          className: "human-input-badge" + (draftsOnly ? " is-draft-only" : ""),
-          text: (draftsOnly ? "🟠 Unsent Composer Drafts · " : "🟡 Needs Human Input · ") + counts.total
-        }),
+        el("span", {className: badgeCls, text: badgeTxt}),
         el("span", {className: "human-input-sub", text: subText})
       ]),
       el("button", {
@@ -2084,10 +2581,42 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       })
     ]);
 
+    const catDefs = [
+      {sub: "all", label: "All (" + counts.total + ")", cls: "", title: "Show all human-blocked sessions"},
+      {sub: "keystroke", label: "🟡 ⌨ Keystrokes / Questions (" + counts.keystrokes + ")", cls: "", title: "Interactive TUI approvals, menus, and questions requiring specific keystrokes"},
+      {sub: "agy_work", label: "⚡ Fixable by agy-work (" + counts.agyWork + "/" + counts.keystrokes + ")", cls: " is-agy-chip", title: "Subset of AGY command approvals running without --dangerously-skip-permissions (relaunch with agy-work -c)"},
+      {sub: "agent_message", label: "🟣 💬 Agent Messages (" + counts.messages + ")", cls: "", title: "Coding agent finished turn with a plain-text question or confirmation request at the end of its response"},
+      {sub: "pasted_prompt", label: "🟠 📋 Pasted Not Running (" + counts.pasted + ")", cls: "", title: "Pasted or typed prompt sitting in the composer without executing (press Enter to run)"}
+    ];
+    const catsBar = el("div", {className: "human-input-cats", role: "group", "aria-label": "Human blocker categories"});
+    for (const cd of catDefs) {
+      const activeSub = filterActive && inputSubFilter === cd.sub;
+      catsBar.appendChild(el("button", {
+        type: "button",
+        className: "hic-cat-chip" + cd.cls,
+        "data-input-sub": cd.sub,
+        "aria-pressed": String(activeSub),
+        title: cd.title,
+        text: cd.label,
+        onClick: function() { setInputSubFilter(cd.sub); }
+      }));
+    }
+
+    const visibleItems = items.filter(matchesSpotlightItemSubFilter);
     const grid = el("div", {className: "human-input-grid"});
-    for (const item of items) {
-      const isDraft = item.kind === "draft";
-      const actionPrefix = isDraft ? "🟠 ✎ " : "🟡 ▲ ";
+    if (!visibleItems.length) {
+      grid.appendChild(el("div", {
+        className: "human-input-sub",
+        text: "0 sessions in the selected sub-category — click another category pill above to view all " + counts.total + "."
+      }));
+    }
+    for (const item of visibleItems) {
+      const normKind = item.kind === "prompt" ? "keystroke" : (item.kind === "draft" ? "pasted_prompt" : item.kind);
+      const isPasted = normKind === "pasted_prompt";
+      const isMessage = normKind === "agent_message";
+      const actionPrefix = isPasted
+        ? (item.is_pasted_prompt ? "🟠 📋 " : "🟠 ✎ ")
+        : (isMessage ? "🟣 💬 " : "🟡 ⌨ ");
       const waitParts = [];
       if (item.timer_text) waitParts.push(item.timer_text);
       if (item.delta && item.delta.short && item.delta.short !== "first" && item.delta.short !== "Δ?") {
@@ -2095,12 +2624,32 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       } else if (item.up_text && item.up_text !== "?") {
         waitParts.push("up " + item.up_text);
       }
-      const locText = item.tmux_session
+      const canFocusItem = isRowM1Focusable(item);
+      const locBase = item.tmux_session
         ? (item.target_short + " · " + item.tmux_session)
         : item.target_short;
-      const actStr = item.activity
-        ? ("~" + item.activity)
-        : (isDraft ? "Unsent text in composer — inspect terminal before sending" : "Interactive prompt open — inspect terminal to respond");
+      const locText = canFocusItem ? (locBase + " ↗") : locBase;
+
+      let actStr;
+      let hasAct = false;
+      if (isPasted) {
+        if (item.composer_text) {
+          actStr = "❯ " + item.composer_text;
+          hasAct = true;
+        } else if (item.activity) {
+          actStr = "~" + item.activity;
+          hasAct = true;
+        } else {
+          actStr = "Prompt sitting in composer — NOT running (press Enter)";
+        }
+      } else if (isMessage) {
+        const msg = item.agent_message || item.activity;
+        actStr = msg ? ("💬 " + msg) : "Plain-text question at end of agent response";
+        hasAct = Boolean(msg);
+      } else {
+        actStr = item.activity ? ("~" + item.activity) : "Interactive prompt open — inspect terminal to respond";
+        hasAct = Boolean(item.activity);
+      }
 
       const projKids = [
         el("span", {className: "mech-dot", style: "background:" + mechColorVar(item.color_key)}),
@@ -2111,29 +2660,67 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       }
       projKids.push(el("span", {className: "hic-role", text: item.role}));
 
+      const topLeftKids = [
+        el("span", {className: "hic-action", text: actionPrefix + (item.action_label || item.status)})
+      ];
+      if (item.agy_work_fixable) {
+        topLeftKids.push(el("span", {
+          className: "hic-agy-badge",
+          title: item.agy_work_hint || "Relaunch with agy-work -c (--dangerously-skip-permissions) to bypass routine approvals",
+          text: "⚡ Fixable via agy-work"
+        }));
+      } else if (item.agy_work_status === "already_enabled") {
+        topLeftKids.push(el("span", {
+          className: "hic-agy-active-badge",
+          title: item.agy_work_hint || "Already running with --dangerously-skip-permissions; stopped on a standing Ask rule",
+          text: "🛡 agy-work on (Ask gate)"
+        }));
+      }
+
+      const ksHint = item.keystroke_hint || (isPasted
+        ? "Press Enter to run · clear to discard"
+        : (isMessage ? "Type reply + Enter" : "Inspect terminal to respond"));
+      const keyRowKids = [
+        el("span", {className: "hic-keys", text: "⌨ " + ksHint})
+      ];
+      if (item.agy_work_fixable) {
+        keyRowKids.push(el("span", {className: "hic-agy-cmd", text: "agy-work -c"}));
+      }
+
+      let cardCls = "human-input-card";
+      if (canFocusItem) cardCls += " is-m1-focusable";
+      if (isPasted) cardCls += " is-pasted is-draft";
+      else if (isMessage) cardCls += " is-agent-message";
+      else cardCls += " is-keystroke is-prompt" + (item.agy_work_fixable ? " is-agy-work-fixable" : "");
+
+      const cardTitle = canFocusItem
+        ? ("Switch to M1 Terminal (" + item.target_full + ") · " + item.project_label)
+        : ("Jump to " + item.project_label + " (" + item.host_label + " · " + item.target_full + ")");
+
       grid.appendChild(el("button", {
         type: "button",
-        className: "human-input-card" + (isDraft ? " is-draft" : " is-prompt"),
-        title: "Jump to " + item.project_label + " (" + item.host_label + " · " + item.target_full + ")",
+        className: cardCls,
+        title: cardTitle,
         onClick: function() { jumpToSessionRow(item.row_id); }
       }, [
         el("div", {className: "hic-top"}, [
-          el("span", {className: "hic-action", text: actionPrefix + (item.action_label || item.status)}),
+          el("div", {className: "hic-top-left"}, topLeftKids),
           el("span", {className: "hic-wait", text: waitParts.join(" · ")})
         ]),
         el("div", {className: "hic-where"}, [
           el("div", {className: "hic-proj"}, projKids),
           el("div", {className: "hic-badges"}, [
             renderSymPill(item.mac, false),
-            el("span", {className: "hic-loc", text: locText}),
+            el("span", {className: "hic-loc" + (canFocusItem ? " is-terminal-link" : ""), text: locText}),
             renderSymPill(item.view, true),
             renderSymPill(item.cli, false)
           ])
         ]),
-        el("div", {className: "hic-act" + (item.activity ? " has-act" : ""), text: actStr})
+        el("div", {className: "hic-key-row"}, keyRowKids),
+        el("div", {className: "hic-act" + (hasAct ? " has-act" : ""), text: actStr})
       ]));
     }
-    box.replaceChildren(head, grid);
+    box.replaceChildren(head, catsBar, grid);
   }
 
   function renderHostCards() {
@@ -2144,24 +2731,44 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       const statusLabel = !h.reachable ? "🔴 UNREACHABLE" : (h.source === "snapshot" ? "🔵 SNAPSHOT" : "🟢 LIVE");
       const statusPill = el("span", {className: "sym-pill tone-" + statusTone, text: statusLabel});
       const hostHumanTotal = typeof h.human_total_count === "number" ? h.human_total_count : 0;
-      const hostHumanPrompts = typeof h.human_prompt_count === "number" ? h.human_prompt_count : 0;
+      const hostKeystrokes = typeof h.human_keystroke_count === "number"
+        ? h.human_keystroke_count
+        : (typeof h.human_prompt_count === "number" ? h.human_prompt_count : 0);
+      const hostAgyWork = typeof h.human_agy_work_count === "number" ? h.human_agy_work_count : 0;
+      const hostMessages = typeof h.human_message_count === "number" ? h.human_message_count : 0;
+      const hostPasted = typeof h.human_pasted_count === "number"
+        ? h.human_pasted_count
+        : (typeof h.human_draft_count === "number" ? h.human_draft_count : 0);
       let hostInputBtn = null;
       if (h.reachable && hostHumanTotal > 0) {
-        const pillTone = hostHumanPrompts > 0 ? "yellow" : "orange";
-        const pillText = (hostHumanPrompts > 0 ? "🟡 " : "🟠 ") + hostHumanTotal + (hostHumanPrompts > 0 ? " input" : " draft");
+        let pillTone = "orange";
+        let pillText = "🟠 " + hostHumanTotal + " pasted";
+        if (hostKeystrokes > 0) {
+          pillTone = "yellow";
+          pillText = "🟡 " + hostHumanTotal + " input" + (hostAgyWork > 0 ? (" · " + hostAgyWork + "⚡") : "");
+        } else if (hostMessages > 0) {
+          pillTone = "purple";
+          pillText = "🟣 " + hostHumanTotal + " reply";
+        }
+        const tipParts = [];
+        if (hostKeystrokes > 0) tipParts.push(hostKeystrokes + " keystroke prompt(s)" + (hostAgyWork > 0 ? " (" + hostAgyWork + " fixable by agy-work)" : ""));
+        if (hostMessages > 0) tipParts.push(hostMessages + " agent message(s)");
+        if (hostPasted > 0) tipParts.push(hostPasted + " pasted/unsent prompt(s) not running");
         hostInputBtn = el("button", {
           type: "button",
           className: "sym-pill tone-" + pillTone + " host-input-pill",
-          title: "Filter tables to " + h.label + " sessions needing human input",
+          title: "Filter tables to " + h.label + " (" + tipParts.join(" · ") + ")",
           text: pillText,
           onClick: function() {
             if (macFilter === h.key && stateFilter === "input") {
               macFilter = "all";
               renderMacFilterChips();
+              updateHeader();
               setStateFilter("all");
             } else {
               macFilter = h.key;
               renderMacFilterChips();
+              updateHeader();
               setStateFilter("input");
             }
           }
@@ -2231,7 +2838,11 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
         el("div", {className: "metric-cell", title: loadTitle}, [el("span", {className: "k", text: "Load 1m"}), el("span", {className: "v", text: loadText}), loadBarNode])
       ]);
 
-      const cardCls = "host-card" + (!h.reachable ? " is-unreachable" : (hostHumanTotal > 0 ? " has-human-input" : ""));
+      let cardCls = "host-card";
+      if (!h.reachable) cardCls += " is-unreachable";
+      else if (hostKeystrokes > 0) cardCls += " has-human-input";
+      else if (hostMessages > 0) cardCls += " has-agent-message";
+      else if (hostPasted > 0) cardCls += " has-drafts-only";
       const card = el("article", {className: cardCls}, [
         el("div", {className: "host-head"}, [
           el("div", {className: "host-title"}, [renderSymPill(h.mac, false), el("span", {text: h.label})]),
@@ -2251,9 +2862,14 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     const counts = humanInputCounts();
     const rollup = document.getElementById("fleet-rollup");
     const inputTileCls = "rollup-tile is-clickable" +
-      (counts.prompts > 0 ? " has-human-input" : (counts.drafts > 0 ? " has-drafts-only" : ""));
-    const inputTileLbl = counts.prompts === 0 && counts.drafts > 0 ? "🟠 Unsent Drafts" : "🟡 Needs Human Input";
-    const inputTileTitle = counts.prompts + " prompt(s) · " + counts.drafts + " unsent draft(s) — click to toggle Needs Input filter";
+      (counts.keystrokes > 0
+        ? " has-human-input"
+        : (counts.messages > 0 ? " has-agent-message" : (counts.pasted > 0 ? " has-drafts-only" : "")));
+    const inputTileLbl = counts.keystrokes > 0
+      ? "🟡 Needs Human Input"
+      : (counts.messages > 0 ? "🟣 Agent Replies" : (counts.pasted > 0 ? "🟠 Pasted Not Running" : "🟡 Needs Human Input"));
+    const inputTileTitle = counts.keystrokes + " keystroke prompt(s) (" + counts.agyWork + " agy-work fixable) · " +
+      counts.messages + " agent message(s) · " + counts.pasted + " pasted/unsent prompt(s) — click to toggle Needs Input filter";
     rollup.replaceChildren(
       el("button", {
         type: "button",
@@ -2313,7 +2929,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       className: "chip",
       "aria-pressed": String(macFilter === "all"),
       text: "All Macs",
-      onClick: function() { macFilter = "all"; renderMacFilterChips(); renderMain(); }
+      onClick: function() { macFilter = "all"; renderMacFilterChips(); updateHeader(); renderHumanInputBanner(); renderMain(); }
     });
     wrap.appendChild(allBtn);
     for (const h of payload.hosts || []) {
@@ -2323,32 +2939,57 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
         className: "chip",
         "aria-pressed": String(macFilter === h.key),
         text: label,
-        onClick: function() { macFilter = h.key; renderMacFilterChips(); renderMain(); }
+        onClick: function() { macFilter = h.key; renderMacFilterChips(); updateHeader(); renderHumanInputBanner(); renderMain(); }
       }));
     }
   }
 
+  function normalizedRowHumanKind(row) {
+    if (row.stale_cached) return null;
+    const k = row.human_block_kind;
+    if (k === "keystroke" || k === "prompt") return "keystroke";
+    if (k === "agent_message") return "agent_message";
+    if (k === "pasted_prompt" || k === "draft") return "pasted_prompt";
+    if (row.symbols.state.tone === "yellow") return "keystroke";
+    if (row.symbols.guard.short === "reply") return "agent_message";
+    if (row.symbols.guard.short === "draft" || row.symbols.guard.short === "pasted") return "pasted_prompt";
+    return null;
+  }
+
   function isRowHumanBlocked(row) {
-    if (row.stale_cached) return false;
-    if (row.human_block_kind === "prompt" || row.human_block_kind === "draft") return true;
-    return row.symbols.state.tone === "yellow" || row.symbols.guard.short === "draft";
+    return normalizedRowHumanKind(row) !== null;
+  }
+
+  function matchesRowInputSubFilter(row) {
+    const k = normalizedRowHumanKind(row);
+    if (!k) return false;
+    if (inputSubFilter === "all") return true;
+    if (inputSubFilter === "keystroke") return k === "keystroke";
+    if (inputSubFilter === "agy_work") return k === "keystroke" && Boolean(row.agy_work_fixable || row.symbols.guard.short === "agy-wk");
+    if (inputSubFilter === "agent_message") return k === "agent_message";
+    if (inputSubFilter === "pasted_prompt") return k === "pasted_prompt";
+    return true;
   }
 
   function matchesFilters(row) {
     if (row.stale_cached && !includeCached) return false;
     if (macFilter !== "all" && row.host_key !== macFilter) return false;
     const stTone = row.symbols.state.tone;
-    if (stateFilter === "input" && !isRowHumanBlocked(row)) return false;
+    const rowHumanBlocked = isRowHumanBlocked(row);
+    if (stateFilter === "input" && !matchesRowInputSubFilter(row)) return false;
     if (stateFilter === "active" && stTone !== "green") return false;
     if (stateFilter === "alert" && stTone !== "red" && stTone !== "orange" && row.symbols.ports.tone !== "red") return false;
     if (stateFilter === "changed" && row.symbols.delta.short !== "Δnow") return false;
-    if (stateFilter === "idle" && stTone !== "white" && stTone !== "blue") return false;
-    if (stateFilter === "unknown" && stTone !== "slate" && row.symbols.guard.short !== "blind") return false;
+    if (stateFilter === "idle" && (rowHumanBlocked || (stTone !== "white" && stTone !== "blue"))) return false;
+    if (stateFilter === "unknown" && (rowHumanBlocked || (stTone !== "slate" && row.symbols.guard.short !== "blind"))) return false;
     if (searchQuery) {
       const hay = [
         row.project_label, row.stream_label || "", row.repo_label,
         row.target_short, row.agent, row.model_compact || "",
-        row.status, row.human_action_label || "", row.activity || "", row.host_label
+        row.status, row.human_action_label || "", row.keystroke_hint || "",
+        row.agy_work_fixable ? "agy-work fixable" : "", row.agy_work_hint || "",
+        row.composer_text || "", row.agent_message || "",
+        row.activity || "", row.host_label
       ].join(" ").toLowerCase();
       if (!hay.includes(searchQuery)) return false;
     }
@@ -2356,12 +2997,12 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   function defaultUrgencyTier(row) {
-    if (!row.stale_cached) {
-      if (row.human_block_kind === "prompt" || row.symbols.state.tone === "yellow") return 0;
-      if (row.human_block_kind === "draft" || row.symbols.guard.short === "draft") return 1;
-    }
-    if (row.symbols.state.rank <= 25) return 2;
-    return 3;
+    const k = normalizedRowHumanKind(row);
+    if (k === "keystroke") return 0;
+    if (k === "agent_message") return 1;
+    if (k === "pasted_prompt") return 2;
+    if (row.symbols.state.rank <= 25) return 3;
+    return 4;
   }
 
   function sortSessions(rows) {
@@ -2433,6 +3074,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     } else {
       for (const row of sorted) {
         const isOpen = expandedRows.has(row.row_id);
+        const canFocusM1 = isRowM1Focusable(row);
         const toggleRow = function() {
           if (expandedRows.has(row.row_id)) expandedRows.delete(row.row_id);
           else expandedRows.add(row.row_id);
@@ -2444,11 +3086,36 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
         if (row.stream_label) {
           nameKids.push(el("span", {className: "stream-tag", text: "· " + row.stream_label}));
         }
-        const sessCell = el("div", {className: "sess-cell", title: row.project_label + (row.stream_label ? " · " + row.stream_label : "") + " (" + row.target_full + ")"}, [
+        const sessTitle = canFocusM1
+          ? ("Click row to switch to M1 Terminal (" + row.target_full + ") · click ▸ for details")
+          : (row.project_label + (row.stream_label ? " · " + row.stream_label : "") + " (" + row.target_full + ")");
+        const sessCellKids = [
           el("span", {className: "mech-dot", style: "background:" + mechColorVar(row.color_key)}),
           el("div", {className: "sess-names"}, nameKids),
-          el("span", {className: "target-tag", text: row.target_short})
-        ]);
+          el("span", {
+            className: "target-tag" + (canFocusM1 ? " is-terminal-link" : ""),
+            text: canFocusM1 ? (row.target_short + " ↗") : row.target_short
+          })
+        ];
+        if (canFocusM1) {
+          sessCellKids.push(el("button", {
+            id: "expand-" + row.row_id,
+            type: "button",
+            className: "row-expand-btn",
+            "aria-label": (isOpen ? "Collapse" : "Expand") + " details for " + row.project_label,
+            "aria-expanded": String(isOpen),
+            title: (isOpen ? "Hide" : "Show") + " session details without switching apps (Space)",
+            text: isOpen ? "▾" : "▸",
+            onClick: function(ev) {
+              if (ev) {
+                ev._detailToggleHandled = true;
+                if (typeof ev.stopPropagation === "function") ev.stopPropagation();
+              }
+              toggleRow();
+            }
+          }));
+        }
+        const sessCell = el("div", {className: "sess-cell", title: sessTitle}, sessCellKids);
 
         const upKids = [el("span", {text: row.up_text})];
         if (row.timer_text) upKids.push(el("span", {className: "tmr", text: " · " + row.timer_text}));
@@ -2456,11 +3123,22 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
           upKids.push(el("span", {className: "tmr", text: " (cached " + row.cached_age_text + ")"}));
         }
 
-        const actText = row.activity ? ("~" + row.activity) : "—";
+        const rowHumanKind = normalizedRowHumanKind(row);
+        let actText = row.activity ? ("~" + row.activity) : "—";
+        let hasAct = Boolean(row.activity);
+        if (rowHumanKind === "pasted_prompt" && row.composer_text) {
+          actText = "❯ " + row.composer_text;
+          hasAct = true;
+        } else if (rowHumanKind === "agent_message" && row.agent_message) {
+          actText = "💬 " + row.agent_message;
+          hasAct = true;
+        }
         let rowCls = "session-row";
+        if (canFocusM1) rowCls += " is-m1-focusable";
         if (row.stale_cached) rowCls += " is-stale-cached";
-        else if (row.human_block_kind === "prompt" || row.symbols.state.tone === "yellow") rowCls += " is-human-prompt";
-        else if (row.human_block_kind === "draft" || row.symbols.guard.short === "draft") rowCls += " is-human-draft";
+        else if (rowHumanKind === "keystroke") rowCls += " is-human-prompt";
+        else if (rowHumanKind === "agent_message") rowCls += " is-human-message";
+        else if (rowHumanKind === "pasted_prompt") rowCls += " is-human-draft";
         if (flashRowId === row.row_id) rowCls += " is-flash-target";
 
         const tr = el("tr", {
@@ -2468,9 +3146,37 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
           className: rowCls,
           tabindex: "0",
           "aria-expanded": String(isOpen),
-          onClick: toggleRow,
+          title: canFocusM1 ? sessTitle : null,
+          onClick: function(ev) {
+            if (ev && ev._detailToggleHandled) return;
+            if (ev && ev.target && typeof ev.target.closest === "function" && ev.target.closest(".row-expand-btn")) return;
+            if (typeof window.getSelection === "function") {
+              const sel = window.getSelection();
+              if (
+                sel &&
+                !sel.isCollapsed &&
+                String(sel).length > 0 &&
+                ((sel.anchorNode && typeof tr.contains === "function" && tr.contains(sel.anchorNode)) ||
+                 (sel.focusNode && typeof tr.contains === "function" && tr.contains(sel.focusNode)))
+              ) {
+                return;
+              }
+            }
+            if (canFocusM1) {
+              focusTerminalSession(row);
+            } else {
+              toggleRow();
+            }
+          },
           onKeydown: function(ev) {
-            if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggleRow(); }
+            if (ev && ev.target && ev.target.tagName === "BUTTON") return;
+            if (canFocusM1 && ev.key === "Enter") {
+              ev.preventDefault();
+              focusTerminalSession(row);
+            } else if (ev.key === "Enter" || ev.key === " ") {
+              ev.preventDefault();
+              toggleRow();
+            }
           }
         }, [
           el("td", null, sessCell),
@@ -2483,7 +3189,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
           el("td", {className: "sym-cell"}, renderSymPill(row.symbols.ports, false)),
           el("td", {className: "sym-cell"}, renderSymPill(row.symbols.view, true)),
           el("td", {className: "up-cell", title: "Process age: " + row.up_text + (row.timer_text ? " · UI timer: " + row.timer_text : "")}, upKids),
-          el("td", {className: "act-cell" + (row.activity ? " has-act" : ""), title: actText, text: actText})
+          el("td", {className: "act-cell" + (hasAct ? " has-act" : ""), title: actText, text: actText})
         ]);
         tbody.appendChild(tr);
 
@@ -2497,16 +3203,52 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
           const flagInfo = [].concat(row.flags || [], row.errors || []).join(", ") || "none";
           const detailItems = [];
           if (row.human_action_label) {
-            const prefix = row.human_block_kind === "draft" ? "🟠 " : "🟡 ";
+            const prefix = rowHumanKind === "pasted_prompt" ? "🟠 " : (rowHumanKind === "agent_message" ? "🟣 " : "🟡 ");
             detailItems.push(el("div", {className: "detail-item"}, [
               el("b", {text: "Human Action Needed"}),
               el("span", {text: prefix + row.human_action_label + " (" + row.status + ")"})
             ]));
           }
+          if (row.keystroke_hint) {
+            detailItems.push(el("div", {className: "detail-item"}, [
+              el("b", {text: "Required Keystrokes"}),
+              el("span", {className: "mono", text: "⌨ " + row.keystroke_hint})
+            ]));
+          }
+          if (row.agy_work_fixable || row.agy_work_hint) {
+            detailItems.push(el("div", {className: "detail-item"}, [
+              el("b", {text: "agy-work Permission Status"}),
+              el("span", {text: (row.agy_work_fixable ? "⚡ Fixable via agy-work — " : "🛡 ") + (row.agy_work_hint || "Relaunch with agy-work -c")})
+            ]));
+          }
+          if (row.composer_text) {
+            detailItems.push(el("div", {className: "detail-item"}, [
+              el("b", {text: "Unsent Composer Prompt (Not Running)"}),
+              el("span", {className: "mono", text: "❯ " + row.composer_text})
+            ]));
+          }
+          if (row.agent_message) {
+            detailItems.push(el("div", {className: "detail-item"}, [
+              el("b", {text: "Agent End-of-Response Message"}),
+              el("span", {text: "💬 " + row.agent_message})
+            ]));
+          }
+          const rawActText = row.activity ? ("~" + row.activity) : "—";
+          if (canFocusM1) {
+            detailItems.push(el("div", {className: "detail-item"}, [
+              el("b", {text: "M1 Terminal Navigation"}),
+              el("button", {
+                type: "button",
+                className: "btn btn-primary detail-focus-btn",
+                text: "↗ Switch to Terminal (" + row.target_short + ")",
+                onClick: function() { focusTerminalSession(row); }
+              })
+            ]));
+          }
           detailItems.push(
             el("div", {className: "detail-item"}, [el("b", {text: "Host & Target"}), el("span", {text: row.host_label + " · " + tmuxInfo + " · PID " + (row.pid || "?") + " · " + (row.tty || "?")})]),
             el("div", {className: "detail-item"}, [el("b", {text: "CLI & Model"}), el("span", {text: row.agent + " / " + (row.model || row.model_compact || "model not on screen")})]),
-            el("div", {className: "detail-item"}, [el("b", {text: "Screen-Reported Activity (~)"}), el("span", {text: actText})]),
+            el("div", {className: "detail-item"}, [el("b", {text: "Screen-Reported Activity (~)"}), el("span", {text: rawActText})]),
             el("div", {className: "detail-item"}, [el("b", {text: "Launch ID Evidence"}), el("span", {className: "mono", text: idInfo})]),
             el("div", {className: "detail-item"}, [el("b", {text: "Flags & Collection Codes"}), el("span", {className: "mono", text: flagInfo})])
           );
@@ -2527,10 +3269,11 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   function sectionDotsSummary(rows) {
     const counts = {};
     for (const r of rows) {
-      const dot = (!r.stale_cached && r.human_block_kind === "draft") ? "🟠" : r.symbols.state.dot;
+      const k = normalizedRowHumanKind(r);
+      const dot = k === "pasted_prompt" ? "🟠" : (k === "agent_message" ? "🟣" : r.symbols.state.dot);
       counts[dot] = (counts[dot] || 0) + 1;
     }
-    return ["🟢", "🟡", "🟠", "🔴", "🔵", "⚪", "⚫"]
+    return ["🟢", "🟡", "🟣", "🟠", "🔴", "🔵", "⚪", "⚫"]
       .filter(d => counts[d])
       .map(d => d + counts[d])
       .join("  ");
@@ -2559,7 +3302,8 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     const mechRows = filtered.filter(r => r.role === "mech");
     const otherRows = filtered.filter(r => r.role === "other");
     const otherHumanCount = otherRows.filter(isRowHumanBlocked).length;
-    const otherHasPrompt = otherRows.some(r => !r.stale_cached && (r.human_block_kind === "prompt" || r.symbols.state.tone === "yellow"));
+    const otherHasKeystroke = otherRows.some(r => normalizedRowHumanKind(r) === "keystroke");
+    const otherHasMessage = otherRows.some(r => normalizedRowHumanKind(r) === "agent_message");
 
     container.appendChild(buildSectionCard("1 · MechBay Sessions", "xmechbay", mechbayRows, "No MechBay sessions observed matching current filter."));
     container.appendChild(buildSectionCard("2 · Claw Sessions", "claw", clawRows, "No Claw sessions observed matching current filter."));
@@ -2579,9 +3323,11 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     const otherDots = sectionDotsSummary(otherRows);
     const summaryBadges = [];
     if (otherHumanCount > 0) {
+      const drTone = otherHasKeystroke ? "yellow" : (otherHasMessage ? "purple" : "orange");
+      const drDot = otherHasKeystroke ? "🟡 " : (otherHasMessage ? "🟣 " : "🟠 ");
       summaryBadges.push(el("span", {
-        className: "sym-pill tone-" + (otherHasPrompt ? "yellow" : "orange"),
-        text: (otherHasPrompt ? "🟡 " : "🟠 ") + otherHumanCount + " need input"
+        className: "sym-pill tone-" + drTone,
+        text: drDot + otherHumanCount + " need input"
       }));
     }
     summaryBadges.push(el("span", {text: otherDots || "collapsed by default"}));
@@ -2646,9 +3392,14 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
         } else {
           const wrap = el("div", {className: "matrix-pills"});
           for (const r of cellRows) {
-            const sym = (!r.stale_cached && r.human_block_kind === "draft") ? r.symbols.guard : r.symbols.state;
+            const rk = normalizedRowHumanKind(r);
+            const useGuard = rk === "pasted_prompt" || rk === "agent_message" || (rk === "keystroke" && r.agy_work_fixable);
+            const sym = useGuard ? r.symbols.guard : r.symbols.state;
             const pill = renderSymPill(sym, true);
-            const pillTitle = r.project_label + (r.stream_label ? " · " + r.stream_label : "") + " (" + r.target_short + "): " + (sym.detail || "");
+            const pillCanFocusM1 = isRowM1Focusable(r);
+            const pillTitle = r.project_label + (r.stream_label ? " · " + r.stream_label : "") +
+              " (" + r.target_short + "): " + (sym.detail || "") +
+              (pillCanFocusM1 ? " · Click to switch to M1 Terminal ↗" : "");
             wrap.appendChild(el("button", {
               type: "button",
               className: "matrix-pill-btn",
@@ -2697,11 +3448,28 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 
   function renderMain() {
     const container = document.getElementById("tables-container");
+    const prevActive = document.activeElement;
+    const prevId = (
+      prevActive &&
+      prevActive.id &&
+      typeof container.contains === "function" &&
+      container.contains(prevActive)
+    ) ? prevActive.id : null;
     container.replaceChildren();
     const filtered = (payload.sessions || []).filter(matchesFilters);
     if (viewMode === "role") renderRoleView(container, filtered);
     else if (viewMode === "host") renderHostView(container, filtered);
     else renderMatrixView(container, filtered);
+    if (prevId) {
+      const restored = document.getElementById(prevId);
+      if (restored && typeof restored.focus === "function") {
+        try {
+          restored.focus({preventScroll: true});
+        } catch (_) {
+          try { restored.focus(); } catch (__) {}
+        }
+      }
+    }
   }
 
   function renderAll() {
@@ -2724,6 +3492,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     return {
       viewMode: viewMode,
       stateFilter: stateFilter,
+      inputSubFilter: inputSubFilter,
       macFilter: macFilter,
       searchInputVal: searchInput ? String(searchInput.value || "").slice(0, 200) : "",
       includeCached: includeCached,
@@ -2769,8 +3538,10 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     toast.classList.add("is-visible");
   }
 
-  function attemptCsrfRestartReload() {
+  function attemptCsrfRestartReload(opts) {
     if (STATIC_EXPORT || window.location.protocol === "file:") return false;
+    const pendingRefresh = opts && typeof opts.pendingRefresh === "boolean" ? opts.pendingRefresh : true;
+    const pendingFocusRowId = opts && typeof opts.pendingFocusRowId === "string" ? opts.pendingFocusRowId.slice(0, 256) : null;
     try {
       const now = Date.now();
       const prevAt = parseInt(window.sessionStorage.getItem(CSRF_RELOAD_AT_KEY) || "0", 10);
@@ -2780,7 +3551,8 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       window.sessionStorage.setItem(CSRF_RELOAD_AT_KEY, String(now));
       window.sessionStorage.setItem(CSRF_RECOVERY_KEY, JSON.stringify({
         at: now,
-        pendingRefresh: true,
+        pendingRefresh: pendingRefresh,
+        pendingFocusRowId: pendingFocusRowId,
         ui: captureUiState()
       }));
     } catch (_) {
@@ -2819,6 +3591,10 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       for (const b of document.querySelectorAll("[data-filter]")) {
         b.setAttribute("aria-pressed", String(b.getAttribute("data-filter") === stateFilter));
       }
+    }
+    const allowedSubFilters = new Set(["all", "keystroke", "agy_work", "agent_message", "pasted_prompt"]);
+    if (stateFilter === "input" && typeof ui.inputSubFilter === "string" && allowedSubFilters.has(ui.inputSubFilter)) {
+      inputSubFilter = ui.inputSubFilter;
     }
     const validHostKeys = new Set((payload.hosts || []).map(function(h) { return h.key; }));
     if (typeof ui.macFilter === "string" && (ui.macFilter === "all" || validHostKeys.has(ui.macFilter))) {
@@ -2866,10 +3642,114 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       document.getElementById("btn-theme").textContent = "Theme: " + themeMode.charAt(0).toUpperCase() + themeMode.slice(1);
     }
 
+    if (typeof rec.pendingFocusRowId === "string" && rec.pendingFocusRowId.length <= 256) {
+      pendingPostReloadFocusRowId = rec.pendingFocusRowId;
+    }
+
     if (!rec.pendingRefresh) return false;
     const genMs = payload && payload.generated_at ? Date.parse(payload.generated_at) : NaN;
     const alreadyFreshFromReload = !Number.isNaN(genMs) && genMs >= (rec.at - 5);
     return !alreadyFreshFromReload;
+  }
+
+  function describeTerminalFocusError(status, errCode, row) {
+    const label = (row && row.project_label ? row.project_label : "session") +
+      (row && row.target_short ? (" (" + row.target_short + ")") : "");
+    if (errCode === "m1_local_sessions_only") {
+      return "Terminal window switching is only available for live local M1 sessions.";
+    }
+    if (errCode === "terminal_not_running") {
+      return "Terminal.app is not running on M1 (dashboard will not cold-launch GUI apps).";
+    }
+    if (errCode === "terminal_tab_not_found") {
+      return label + " tab is no longer open in Terminal.app — click Update to refresh.";
+    }
+    if (errCode === "session_not_found") {
+      return label + " is no longer in the server snapshot — click Update to refresh.";
+    }
+    if (errCode === "tmux_session_not_attached_in_terminal") {
+      return label + " is running in tmux with no attached M1 Terminal.app tab.";
+    }
+    if (errCode === "tmux_window_not_visible_in_terminal") {
+      const winRef = row && row.tmux_window ? (" (" + row.tmux_window + ")") : "";
+      return label + " is in another tmux window" + winRef + " — attached M1 Terminal tab(s) are viewing a different window.";
+    }
+    if (errCode === "terminal_automation_not_authorized") {
+      return "macOS Automation permission denied — allow Terminal control in System Settings → Privacy & Security → Automation.";
+    }
+    if (errCode === "terminal_focus_timed_out") {
+      return "Terminal.app timed out responding to focus request (check for modal dialogs or Automation permission prompt).";
+    }
+    if (errCode === "terminal_window_not_raised" || errCode === "terminal_tab_not_selected") {
+      return "Terminal.app did not raise " + label + " to the front window — try clicking again.";
+    }
+    if (errCode === "session_has_no_terminal_window") {
+      return label + " is a headless background process with no Terminal.app window or tab.";
+    }
+    if (errCode === "local_macos_gui_required" || errCode === "terminal_focus_unavailable_in_snapshot_mode") {
+      return "Local macOS Terminal switching is unavailable in this server mode.";
+    }
+    return "HTTP " + status + (errCode ? " (" + errCode + ")" : "");
+  }
+
+  async function focusTerminalSession(row) {
+    if (!isRowM1Focusable(row) || focusInFlight) return false;
+    focusInFlight = true;
+    let reloadingPage = false;
+    hideErrorToast();
+    try {
+      const resp = await fetch("/api/focus-terminal", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-MechBay-Token": CSRF_TOKEN,
+          "Accept": "application/json"
+        },
+        body: JSON.stringify({row_id: row.row_id})
+      });
+      if (!resp.ok) {
+        let errCode = "";
+        try {
+          const errBody = await resp.json();
+          if (errBody && typeof errBody.error === "string") {
+            errCode = errBody.error.replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64);
+          }
+        } catch (_) {}
+        if (resp.status === 403 && errCode === "invalid_csrf_token") {
+          if (attemptCsrfRestartReload({pendingRefresh: false, pendingFocusRowId: row.row_id})) {
+            reloadingPage = true;
+            setTimeout(function() {
+              focusInFlight = false;
+              showErrorToast(
+                "Terminal switch failed: Dashboard server restarted or token expired (HTTP 403: invalid_csrf_token) — reload this page to reconnect.",
+                true
+              );
+            }, 4000);
+            return false;
+          }
+          const csrfErr = new Error(
+            "Dashboard server restarted or token expired (HTTP 403: invalid_csrf_token) — reload this page to reconnect."
+          );
+          csrfErr.offerReload = true;
+          throw csrfErr;
+        }
+        const httpErr = new Error(describeTerminalFocusError(resp.status, errCode, row));
+        httpErr.offerReload = false;
+        throw httpErr;
+      }
+      await resp.json();
+      flashRowId = row.row_id;
+      renderMain();
+      return true;
+    } catch (err) {
+      const msg = "Terminal switch failed: " + (err && err.message ? err.message : String(err));
+      showErrorToast(msg, Boolean(err && err.offerReload));
+      return false;
+    } finally {
+      if (!reloadingPage) {
+        focusInFlight = false;
+      }
+    }
   }
 
   async function triggerRefresh() {
@@ -3020,6 +3900,16 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 
   const shouldRefreshAfterReload = restoreCsrfRecoveryState();
   renderAll();
+  if (pendingPostReloadFocusRowId) {
+    const recoveredFocusId = pendingPostReloadFocusRowId;
+    pendingPostReloadFocusRowId = null;
+    const recoveredRow = (payload.sessions || []).find(function(s) { return s.row_id === recoveredFocusId; });
+    if (recoveredRow && isRowM1Focusable(recoveredRow)) {
+      focusTerminalSession(recoveredRow);
+    } else if (!recoveredRow) {
+      showErrorToast("Terminal switch failed: " + describeTerminalFocusError(404, "session_not_found", null), false);
+    }
+  }
   if (shouldRefreshAfterReload) {
     triggerRefresh();
   }
@@ -3061,6 +3951,7 @@ class DashboardState:
         self.snapshot_html_path = Path(snapshot_html_path) if snapshot_html_path else None
         self.wait_timeout = wait_timeout
         self.csrf_token = secrets.token_urlsafe(24)
+        self.focus_lock = threading.Lock()
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._inflight = None
@@ -3148,6 +4039,350 @@ def _allowed_origins(port):
     } | ({"http://127.0.0.1", "http://localhost", "http://[::1]"} if port == 80 else set())
 
 
+TERMINAL_FOCUS_JXA = """function run(argv) {
+  if (!argv || argv.length < 1) {
+    return JSON.stringify({ok: false, error: "missing_focus_args"});
+  }
+  var req = JSON.parse(argv[0]);
+  var wantedTtys = Array.isArray(req.ttys) ? req.ttys : [];
+  if (!wantedTtys.length) {
+    return JSON.stringify({ok: false, error: "missing_focus_tty"});
+  }
+  var wantedWinId = typeof req.window_id === "number" ? req.window_id : null;
+  var wantedTabIdx = typeof req.tab_index === "number" ? req.tab_index : null;
+  var app = Application("Terminal");
+  if (!app.running()) {
+    return JSON.stringify({ok: false, error: "terminal_not_running"});
+  }
+  var windows = app.windows();
+  var bestWin = null;
+  var bestTab = null;
+  var bestWinId = null;
+  var bestTabIdx = null;
+  var bestTty = null;
+  var bestScore = -1;
+
+  for (var wi = 0; wi < windows.length; wi++) {
+    var w = windows[wi];
+    var wid = null;
+    var tabs = null;
+    try {
+      wid = Number(w.id());
+      tabs = w.tabs();
+    } catch (_) {
+      continue;
+    }
+    if (!tabs || !tabs.length) continue;
+
+    for (var ti = 0; ti < tabs.length; ti++) {
+      var t = tabs[ti];
+      var rawTty = "";
+      try {
+        rawTty = String(t.tty() || "");
+      } catch (_) {
+        continue;
+      }
+      var normTty = rawTty.indexOf("/dev/") === 0 ? rawTty.slice(5) : rawTty;
+      var ttyPos = wantedTtys.indexOf(normTty);
+      if (ttyPos === -1) continue;
+      var tabOneBased = ti + 1;
+      var score = 100 - Math.min(ttyPos, 50);
+      if (wantedWinId !== null && wid === wantedWinId) score += 200;
+      if (wantedTabIdx !== null && tabOneBased === wantedTabIdx) score += 50;
+      if (score > bestScore) {
+        bestScore = score;
+        bestWin = w;
+        bestTab = t;
+        bestWinId = wid;
+        bestTabIdx = tabOneBased;
+        bestTty = normTty;
+      }
+    }
+  }
+
+  if (!bestWin || !bestTab) {
+    return JSON.stringify({ok: false, error: "terminal_tab_not_found"});
+  }
+
+  try {
+    if (bestWin.miniaturized()) {
+      bestWin.miniaturized = false;
+    }
+  } catch (_) {}
+  bestTab.selected = true;
+  try { bestWin.index = 1; } catch (_) {}
+  try { bestWin.frontmost = true; } catch (_) {}
+  app.activate();
+  try { bestTab.selected = true; } catch (_) {}
+  try { bestWin.index = 1; } catch (_) {}
+  try { bestWin.frontmost = true; } catch (_) {}
+
+  var tabSelected = false;
+  try {
+    tabSelected = Boolean(bestTab.selected());
+  } catch (_) {}
+  var frontWinId = null;
+  try {
+    var afterWins = app.windows();
+    if (afterWins.length > 0) frontWinId = Number(afterWins[0].id());
+  } catch (_) {}
+
+  if (!tabSelected) {
+    return JSON.stringify({ok: false, error: "terminal_tab_not_selected"});
+  }
+
+  return JSON.stringify({
+    ok: true,
+    window_id: bestWinId,
+    tab_index: bestTabIdx,
+    tty: bestTty,
+    front_window_id: frontWinId
+  });
+}
+"""
+
+
+def _terminal_app_is_running():
+    proc = subprocess.run(
+        ["/bin/ps", "-axo", "comm="],
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False
+    return bool(re.search(r"/Terminal\.app/Contents/MacOS/Terminal$", proc.stdout, re.M))
+
+
+def _find_local_tmux_bin():
+    for candidate in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("tmux")
+
+
+def _resolve_local_tmux_client_ttys(session_row):
+    wanted = []
+    for candidate_name in (
+        list(session_row.get("tmux_lookup_sessions") or [])
+        + [session_row.get("tmux_session")]
+        + list(session_row.get("tmux_sessions") or [])
+    ):
+        if (
+            isinstance(candidate_name, str)
+            and _TMUX_SESSION_NAME_RE.fullmatch(candidate_name)
+            and candidate_name not in wanted
+        ):
+            wanted.append(candidate_name)
+    if not wanted:
+        return "not_attached", []
+
+    tmux_bin = _find_local_tmux_bin()
+    if not tmux_bin:
+        return "not_attached", []
+
+    raw_pane = session_row.get("tmux_pane")
+    target_pane = (
+        raw_pane.strip()
+        if isinstance(raw_pane, str) and _TMUX_PANE_ID_RE.fullmatch(raw_pane.strip())
+        else None
+    )
+    row_pane_tty = _normalize_tty_name(session_row.get("tty"))
+
+    try:
+        proc_panes = subprocess.run(
+            [tmux_bin, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_tty}\t#{window_id}\t#{session_name}"],
+            text=True,
+            capture_output=True,
+            timeout=4,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "timed_out", []
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return "not_attached", []
+    if proc_panes.returncode != 0:
+        return "not_attached", []
+
+    target_window_ids = set()
+    wanted_set = set(wanted)
+    pane_matched = False
+    for line in proc_panes.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        p_id = parts[0].strip()
+        p_tty = _normalize_tty_name(parts[1])
+        w_id = parts[2].strip()
+        s_name = parts[3].strip()
+        if target_pane is not None:
+            if p_id != target_pane:
+                continue
+            if row_pane_tty and p_tty and p_tty != row_pane_tty:
+                continue
+        elif row_pane_tty is not None:
+            if p_tty != row_pane_tty:
+                continue
+            target_pane = p_id
+        else:
+            continue
+        pane_matched = True
+        if w_id:
+            target_window_ids.add(w_id)
+        if _TMUX_SESSION_NAME_RE.fullmatch(s_name):
+            if s_name not in wanted_set:
+                wanted.append(s_name)
+            wanted_set.add(s_name)
+
+    if (target_pane is not None or row_pane_tty is not None) and not pane_matched:
+        return "pane_not_found", []
+
+    rank_idx = {name: idx for idx, name in enumerate(wanted)}
+    try:
+        proc_clients = subprocess.run(
+            [tmux_bin, "list-clients", "-F", "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}"],
+            text=True,
+            capture_output=True,
+            timeout=4,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "timed_out", []
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return "not_attached", []
+    if proc_clients.returncode != 0:
+        return "not_attached", []
+
+    hits = []
+    other_window_attached = 0
+    for line in proc_clients.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        tty_name = _normalize_tty_name(parts[0])
+        sess_name = parts[1].strip()
+        c_win_id = parts[2].strip() if len(parts) >= 3 else ""
+        c_pane_id = parts[3].strip() if len(parts) >= 4 else ""
+        if not tty_name:
+            continue
+        viewer_pref = 0 if sess_name.startswith("xmb-view-") else 1
+        sess_pos = rank_idx.get(sess_name, 999)
+        if target_window_ids:
+            if target_pane and c_pane_id == target_pane:
+                hits.append(((0, viewer_pref, sess_pos), tty_name))
+            elif c_win_id and c_win_id in target_window_ids:
+                hits.append(((1, viewer_pref, sess_pos), tty_name))
+            elif sess_name in wanted_set:
+                other_window_attached += 1
+        elif sess_name in wanted_set:
+            hits.append(((1, viewer_pref, sess_pos), tty_name))
+
+    if hits:
+        hits.sort(key=lambda item: item[0])
+        ordered = []
+        for _, tty_name in hits:
+            if tty_name not in ordered:
+                ordered.append(tty_name)
+        return "ok", ordered
+    if other_window_attached > 0:
+        return "window_not_visible", []
+    return "not_attached", []
+
+
+def focus_local_terminal_session(session_row, mode="live"):
+    """Switch local M1 Terminal.app to session_row's window and tab without sending input."""
+    if not isinstance(session_row, dict):
+        return False, 400, {"error": "invalid_session_row"}
+    mac_glyph = ((session_row.get("symbols") or {}).get("mac") or {}).get("glyph")
+    if (
+        mode != "live"
+        or session_row.get("host_source") != "local"
+        or bool(session_row.get("stale_cached"))
+        or not is_m1_host(session_row.get("host_key"), session_row.get("host_label"))
+        or mac_glyph != "M1"
+    ):
+        return False, 403, {"error": "m1_local_sessions_only"}
+    if not session_row.get("can_focus_terminal"):
+        return False, 409, {"error": "session_has_no_terminal_window"}
+    if sys.platform != "darwin" or os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+        return False, 409, {"error": "local_macos_gui_required"}
+    try:
+        running = _terminal_app_is_running()
+    except subprocess.TimeoutExpired:
+        return False, 504, {"error": "terminal_focus_timed_out"}
+    if not running:
+        return False, 409, {"error": "terminal_not_running"}
+
+    transport = str(session_row.get("transport") or "process")
+    if transport == "tmux":
+        tmux_state, ttys = _resolve_local_tmux_client_ttys(session_row)
+        if tmux_state == "timed_out":
+            return False, 504, {"error": "terminal_focus_timed_out"}
+        if tmux_state == "pane_not_found":
+            return False, 404, {"error": "terminal_tab_not_found"}
+        if tmux_state == "window_not_visible":
+            return False, 409, {"error": "tmux_window_not_visible_in_terminal"}
+        if not ttys:
+            return False, 409, {"error": "tmux_session_not_attached_in_terminal"}
+        window_id = None
+        tab_index = None
+    elif transport == "terminal":
+        norm_tty = _normalize_tty_name(session_row.get("tty"))
+        if not norm_tty:
+            return False, 409, {"error": "session_has_no_terminal_window"}
+        ttys = [norm_tty]
+        raw_wid = session_row.get("window_id")
+        window_id = raw_wid if isinstance(raw_wid, int) and not isinstance(raw_wid, bool) and raw_wid >= 1 else None
+        raw_tab = session_row.get("tab_index")
+        tab_index = raw_tab if isinstance(raw_tab, int) and not isinstance(raw_tab, bool) and raw_tab >= 1 else None
+    else:
+        return False, 409, {"error": "session_has_no_terminal_window"}
+
+    req_arg = json.dumps({"ttys": ttys, "window_id": window_id, "tab_index": tab_index})
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/osascript", "-l", "JavaScript", "-e", TERMINAL_FOCUS_JXA, req_arg],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, 504, {"error": "terminal_focus_timed_out"}
+    if proc.returncode != 0:
+        stderr_low = (proc.stderr or "").lower()
+        if "-1743" in stderr_low or "not authorized to send apple events" in stderr_low:
+            return False, 403, {"error": "terminal_automation_not_authorized"}
+        return False, 502, {"error": "terminal_focus_osascript_failed"}
+    try:
+        res = json.loads(proc.stdout.strip() or "{}")
+    except ValueError:
+        return False, 502, {"error": "terminal_focus_invalid_response"}
+    if not isinstance(res, dict) or not res.get("ok"):
+        err_code = str(res.get("error") if isinstance(res, dict) else "" or "terminal_focus_failed")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", err_code):
+            err_code = "terminal_focus_failed"
+        status_code = 404 if err_code == "terminal_tab_not_found" else (409 if err_code == "terminal_not_running" else 502)
+        return False, status_code, {"error": err_code}
+
+    front_wid = res.get("front_window_id")
+    actual_wid = res.get("window_id")
+    if front_wid is not None and actual_wid is not None and front_wid != actual_wid:
+        return False, 502, {"error": "terminal_window_not_raised"}
+
+    return True, 200, {
+        "ok": True,
+        "row_id": session_row.get("row_id"),
+        "host_key": session_row.get("host_key"),
+        "project_label": session_row.get("project_label"),
+        "window_id": actual_wid,
+        "tab_index": res.get("tab_index"),
+        "tty": res.get("tty"),
+        "front_window_id": front_wid,
+    }
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "XMechBayDashboard/1.0"
     sys_version = ""
@@ -3180,28 +4415,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         host_hdr = (self.headers.get("Host") or "").strip().lower()
         return host_hdr in _allowed_host_headers(port)
 
-    def _drain_post_body(self, max_bytes=4096):
+    def _read_post_body(self, max_bytes=4096):
         if self.headers.get("Transfer-Encoding") is not None:
             self.close_connection = True
-            return False, 413, "unsupported_transfer_encoding"
+            return False, 413, "unsupported_transfer_encoding", b""
         raw_len = (self.headers.get("Content-Length") or "0").strip()
         if not raw_len.isdigit():
             self.close_connection = True
-            return False, 400, "invalid_content_length"
+            return False, 400, "invalid_content_length", b""
         length = int(raw_len)
         if length > max_bytes:
             self.close_connection = True
-            return False, 413, "payload_too_large"
+            return False, 413, "payload_too_large", b""
+        body = b""
         if length > 0:
             try:
                 body = self.rfile.read(length)
             except socket.timeout:
                 self.close_connection = True
-                return False, 408, "request_timeout"
+                return False, 408, "request_timeout", b""
             if len(body) < length:
                 self.close_connection = True
-                return False, 400, "incomplete_request_body"
-        return True, 200, ""
+                return False, 400, "incomplete_request_body", b""
+        return True, 200, "", body
+
+    def _drain_post_body(self, max_bytes=4096):
+        ok, status_code, err_code, _ = self._read_post_body(max_bytes=max_bytes)
+        return ok, status_code, err_code
 
     def do_GET(self):
         if not self._check_host_header():
@@ -3235,7 +4475,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"error": "forbidden_host_header"})
             return
         parsed = urlparse(self.path)
-        if parsed.path != "/api/refresh":
+        route = parsed.path
+        if route not in {"/api/refresh", "/api/focus-terminal"}:
             self._send_json(404, {"error": "not_found"})
             return
         port = self.server.server_address[1]
@@ -3247,16 +4488,59 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not supplied or not secrets.compare_digest(supplied, self.server.state.csrf_token):
             self._send_json(403, {"error": "invalid_csrf_token"})
             return
-        ok, err_status, err_code = self._drain_post_body()
+        ok, err_status, err_code, raw_body = self._read_post_body()
         if not ok:
             self._send_json(err_status, {"error": err_code})
             return
-        try:
-            payload = self.server.state.refresh()
-        except (OSError, ValueError, RuntimeError, TypeError):
-            self._send_json(500, {"error": "dashboard_refresh_failed"})
+        if route == "/api/refresh":
+            try:
+                payload = self.server.state.refresh()
+            except (OSError, ValueError, RuntimeError, TypeError):
+                self._send_json(500, {"error": "dashboard_refresh_failed"})
+                return
+            self._send_json(200, payload)
             return
-        self._send_json(200, payload)
+
+        try:
+            req_data = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._send_json(400, {"error": "invalid_json_body"})
+            return
+        if not isinstance(req_data, dict):
+            self._send_json(400, {"error": "invalid_json_body"})
+            return
+        row_id = req_data.get("row_id")
+        if (
+            not isinstance(row_id, str)
+            or not 1 <= len(row_id) <= 256
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in row_id)
+        ):
+            self._send_json(400, {"error": "invalid_row_id"})
+            return
+        try:
+            payload = self.server.state.get_payload()
+        except (OSError, ValueError, RuntimeError, TypeError):
+            self._send_json(500, {"error": "dashboard_collection_failed"})
+            return
+        if payload.get("mode") != "live":
+            self._send_json(409, {"error": "terminal_focus_unavailable_in_snapshot_mode"})
+            return
+        target_row = next(
+            (row for row in (payload.get("sessions") or []) if row.get("row_id") == row_id),
+            None,
+        )
+        if target_row is None:
+            self._send_json(404, {"error": "session_not_found"})
+            return
+        try:
+            with self.server.state.focus_lock:
+                _, focus_status, focus_body = focus_local_terminal_session(
+                    target_row, mode=payload.get("mode", "live")
+                )
+        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
+            self._send_json(500, {"error": "terminal_focus_failed"})
+            return
+        self._send_json(focus_status, focus_body)
 
 
 def create_server(state, host="127.0.0.1", port=8765):
