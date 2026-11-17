@@ -1474,6 +1474,20 @@ class DashboardBlockerAndHtmlTests(unittest.TestCase):
             self.assertNotIn("h1", drafts_md)
             self.assertNotIn("h2", drafts_md)
 
+        # Non-subagent keystroke_prompt row preserves its own status/PROMPT label in choose_target
+        non_sub_payload = {
+            "sessions": [
+                session("h1", "claw", "claw-custom", "idle", repo="claw-custom", target="T9/1",
+                        human_block_kind="keystroke", flags=[]),
+            ],
+        }
+        non_sub_claw = {"host": "h1", "repo": "claw-custom"}
+        non_sub_targets = OPS.claw_targets(non_sub_payload, non_sub_claw)
+        chosen_ns, reason_ns = OPS.choose_target(non_sub_targets, non_sub_claw, "fleet")
+        self.assertIsNone(chosen_ns)
+        self.assertNotIn("subagent-approval", reason_ns)
+        self.assertIn("waits for a human (idle)", reason_ns)
+
 
 if __name__ == "__main__":
     unittest.main()

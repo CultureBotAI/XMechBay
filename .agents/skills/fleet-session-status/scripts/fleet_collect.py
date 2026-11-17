@@ -192,14 +192,29 @@ def ancestors(pid, processes):
 def parse_panes(text):
     # Linked/grouped sessions list the same server-wide pane more than once.
     # Count and probe the pane once; memberships are observations, not ownership.
-    panes, errors = {}, []
+    panes, dead_panes, errors = {}, set(), []
     for line in text.splitlines():
         fields = line.split("\t", 8)
         if (len(fields) != 9 or not re.fullmatch(r"%\d+", fields[0]) or
-                not fields[1].isdigit() or not re.fullmatch(r"@\d+", fields[4])):
+                not (fields[1].isdigit() or fields[1] == "dead") or
+                not re.fullmatch(r"@\d+", fields[4])):
             errors.append("tmux_row_unparsed")
             continue
-        row = {"pane": fields[0], "pid": int(fields[1]), "tty": tty_name(fields[2]),
+        pane_id = fields[0]
+        if fields[1] == "dead":
+            if pane_id in panes:
+                if panes[pane_id] is not None:
+                    errors.append("pane_rows_invalid")
+                    panes[pane_id] = None
+            else:
+                dead_panes.add(pane_id)
+            continue
+        if pane_id in dead_panes:
+            dead_panes.discard(pane_id)
+            errors.append("pane_rows_invalid")
+            panes[pane_id] = None
+            continue
+        row = {"pane": pane_id, "pid": int(fields[1]), "tty": tty_name(fields[2]),
                "tmux_session": fields[3], "window": fields[5], "tmux_window_id": fields[4],
                "pane_index": fields[6], "command": fields[7], "cwd": fields[8]}
         if row["pane"] not in panes:
@@ -622,7 +637,7 @@ def collect(health_report=None, runner=None):
                  if Path(path).is_file()), None) or shutil.which("tmux")
     panes = []
     if tmux:
-        fmt = "#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{session_name}\t#{window_id}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}"
+        fmt = "#{pane_id}\t#{?pane_dead,dead,#{pane_pid}}\t#{pane_tty}\t#{session_name}\t#{window_id}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}"
         try:
             panes, errors = parse_panes(runner.run([tmux, "list-panes", "-a", "-F", fmt]))
             result["errors"].extend(errors)

@@ -574,6 +574,33 @@ class ObservationTests(unittest.TestCase):
         self.assertIsNone(logical[11]["skip_permissions"])
         self.assertIsNone(logical[12]["skip_permissions"])
 
+    @patch.object(COLLECTOR, "MAX_PANES", 1)
+    def test_remain_on_exit_dead_pane_is_ignored_without_parse_error_or_budget_drain(self):
+        # Exited remain-on-exit panes emit "dead" for #{?pane_dead,dead,#{pane_pid}}
+        text = (
+            "%44\tdead\t/dev/ttys019\tclaw-fleet\t@44\tprimary\t0\tpython3\t/srv/claw\n"
+            "%44\tdead\t/dev/ttys019\txmb-view\t@44\tprimary\t0\tpython3\t/srv/claw\n"
+            "%1\t10\t/dev/ttys001\tmechs\t@1\texample-project\t0\tcodex\t/srv/example-project\n"
+        )
+        rows, errors = COLLECTOR.parse_panes(text)
+        self.assertEqual(errors, [])
+        self.assertEqual([row["pane"] for row in rows], ["%1"])
+
+        # Empty pid field without dead marker remains a parse error
+        bad_rows, bad_errors = COLLECTOR.parse_panes(
+            "%45\t\t/dev/ttys036\tclaw-secondary\t@45\tprimary\t0\tpython3\t/srv/claw\n"
+        )
+        self.assertEqual(bad_rows, [])
+        self.assertEqual(bad_errors, ["tmux_row_unparsed"])
+
+        # Conflicting dead + live rows for the same pane ID invalidate that pane
+        conflict_rows, conflict_errors = COLLECTOR.parse_panes(
+            "%44\tdead\t/dev/ttys019\tclaw-fleet\t@44\tprimary\t0\tpython3\t/srv/claw\n"
+            "%44\t10\t/dev/ttys019\txmb-view\t@44\tprimary\t0\tpython3\t/srv/claw\n"
+        )
+        self.assertEqual(conflict_rows, [])
+        self.assertEqual(conflict_errors, ["pane_rows_invalid"])
+
 
 if __name__ == "__main__":
     unittest.main()

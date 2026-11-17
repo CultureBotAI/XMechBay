@@ -1341,6 +1341,13 @@ def claw_targets(payload: dict, claw: dict) -> list:
             transport = "terminal"
         else:
             continue  # process-only rows (P123) cannot receive guarded input
+        status_str = str(r.get("status") or "")
+        flags_set = set(r.get("flags") or ())
+        prompt_label = (
+            status_str
+            if status_str.startswith(HUMAN_PROMPTS)
+            else ("subagent-approval" if "subagent-approval" in flags_set else (status_str or "PROMPT"))
+        )
         out.append({"target": target, "transport": transport,
                     "window": int(match.group(1)) if match else None, "tab": int(match.group(2)) if match else None,
                     "tmux_session": r.get("tmux_session"), "tmux_window": r.get("tmux_window"),
@@ -1348,7 +1355,8 @@ def claw_targets(payload: dict, claw: dict) -> list:
                     "has_draft": has_composer_draft(r),
                     "is_pasted_prompt": is_pasted_prompt_row(r),
                     "has_agent_message": is_agent_message_row(r),
-                    "is_keystroke_prompt": is_keystroke_prompt_row(r)})
+                    "is_keystroke_prompt": is_keystroke_prompt_row(r),
+                    "keystroke_prompt_label": prompt_label})
     return out
 
 
@@ -1433,7 +1441,9 @@ def choose_target(targets: list, claw: dict, controller_session: str):
         return None, f"claw {chosen['target']} has an unsent composer draft; send or clear it before pasting"
     c_status = str(chosen.get("status") or "")
     if chosen.get("is_keystroke_prompt") or c_status.startswith(HUMAN_PROMPTS):
-        prompt_name = c_status if c_status.startswith(HUMAN_PROMPTS) else "subagent-approval"
+        prompt_name = chosen.get("keystroke_prompt_label") or (
+            c_status if c_status.startswith(HUMAN_PROMPTS) else (c_status or "PROMPT")
+        )
         return None, f"claw {chosen['target']} waits for a human ({prompt_name}); answer or clear the prompt before pasting"
     if chosen.get("has_agent_message"):
         return None, f"claw {chosen['target']} awaits a user reply to its last message; reply before pasting a new goal"
@@ -1487,9 +1497,15 @@ def render_decisions_md(decisions: list, claw_summary: dict) -> str:
         lines.append("## Prepared claw briefs (`DISPATCH.md`)")
         lines.append("")
         if ready:
-            lines.append(f"- Ready for canary-first dispatch after approval: {', '.join(f'`{k}` ({claw_summary[k]['findings']} findings)' for k in ready)}.")
+            ready_text = ", ".join(
+                f"`{k}` ({claw_summary[k]['findings']} findings)" for k in ready
+            )
+            lines.append(f"- Ready for canary-first dispatch after approval: {ready_text}.")
         if blocked:
-            lines.append(f"- Waiting on target resolution or blocker clearance before dispatch: {', '.join(f'`{k}` ({claw_summary[k]['reason']})' for k in blocked)}.")
+            blocked_text = ", ".join(
+                f"`{k}` ({claw_summary[k]['reason']})" for k in blocked
+            )
+            lines.append(f"- Waiting on target resolution or blocker clearance before dispatch: {blocked_text}.")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
