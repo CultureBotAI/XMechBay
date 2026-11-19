@@ -1488,6 +1488,114 @@ class DashboardBlockerAndHtmlTests(unittest.TestCase):
         self.assertNotIn("subagent-approval", reason_ns)
         self.assertIn("waits for a human (idle)", reason_ns)
 
+    def test_stale_reused_payload_warns_and_refresh_dashboard_triggers_csrf_post(self):
+        cfg = config(thresholds={"dashboard_payload_stale_seconds": 300})
+        base_payload = {
+            "mode": "live",
+            "generated_at": "2026-11-16T23:00:00Z",
+            "hosts": [{"key": "h1", "reachable": True, "errors": [], "health": {"status": "ok", "process_status": "ok"}}],
+            "sessions": [session("h1", "claw", "claw-a", "idle", repo="claw-a", target="T1/1")],
+        }
+        # 1. Stale reused payload (> 300s) emits an observation warning; fresh (< 300s) does not
+        stale = OPS.tag_reused_payload(
+            base_payload,
+            "dashboard_url",
+            observed_at=OPS.parse_time("2026-11-16T23:25:00Z"),
+        )
+        stale_findings = OPS.analyze(stale, {}, {}, cfg)
+        obs_titles = [f["title"] for f in stale_findings if f["category"] == "observation"]
+        self.assertTrue(any("session payload from dashboard_url is 25.0 min old" in t for t in obs_titles), obs_titles)
+
+        fresh = OPS.tag_reused_payload(
+            base_payload,
+            "dashboard_url",
+            observed_at=OPS.parse_time("2026-11-16T23:02:00Z"),
+        )
+        fresh_findings = OPS.analyze(fresh, {}, {}, cfg)
+        self.assertFalse(any("session payload from" in f["title"] for f in fresh_findings))
+
+        # Snapshot-mode payloads never emit live staleness warnings
+        snap_payload = dict(base_payload, mode="snapshot")
+        snap_tagged = OPS.tag_reused_payload(
+            snap_payload,
+            "status_json",
+            observed_at=OPS.parse_time("2026-11-18T23:00:00Z"),
+        )
+        self.assertFalse(any("session payload from" in f["title"] for f in OPS.analyze(snap_tagged, {}, {}, cfg)))
+
+        # 2. CLI validation: --refresh-dashboard requires --dashboard-url, and performs CSRF GET + POST /api/refresh
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_path = tmp_path / "fleet-ops.json"
+            cfg_path.write_text(json.dumps(cfg))
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    OPS.main([
+                        "--config", str(cfg_path), "observe",
+                        "--refresh-dashboard", "--no-issues",
+                        "--out", str(tmp_path / "bad-run"),
+                    ])
+
+            requests_seen = []
+
+            class FakeResp:
+                def __init__(self, body: bytes):
+                    self._body = body
+
+                def read(self):
+                    return self._body
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            fresh_now = OPS.datetime.now(OPS.timezone.utc).isoformat()
+            refreshed_payload = dict(base_payload, generated_at=fresh_now)
+
+            def fake_urlopen(req_or_url, timeout=120):
+                if isinstance(req_or_url, str):
+                    requests_seen.append(("GET", req_or_url, {}))
+                    html = '<!doctype html><script>const CSRF_TOKEN = "tok_test_12345678";</script>'
+                    return FakeResp(html.encode("utf-8"))
+                hdrs = {k.lower(): v for k, v in req_or_url.header_items()}
+                requests_seen.append((req_or_url.get_method(), req_or_url.full_url, hdrs))
+                return FakeResp(json.dumps(refreshed_payload).encode("utf-8"))
+
+            run_refreshed = tmp_path / "run-refreshed"
+            with unittest.mock.patch.object(OPS.urllib.request, "urlopen", side_effect=fake_urlopen):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = OPS.main([
+                        "--config", str(cfg_path), "observe",
+                        "--dashboard-url", "http://127.0.0.1:8765/",
+                        "--refresh-dashboard",
+                        "--resources-json", str(EXAMPLES / "fleet-ops-resources.json"),
+                        "--no-issues", "--out", str(run_refreshed),
+                    ])
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(requests_seen), 2)
+            self.assertEqual(requests_seen[0][0], "GET")
+            self.assertEqual(requests_seen[0][1], "http://127.0.0.1:8765/")
+            self.assertEqual(requests_seen[1][0], "POST")
+            self.assertEqual(requests_seen[1][1], "http://127.0.0.1:8765/api/refresh")
+            self.assertEqual(requests_seen[1][2].get("x-mechbay-token"), "tok_test_12345678")
+            self.assertEqual(requests_seen[1][2].get("origin"), "http://127.0.0.1:8765")
+            saved_sessions = json.loads((run_refreshed / "sessions.json").read_text())
+            self.assertEqual(saved_sessions["_fleet_ops_observation"]["source"], "dashboard_url_refreshed")
+            saved_findings = json.loads((run_refreshed / "findings.json").read_text())
+            self.assertFalse(any("session payload from" in f["title"] for f in saved_findings))
+
+            # Non-HTTP URL schemes and URLError failures exit cleanly via SystemExit
+            with self.assertRaises(SystemExit):
+                OPS.refresh_dashboard_url("file:///tmp/dashboard.html")
+            with unittest.mock.patch.object(
+                OPS.urllib.request, "urlopen", side_effect=OPS.urllib.error.URLError("connection refused")
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    OPS.refresh_dashboard_url("http://127.0.0.1:8765")
+            self.assertIn("failed to load dashboard HTML", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

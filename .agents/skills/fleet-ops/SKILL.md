@@ -20,6 +20,7 @@ behind the thresholds and actions are in the
 S=.agents/skills/fleet-ops/scripts/fleet_ops.py
 python3 $S observe                                   # live: sessions, resources, GitHub backlog
 python3 $S observe --dashboard-url http://127.0.0.1:8765   # reuse a running fleet dashboard's /api/status
+python3 $S observe --dashboard-url http://127.0.0.1:8765 --refresh-dashboard  # refresh dashboard first, then reuse
 python3 $S observe --dashboard-html .local/fleet-reports/dashboard-latest.html   # reuse a saved dashboard HTML export
 python3 $S observe --status-json path/to/status.json # reuse a saved /api/status JSON payload
 python3 $S observe --no-issues                       # skip GitHub
@@ -29,11 +30,16 @@ python3 $S --config examples/fleet-ops.json observe --snapshot examples/fleet-sn
 ```
 
 - **Sessions** come from the `fleet-session-status` collector, a live dashboard
-  (`--dashboard-url`), a rendered dashboard HTML snapshot (`--dashboard-html`,
-  parsing `<script id="initial-payload">`), a saved `/api/status` JSON file
-  (`--status-json`), or an offline fixture (`--snapshot`); these four session
-  source flags are mutually exclusive. Screen states are observations, not proof
-  of work.
+  (`--dashboard-url`, optionally paired with `--refresh-dashboard` to trigger a
+  fresh read-only `POST /api/refresh` sweep first), a rendered dashboard HTML
+  snapshot (`--dashboard-html`, parsing `<script id="initial-payload">`), a
+  saved `/api/status` JSON file (`--status-json`), or an offline fixture
+  (`--snapshot`); these four session source flags are mutually exclusive. When a
+  non-snapshot payload from `--dashboard-url`, `--dashboard-html`, or
+  `--status-json` has a `generated_at` timestamp older than
+  `thresholds.dashboard_payload_stale_seconds` (default `300` s), `fleet-ops`
+  raises an `observation` warning so stale cached state is visible before
+  planning dispatch. Screen states are observations, not proof of work.
 - **Resources** come from `host_resources_probe.py`, run locally or piped over
   SSH to the system Python. It only reads, bounds every `du` with a timeout and
   reports a timeout as unknown, never as zero (fleet-ops raises an observation

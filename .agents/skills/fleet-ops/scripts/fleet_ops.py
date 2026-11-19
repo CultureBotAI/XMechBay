@@ -42,6 +42,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -65,6 +67,7 @@ DEFAULT_THRESHOLDS = {
     "idle_sessions_warn": 12,
     "non_working_sessions_warn": 20,
     "blind_sessions_warn": 2,
+    "dashboard_payload_stale_seconds": 300,
     "achieved_goal_age_hours": 12,
     "pr_stale_days": 14,
     "pr_backlog_warn": 25,
@@ -207,6 +210,7 @@ INITIAL_PAYLOAD_RE = re.compile(
     r"<script\b[^>]*\bid=[\"']initial-payload[\"'][^>]*>(.*?)</script>",
     re.I | re.S,
 )
+CSRF_TOKEN_RE = re.compile(r'const\s+CSRF_TOKEN\s*=\s*"([A-Za-z0-9_-]{8,96})"')
 
 
 def extract_dashboard_html_payload(html_text: str) -> dict:
@@ -223,14 +227,72 @@ def extract_dashboard_html_payload(html_text: str) -> dict:
     return payload
 
 
+def tag_reused_payload(payload: dict, source: str, observed_at: datetime | None = None) -> dict:
+    if not isinstance(payload, dict):
+        return payload
+    stamped = dict(payload)
+    stamped["_fleet_ops_observation"] = {
+        "source": source,
+        "observed_at": (observed_at or datetime.now(timezone.utc)).isoformat(),
+    }
+    return stamped
+
+
+def validate_dashboard_url(dashboard_url: str) -> tuple[str, str]:
+    base = (dashboard_url or "").strip().rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise SystemExit(f"--dashboard-url must be an http:// or https:// URL: {dashboard_url!r}")
+    return base, f"{parsed.scheme}://{parsed.netloc}"
+
+
+def refresh_dashboard_url(dashboard_url: str, timeout: int = 120) -> dict:
+    base, origin = validate_dashboard_url(dashboard_url)
+    try:
+        with urllib.request.urlopen(base + "/", timeout=timeout) as index_resp:
+            html_text = index_resp.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"failed to load dashboard HTML from {base}/: {exc}")
+    token_match = CSRF_TOKEN_RE.search(html_text)
+    if not token_match:
+        raise SystemExit("dashboard HTML at --dashboard-url missing CSRF_TOKEN for --refresh-dashboard")
+    req = urllib.request.Request(
+        base + "/api/refresh",
+        data=b"{}",
+        method="POST",
+        headers={
+            "Origin": origin,
+            "X-MechBay-Token": token_match.group(1),
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as refresh_resp:
+            payload = json.loads(refresh_resp.read().decode())
+    except (urllib.error.URLError, ValueError) as exc:
+        raise SystemExit(f"failed to refresh dashboard at {base}/api/refresh: {exc}")
+    if not isinstance(payload, dict) or not isinstance(payload.get("sessions"), list):
+        raise SystemExit("dashboard /api/refresh response must be a JSON object with a sessions list")
+    return payload
+
+
 def collect_sessions(args, config: dict) -> dict:
     if getattr(args, "status_json", None):
-        return json.loads(Path(args.status_json).read_text())
+        return tag_reused_payload(json.loads(Path(args.status_json).read_text()), "status_json")
     if getattr(args, "dashboard_html", None):
-        return extract_dashboard_html_payload(Path(args.dashboard_html).read_text())
+        return tag_reused_payload(extract_dashboard_html_payload(Path(args.dashboard_html).read_text()), "dashboard_html")
     if getattr(args, "dashboard_url", None):
-        with urllib.request.urlopen(args.dashboard_url.rstrip("/") + "/api/status", timeout=120) as response:
-            return json.loads(response.read().decode())
+        if getattr(args, "refresh_dashboard", False):
+            return tag_reused_payload(refresh_dashboard_url(args.dashboard_url), "dashboard_url_refreshed")
+        base, _ = validate_dashboard_url(args.dashboard_url)
+        try:
+            with urllib.request.urlopen(base + "/api/status", timeout=120) as response:
+                payload = json.loads(response.read().decode())
+        except (urllib.error.URLError, ValueError) as exc:
+            raise SystemExit(f"failed to fetch dashboard status from {base}/api/status: {exc}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("sessions"), list):
+            raise SystemExit("dashboard /api/status response must be a JSON object with a sessions list")
+        return tag_reused_payload(payload, "dashboard_url")
     sys.path.insert(0, str(STATUS_SCRIPTS))
     import fleet_dashboard  # noqa: E402  (sibling skill; shares its collector)
     status_config = None if getattr(args, "snapshot", None) else resolve_path(config, config.get("fleet_status_config"))
@@ -928,11 +990,59 @@ def parked_achieved_seconds(row: dict) -> float:
     return -1.0
 
 
+def format_age_seconds(seconds: float) -> str:
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f} h"
+    if seconds >= 120:
+        return f"{seconds / 60:.1f} min"
+    return f"{int(round(seconds))} s"
+
+
 def host_observation_findings(payload: dict, config: dict, live: set | None = None) -> list:
     t, out = config["thresholds"], []
     if live is None and "sessions" in payload:
         live = live_claws(payload.get("sessions"), config)
     coord_maint = owner("xmechbay", "maintenance")
+    obs_meta = payload.get("_fleet_ops_observation")
+    if isinstance(obs_meta, dict) and payload.get("mode") != "snapshot":
+        source_label = str(obs_meta.get("source") or "reused_payload")
+        gen_raw = payload.get("generated_at")
+        obs_raw = obs_meta.get("observed_at")
+        try:
+            gen_ts = parse_time(gen_raw) if isinstance(gen_raw, str) and gen_raw.strip() else None
+        except ValueError:
+            gen_ts = None
+        try:
+            obs_ts = parse_time(obs_raw) if isinstance(obs_raw, str) and obs_raw.strip() else None
+        except ValueError:
+            obs_ts = None
+        if gen_ts is None:
+            out.append(finding(
+                "warning", "observation",
+                f"session payload from {source_label} has no valid generated_at timestamp",
+                "Refresh the dashboard (`observe --dashboard-url ... --refresh-dashboard`) or run live `fleet_ops.py observe` before planning dispatch.",
+                coord_maint,
+                evidence={"source": source_label, "generated_at": gen_raw},
+            ))
+        else:
+            effective_obs_ts = obs_ts or datetime.now(timezone.utc)
+            age_sec = (effective_obs_ts - gen_ts).total_seconds()
+            stale_limit = t.get("dashboard_payload_stale_seconds", DEFAULT_THRESHOLDS["dashboard_payload_stale_seconds"])
+            if age_sec > stale_limit:
+                age_txt = format_age_seconds(age_sec)
+                out.append(finding(
+                    "warning", "observation",
+                    f"session payload from {source_label} is {age_txt} old",
+                    "Refresh the dashboard (`observe --dashboard-url ... --refresh-dashboard`) or run live `fleet_ops.py observe` before planning dispatch so exited or changed sessions are not treated as current.",
+                    coord_maint,
+                    evidence={
+                        "source": source_label,
+                        "generated_at": gen_raw,
+                        "observed_at": obs_raw or effective_obs_ts.isoformat(),
+                        "age_seconds": int(round(age_sec)),
+                        "threshold_seconds": stale_limit,
+                    },
+                ))
     raw_hosts = [h for h in (payload.get("hosts") or []) if isinstance(h, dict)]
     unreachable_hosts = {h.get("key") for h in raw_hosts if isinstance(h.get("key"), str) and h.get("reachable") is False}
     for host in sorted(raw_hosts, key=lambda h: str(h.get("key") or "")):
@@ -2469,6 +2579,8 @@ def main(argv=None) -> int:
     obs_src.add_argument("--status-json", type=Path, help="use a saved /api/status payload")
     obs_src.add_argument("--dashboard-html", type=Path, help="extract sessions from a rendered dashboard HTML file (e.g. dashboard-latest.html)")
     obs_src.add_argument("--dashboard-url", help="read sessions from a running dashboard, e.g. http://127.0.0.1:8765")
+    obs.add_argument("--refresh-dashboard", action="store_true",
+                     help="trigger POST /api/refresh on --dashboard-url before reading sessions")
     obs.add_argument("--resources-json", type=Path, help="use saved probe results {host: probe} instead of probing")
     obs.add_argument("--issues-json", type=Path, help="use saved backlog data instead of querying GitHub")
     obs.add_argument("--no-issues", action="store_true", help="skip the GitHub backlog")
@@ -2482,6 +2594,8 @@ def main(argv=None) -> int:
     rc.add_argument("--infra-repo", action="append", default=[], metavar="KEY=OWNER/REPO",
                     help="override infra_repos entry (xmechbay or claw)")
     args = parser.parse_args(argv)
+    if args.command == "observe" and args.refresh_dashboard and not args.dashboard_url:
+        parser.error("--refresh-dashboard requires --dashboard-url")
     config = load_config(args.config)
     if args.command == "plan":
         summary = plan(args.run_dir, config)

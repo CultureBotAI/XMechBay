@@ -120,6 +120,22 @@ def scan_blob(data: bytes, location: str, max_bytes: int, extra: list[re.Pattern
     return findings
 
 
+def is_linked_worktree_gitfile(root: Path, candidate: Path) -> bool:
+    if candidate.parent != root or candidate.name != ".git" or candidate.is_symlink() or not candidate.is_file():
+        return False
+    try:
+        raw = candidate.read_bytes()
+    except OSError:
+        return False
+    if len(raw) > 4096:
+        return False
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return bool(re.fullmatch(r"gitdir:\s+[^\r\n]+\r?\n?", text))
+
+
 def scan_repository(root: Path, max_bytes: int, extra: list[re.Pattern[str]], worktree_all: bool = False, refs: list[str] | None = None) -> tuple[set[Finding], dict[str, int]]:
     findings: set[Finding] = set()
     tracked = [os.fsdecode(path) for path in git(root, "ls-files", "-z").split(b"\0") if path]
@@ -159,6 +175,8 @@ def scan_repository(root: Path, max_bytes: int, extra: list[re.Pattern[str]], wo
             link_directories = [name for name in directories if (Path(directory) / name).is_symlink()]
             for filename in filenames + link_directories:
                 candidate = Path(directory) / filename
+                if is_linked_worktree_gitfile(root, candidate):
+                    continue
                 path = candidate.relative_to(root).as_posix()
                 if path in tracked_set:
                     continue

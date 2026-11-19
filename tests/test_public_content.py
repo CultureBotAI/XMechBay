@@ -194,6 +194,35 @@ class PublicationGateTests(unittest.TestCase):
             gate.main(["--root", str(self.root), "--deny-patterns", str(self.root / "patterns.txt")])
         self.assertEqual(caught.exception.code, 2)
 
+    def test_linked_worktree_root_gitfile_is_excluded_under_worktree_all(self):
+        self.write("README.md", "Generic example\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Initial commit")
+        wt_parent = tempfile.TemporaryDirectory()
+        self.addCleanup(wt_parent.cleanup)
+        # Include a path segment matching personal-home-path inside gitdir pointer simulation
+        wt_dir = Path(wt_parent.name) / "linked-wt"
+        self.git("worktree", "add", "-q", "-b", "linked-branch", str(wt_dir), "HEAD")
+        self.assertTrue((wt_dir / ".git").is_file())
+        findings, counts = gate.scan_repository(wt_dir, 1024 * 1024, [], worktree_all=True)
+        self.assertEqual(findings, set())
+        self.assertEqual(counts["additional_worktree_files"], 0)
+
+        # Untracked private files inside a linked worktree are still caught
+        (wt_dir / "untracked.txt").write_text("ssh host" + ".local\n")
+        findings_dirty, counts_dirty = gate.scan_repository(wt_dir, 1024 * 1024, [], worktree_all=True)
+        self.assertIn("local-hostname", self.categories(findings_dirty))
+        self.assertEqual(counts_dirty["additional_worktree_files"], 1)
+
+        # Nested .git pointer files or multi-line spoofed .git files are not skipped
+        (wt_dir / "untracked.txt").unlink()
+        sub = wt_dir / "sub"
+        sub.mkdir()
+        (sub / ".git").write_text("gitdir: /" + "Users/" + "example-user/repo/.git/modules/sub\n")
+        findings_sub, counts_sub = gate.scan_repository(wt_dir, 1024 * 1024, [], worktree_all=True)
+        self.assertIn("personal-home-path", self.categories(findings_sub))
+        self.assertEqual(counts_sub["additional_worktree_files"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
