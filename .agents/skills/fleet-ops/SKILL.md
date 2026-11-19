@@ -62,7 +62,7 @@ A Mech's primary writer claw is resolved in this order:
 3. when any claw declares `roles` (see [`docs/claw-roles.md`](../../../docs/claw-roles.md)),
    the Mech's observed backlog lane (preferring live matching role claws before offline fallbacks):
    - `infra` (`>= pr_ci_cohort_min` and `>= pr_ci_cohort_ratio` failing PRs) -> `infrastructure_supervisor` (when `accept_infra_cohorts` is enabled; falls back to `stewardship_supervisor` / `cycle_supervisor`);
-   - `steward` (`open_prs >= pr_backlog_warn`, any failing check, `open_prs > len(prs)`, or `open_issues >= issue_steward_warn`) -> `stewardship_supervisor` (or `cycle_supervisor`);
+   - `steward` (`open_prs >= pr_backlog_warn`, any failing check, `open_prs > len(prs)`, or `open_issues >= issue_steward_warn` unless `discover_ignores_issue_backlog` is true) -> `stewardship_supervisor` (or `cycle_supervisor`);
    - `discover` (healthy queue below those thresholds with all open PRs observed) -> `discovery_supervisor` (or `cycle_supervisor`);
    - `unknown` (`--no-issues` or query error) -> `stewardship_supervisor` / `cycle_supervisor` (never triggers blind discovery);
 4. otherwise a catch-all supervisor claw (`"mechs": ["*"]`) on the host running
@@ -72,7 +72,19 @@ An explicit `"mechs": []` (or a claw holding only `closure_steward` /
 `fleet_maintainer`) never acts as a catch-all primary Mech owner. When a live
 `closure_steward` claw is configured, `user:merges` keeps merge authority while
 `closure_steward` receives a read-only diff-review finding for unapproved green
-PRs and owns stale-draft triage.
+PRs and owns stale-draft triage. A closure steward whose config sets
+`merge_authority: "after_per_pr_review"` gets brief and goal text that let it
+merge Mech-repository PRs after its own review of the exact head with green
+checks; every other claw keeps the no-merge rule. With
+`discover_ignores_issue_backlog`, a Mech whose only backlog is open issues stays
+in the `discover` lane. Its issue finding goes to a live stewardship claw, else a
+live cycle supervisor (then offline ones), as triage-only work: that claw's brief
+lists the Mech as triage-only, with no record edits or PRs, so the discovery claw
+remains the only writer. With no such claw in scope, the finding goes to the user
+as a configuration warning, never to the discovery claw. `merge_authority` is
+rejected on a claw that also holds a supervisor (writer) role, and green PRs in
+`infra_repos` repositories always stay with `user:merges`. With a valid grant,
+the Mech's green-PR finding goes to that closure claw instead of `user:merges`.
 
 ## 3. Plan
 
@@ -201,7 +213,9 @@ ignored `.local/fleet-ops.json` (or set `XMECHBAY_FLEET_OPS_CONFIG`):
   `fleet_maintainer`, `cycle_supervisor`), optional `accept_infra_cohorts`
   (boolean controlling whether an `infrastructure_supervisor` receives systemic
   `infra` cohorts), optional `closure_mechs` (Mech scope override when a claw
-  combines a supervisor role with `closure_steward`), `brief_dir` on that host,
+  combines a supervisor role with `closure_steward`), optional `merge_authority`
+  (only `"after_per_pr_review"`, only on a `closure_steward` claw; the owner's
+  explicit grant, recorded in private config), `brief_dir` on that host,
   optional `target_hint`, and optional `tmux_session` (when one host runs
   multiple controller-owned tmux sessions).
 - `mech_owner`: explicit Mech-to-claw ownership overrides.
@@ -214,7 +228,8 @@ ignored `.local/fleet-ops.json` (or set `XMECHBAY_FLEET_OPS_CONFIG`):
   `watch_warn_gib`, `codex_sessions_warn_gib`, `guard_stale_hours`,
   `idle_sessions_warn`, `non_working_sessions_warn`, `blind_sessions_warn`,
   `achieved_goal_age_hours`, `pr_stale_days`, `pr_backlog_warn`,
-  `issue_steward_warn`, `pr_ci_cohort_min`, `pr_ci_cohort_ratio`).
+  `issue_steward_warn`, `discover_ignores_issue_backlog`, `pr_ci_cohort_min`,
+  `pr_ci_cohort_ratio`).
 
 Keep the real config, runs, briefs and dispatch records under `.local/`; they
 hold hostnames and paths. Only synthetic examples belong in Git.

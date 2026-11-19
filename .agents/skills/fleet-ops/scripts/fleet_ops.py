@@ -69,6 +69,9 @@ DEFAULT_THRESHOLDS = {
     "pr_stale_days": 14,
     "pr_backlog_warn": 25,
     "issue_steward_warn": 100,
+    # When true, an open-issue backlog alone no longer moves a Mech out of the `discover`
+    # lane; its issues go to a stewardship claw as triage-only work (no record edits).
+    "discover_ignores_issue_backlog": False,
     "pr_ci_cohort_min": 5,
     "pr_ci_cohort_ratio": 0.5,
 }
@@ -80,6 +83,8 @@ KNOWN_CLAW_ROLES = frozenset({
     "closure_steward",
     "fleet_maintainer",
 })
+# Owner-granted merge scopes a closure_steward claw may hold (private config `merge_authority`).
+MERGE_AUTHORITY_VALUES = frozenset({"after_per_pr_review"})
 SUPERVISOR_ROLES = frozenset({
     "cycle_supervisor",
     "discovery_supervisor",
@@ -473,10 +478,30 @@ def mech_mode(mech: str, repo_data: dict | None, thresholds: dict) -> str:
         return "infra"
     open_prs = repo_data.get("open_prs") or 0
     open_issues = repo_data.get("open_issues") or 0
-    if (open_prs >= thresholds["pr_backlog_warn"] or failing
-            or open_issues >= thresholds["issue_steward_warn"] or open_prs > len(prs)):
+    issue_blocks = (open_issues >= thresholds["issue_steward_warn"]
+                    and thresholds.get("discover_ignores_issue_backlog") is not True)
+    if open_prs >= thresholds["pr_backlog_warn"] or failing or issue_blocks or open_prs > len(prs):
         return "steward"
     return "discover"
+
+
+def issue_triage_claw_for_mech(mech: str, config: dict, live: set | None = None) -> str | None:
+    """A stewardship claw (else a cycle supervisor) whose scope covers the Mech, for triage-only
+    issue work while the Mech's writer lane is `discover`. Live claws are preferred."""
+    claws = config["claws"]
+    pools = [[key for key, claw in sorted(claws.items())
+              if isinstance(claw, dict) and claw.get("host") and role in claw_roles(claw)
+              and ("*" in claw_mechs(claw) or mech in claw_mechs(claw))]
+             for role in ("stewardship_supervisor", "cycle_supervisor")]
+    if live is not None:
+        for pool in pools:
+            chosen = pick_claw(pool, live, require_live=True)
+            if chosen:
+                return chosen
+    for pool in pools:
+        if pool:
+            return pick_claw(pool, live)
+    return None
 
 
 def claw_for_mech(mech: str, by_mech: dict, config: dict, live: set | None = None, issues: dict | None = None) -> str | None:
@@ -608,6 +633,10 @@ def config_findings(config: dict) -> list:
             out.append(finding("warning", "observation", f"mech_owner assigns {mech} to non-writer claw {key!r}",
                                "Assign a supervisor claw or add a supervisor role; the Mech falls back to default writer routing.",
                                owner("user", "config"), mech=mech))
+    opt_in = config["thresholds"].get("discover_ignores_issue_backlog")
+    if not isinstance(opt_in, bool):
+        out.append(finding("warning", "observation", "thresholds.discover_ignores_issue_backlog must be a boolean",
+                           "Set it to true or false; any other value is treated as false.", owner("user", "config")))
     roles_by_host = defaultdict(lambda: defaultdict(list))
     for key, claw in sorted(config["claws"].items()):
         if not isinstance(claw, dict) or not claw.get("host"):
@@ -625,6 +654,18 @@ def config_findings(config: dict) -> list:
         if raw_cohorts is not None and not isinstance(raw_cohorts, bool):
             out.append(finding("warning", "observation", f"claw {key!r} accept_infra_cohorts must be a boolean",
                                "Set accept_infra_cohorts to true or false, or omit it.", owner("user", "config")))
+        raw_merge = claw.get("merge_authority")
+        if raw_merge is not None:
+            if raw_merge not in MERGE_AUTHORITY_VALUES:
+                out.append(finding("warning", "observation", f"claw {key!r} merge_authority must be one of {sorted(MERGE_AUTHORITY_VALUES)}",
+                                   "Fix or omit merge_authority; until then its briefs keep the no-merge rule.", owner("user", "config")))
+            elif "closure_steward" not in claw_roles(claw):
+                out.append(finding("warning", "observation", f"claw {key!r} has merge_authority without the closure_steward role",
+                                   "merge_authority only applies to a closure_steward claw; add the role or remove the field.", owner("user", "config")))
+            elif set(claw_roles(claw)) & SUPERVISOR_ROLES:
+                out.append(finding("warning", "observation", f"claw {key!r} has merge_authority but also a writer role",
+                                   "A claw that opens PRs must not merge them; give merge_authority only to a closure_steward claw "
+                                   "without supervisor roles. Until then its briefs keep the no-merge rule.", owner("user", "config")))
         raw_tmux = claw.get("tmux_session")
         if raw_tmux is not None and not valid_tmux_session_name(raw_tmux):
             out.append(finding("warning", "observation", f"claw {key!r} tmux_session must be a valid session name",
@@ -1113,11 +1154,19 @@ def backlog_findings(issues: dict, config: dict, by_mech: dict, live: set | None
         failing = [p["number"] for p in prs if p["checks"] in ("FAILURE", "ERROR")]
         stale = [p["number"] for p in prs if p["draft"] and (now - parse_time(p["updated_at"])).days >= t["pr_stale_days"]]
         closure_key = closure_claw_for_mech(mech, config, by_mech=by_mech, live=live)
-        if ready:
+        merging_key = (closure_key if closure_key and has_merge_authority(config["claws"].get(closure_key))
+                       and not is_infra_repo(config, repo.get("repo")) else None)
+        if ready and merging_key:
+            out.append(finding("info", "backlog", f"{mech}: {len(ready)} PRs mergeable with green checks",
+                               "Under your merge authority: review each exact PR head adversarially via gh, merge only those that pass "
+                               "(pinned with --match-head-commit) and log each; list doubtful PRs for the user instead of merging them.",
+                               owner("claw", merging_key), mech=mech,
+                               evidence={"repo": repo["repo"], "prs": ready[:30], "mergeable_without_checks": unchecked[:30]}))
+        elif ready:
             out.append(finding("info", "backlog", f"{mech}: {len(ready)} PRs mergeable with green checks",
                                "Review each PR adversarially before any merge proposal; merging stays the user's decision.", owner("user", "merges"), mech=mech,
                                evidence={"repo": repo["repo"], "prs": ready[:30], "mergeable_without_checks": unchecked[:30]}))
-        if closure_key and unreviewed_ready:
+        if closure_key and unreviewed_ready and not merging_key:
             out.append(finding("info", "backlog", f"{mech}: {len(unreviewed_ready)} green PRs awaiting closure-steward diff review",
                                "Review each exact PR head read-only via gh, file issues for any defects, and record verified merge candidates without merging or editing branches.",
                                owner("claw", closure_key), mech=mech,
@@ -1136,8 +1185,26 @@ def backlog_findings(issues: dict, config: dict, by_mech: dict, live: set | None
             out.append(finding("warning", "backlog", f"{mech}: {open_prs} open PRs, {repo.get('open_issues')} open issues",
                                "Batch the review queue by theme (fleet-issue-review) and stop opening new PRs until it shrinks.", mech_owner(mech, by_mech, config, live=live, issues=issues), mech=mech, evidence={"repo": repo["repo"]}))
         elif (repo.get("open_issues") or 0) >= t["issue_steward_warn"]:
-            out.append(finding("info", "backlog", f"{mech}: {repo.get('open_issues')} open issues, {open_prs} open PRs",
-                               "Triage and resolve open review/curation issues by theme (fleet-issue-review) before starting new record discovery.", mech_owner(mech, by_mech, config, live=live, issues=issues), mech=mech, evidence={"repo": repo["repo"]}))
+            triage_key = (issue_triage_claw_for_mech(mech, config, live=live)
+                          if has_role_routing(config) and mech_lane_label(mech, config, issues=issues) == "discover" else None)
+            if triage_key:
+                # The Mech stays in the discover lane (discover_ignores_issue_backlog): the discovery
+                # claw is its only file writer, so the stewardship claw triages issues without editing records.
+                out.append(finding("info", "backlog", f"{mech}: {repo.get('open_issues')} open issues, {open_prs} open PRs",
+                                   "Triage open issues only (label, deduplicate, close obsolete ones with a reason) via gh; do not edit "
+                                   "record files or open PRs while this Mech is in the discover lane.",
+                                   owner("claw", triage_key), mech=mech,
+                                   evidence={"repo": repo["repo"], "mode": "discover", "triage_only": True}))
+            elif has_role_routing(config) and mech_lane_label(mech, config, issues=issues) == "discover":
+                # Opt-in kept the Mech in the discover lane but no claw can triage its issues: never hand
+                # issue resolution to the discovery claw (it must not edit existing records).
+                out.append(finding("warning", "observation", f"{mech}: {repo.get('open_issues')} open issues and no claw to triage them",
+                                   "Give a stewardship or cycle supervisor claw this Mech in its scope, or set "
+                                   "discover_ignores_issue_backlog to false.", owner("user", "config"), mech=mech,
+                                   evidence={"repo": repo["repo"], "mode": "discover"}))
+            else:
+                out.append(finding("info", "backlog", f"{mech}: {repo.get('open_issues')} open issues, {open_prs} open PRs",
+                                   "Triage and resolve open review/curation issues by theme (fleet-issue-review) before starting new record discovery.", mech_owner(mech, by_mech, config, live=live, issues=issues), mech=mech, evidence={"repo": repo["repo"]}))
     return out
 
 
@@ -1274,6 +1341,15 @@ ROLE_BRIEF_RULES = {
         "- Closure lane: inspect PR diffs and checks read-only via `gh`, file issues for defects, and prepare per-Mech "
         "verified merge lists for the user. Never merge, push to another session's branch, or edit Mech checkouts."
     ),
+    "closure_steward_merge": (
+        "- Closure lane with owner-granted merge authority (`after_per_pr_review`): for Mech repositories in your scope only, "
+        "merge a PR only after your own adversarial review of that exact head SHA finds no unresolved defect, every check on "
+        "that head is green, and nothing in the PR or its issues asks for the owner's decision. Merge with "
+        "`gh pr merge <n> --repo <owner/repo> --match-head-commit <sha>` (the repository's merge method), then delete the "
+        "branch. Log each merge (repo, PR, head SHA, one-line review verdict) in your report. Put anything doubtful on the "
+        "owner's decision list instead. Never merge XMechBay, claw or other infrastructure repositories, never push to "
+        "another session's branch, and never edit Mech checkouts."
+    ),
     "fleet_maintainer": (
         "- Maintainer lane: run read-only inventories first (`fleet-repo-crud-cleanup`, `disk-usage-report`), clean only "
         "approved regenerable scratch on this host, refresh checkouts at idle checkpoints, and retire duplicate/completed "
@@ -1287,7 +1363,7 @@ ROLE_BRIEF_RULES = {
 BRIEF_RULES = """## Rules for this brief
 - Re-read live state first; this brief was prepared from a read-only snapshot and can be stale.
 - Assess, then act on one Mech end to end (the canary) before fanning out to the rest.
-- No merges, no answering approval, question, sign-in, trust or update prompts, no paid provider credits, no mentions of people or accounts.
+- {merge_rule}, no answering approval, question, sign-in, trust or update prompts, no paid provider credits, no mentions of people or accounts.
 - Never reset or rewrite ledgers, receipts or status; repair only with verified facts.
 - Keep all work in ~/agent-work/ or a repository's .temp/, never in /tmp or $TMPDIR; point test basetemps there too.
 - Resuming goals spends usage: propose resumes in the report instead of resuming many sessions.
@@ -1302,17 +1378,38 @@ def render_brief(run_id: str, claw_key: str, claw: dict, items: list, report_dir
     for f in items:
         evidence = json.dumps(f["evidence"], sort_keys=True)[:400] if f["evidence"] else ""
         lines.append(f"- [{f['severity']}] {f['id']} {f['title']}. Action: {f['action']}" + (f" Evidence: {evidence}" if evidence else ""))
-    role_lines = [ROLE_BRIEF_RULES[r].format(pr_cap=thresholds["pr_backlog_warn"]) for r in claw_roles(claw) if r in ROLE_BRIEF_RULES]
+    merges = has_merge_authority(claw)
+    role_keys = ["closure_steward_merge" if (r == "closure_steward" and merges) else r for r in claw_roles(claw)]
+    role_lines = [ROLE_BRIEF_RULES[r].format(pr_cap=thresholds["pr_backlog_warn"]) for r in role_keys if r in ROLE_BRIEF_RULES]
+    triage_only = sorted({f.get("mech") for f in items if (f.get("evidence") or {}).get("triage_only") and f.get("mech")})
+    if triage_only:
+        role_lines.append(
+            f"- Triage-only Mechs ({', '.join(triage_only)}): another claw writes their records while they are in the discover "
+            "lane. For these, only label, deduplicate and close obsolete issues with a reason via gh. Do not run record_review, "
+            "resolve_review_findings or repairs, edit record files, push, or open PRs for them.")
     if role_lines:
         lines += ["", "## Role boundaries", ""] + role_lines
-    lines += ["", BRIEF_RULES.format(disk_floor=thresholds["disk_critical_gib"]).rstrip(), "", "## Report", "",
+    merge_rule = "No merges except under the closure lane's merge authority above" if merges else "No merges"
+    lines += ["", BRIEF_RULES.format(disk_floor=thresholds["disk_critical_gib"], merge_rule=merge_rule).rstrip(), "", "## Report", "",
               f"Write {report_dir}/report.md and summary.json: one row per Mech (state, action taken, PRs, remaining blockers, decision needed from the user), then stop."]
     return "\n".join(lines) + "\n"
 
 
-def render_goal(run_id: str, brief_path: str, report_dir: str) -> str:
+def has_merge_authority(claw: object) -> bool:
+    """True only for a closure_steward claw whose config grants a known merge scope."""
+    return (isinstance(claw, dict) and claw.get("merge_authority") in MERGE_AUTHORITY_VALUES
+            and "closure_steward" in claw_roles(claw) and not (set(claw_roles(claw)) & SUPERVISOR_ROLES))
+
+
+def is_infra_repo(config: dict, repo: object) -> bool:
+    """True when `repo` (OWNER/REPO) is one of the configured infrastructure repositories."""
+    return isinstance(repo, str) and repo.lower() in {str(v).lower() for v in config.get("infra_repos", {}).values()}
+
+
+def render_goal(run_id: str, brief_path: str, report_dir: str, merge_authority: bool = False) -> str:
+    merge_rule = "merges only as the brief's merge authority allows" if merge_authority else "no merges"
     text = (f"XMechBay fleet-ops {run_id}: read {brief_path} and carry it out for the Mechs it lists. "
-            "Follow its rules: re-read live state, one canary Mech end to end before the rest, no merges, "
+            f"Follow its rules: re-read live state, one canary Mech end to end before the rest, {merge_rule}, "
             "no answering prompts, no paid credits, nothing in /tmp. "
             f"Write the report it names under {report_dir}, then stop.")
     if len(text) > GOAL_LIMIT:
@@ -1539,7 +1636,7 @@ def plan(run_dir: Path, config: dict) -> dict:
         safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(key))
         remote_dir = f"{brief_dir}/{safe_key}/{run_id}" if shared_brief_dirs[(claw.get("host"), brief_dir)] >= 2 else f"{brief_dir}/{run_id}"
         brief = render_brief(run_id, key, claw, items, remote_dir, config["thresholds"])
-        goal = render_goal(run_id, f"{remote_dir}/brief.md", remote_dir)
+        goal = render_goal(run_id, f"{remote_dir}/brief.md", remote_dir, merge_authority=has_merge_authority(claw))
         write_private_file(out / "briefs" / f"{key}.md", brief)
         write_private_file(out / "goals" / f"{key}.txt", goal)
         host_cfg = hosts.get(claw.get("host")) or {}
