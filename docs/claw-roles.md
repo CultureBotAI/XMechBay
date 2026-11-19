@@ -18,7 +18,7 @@ must not claim the same ownership boundary without an explicit handoff.
 | Discovery supervisor | `discovery_supervisor` | Run bounded `source_discovery` and net-new `add_records` (`add/...` branches and discovery saturation ledgers) for repositories in the `discover` lane | Does not edit existing records, schemas or workflows; stops opening PRs when a repository reaches its open-PR cap or fails checks |
 | Stewardship supervisor | `stewardship_supervisor` | Run `record_review`, `resolve_review_findings`, `open_issue_triage` and non-cohort failing-PR repair for repositories in the `steward` lane | Pauses net-new record additions until open PRs and status checks clear; does not merge PRs |
 | Infrastructure supervisor | `infrastructure_supervisor` | Fix shared CI, schema and workflow causes once on `main`, maintain shared exporters/infrastructure tasks, and bootstrap explicitly assigned repositories (`infra` lane) | Does not mass-edit scientific claims across open PR branches when one base-branch fix resolves the cohort |
-| Closure steward | `closure_steward` | Review mergeable green PR heads and triage stale drafts read-only via `gh`; file defect issues; record verified merge candidates for the operator | Never merges, pushes to another session's branch, substitutes batch sampling for per-PR diff review, or edits repository checkouts |
+| Closure steward | `closure_steward` | Review mergeable green PR heads and triage stale drafts read-only via `gh`; file defect issues; record verified merge candidates for the operator; with an owner-granted `merge_authority`, merge Mech-repository PRs after its own review of the exact head | Never merges without that grant, never merges infrastructure repositories, never pushes to another session's branch, substitutes batch sampling for per-PR diff review, or edits repository checkouts |
 | Fleet maintainer | `fleet_maintainer` | Run read-only space/session inventories first, clean approved regenerable scratch on its host, refresh checkouts at idle checkpoints, and retire duplicate/completed loops via graceful exit | Does not change scientific content, touch unreachable hosts, or treat generic maintenance guidance as permission to remove data |
 
 The owning repository session remains responsible for its changes and evidence.
@@ -30,7 +30,12 @@ receipt against the actual repository state before advancing the cycle.
 historical approval, a role assignment or a policy document does not authorize
 a merge. Without the owner's approval, record the PR and decision needed, mark
 the closure as held, and route it to the owner's decision list. Subsequent work
-may proceed only if the configured cycle permits that held state. Related
+may proceed only if the configured cycle permits that held state. An owner who
+wants a closure steward to merge records that grant in private configuration
+(`merge_authority: "after_per_pr_review"`): Mech repositories only, after the
+steward's own adversarial review of the exact head SHA, with every check green
+and nothing awaiting the owner's decision. Each merge is pinned with
+`--match-head-commit` and logged in the steward's report. Related
 external discussion: [held closure handling](https://github.com/CultureBotAI/culturebotai-claw/issues/1248).
 
 ## Two-fleet workload split and exclusive-writer contract
@@ -57,8 +62,8 @@ backlog state (unless pinned via `mech_owner` or an explicit writer
 | --- | --- | --- | --- |
 | `pinned` | Explicit `mech_owner` entry or writer `claws.<key>.mechs` list (for example, bootstrap repositories) | Configured supervisor claw | `closure_steward` (read-only diff/draft review via `gh`), `fleet_maintainer` (host-local hygiene) |
 | `infra` | Systemic check-failure cohort (`>= pr_ci_cohort_min` and `>= pr_ci_cohort_ratio` failing PRs) | `infrastructure_supervisor` (when `accept_infra_cohorts` is enabled; falls back to `stewardship_supervisor` / `cycle_supervisor`) | `closure_steward` (stale-draft classification via `gh`), `fleet_maintainer` (host-local duplicate-loop inventory) |
-| `steward` | Open PRs `>= pr_backlog_warn`, any non-cohort failing check, truncated PR sample (`open_prs > len(prs)`), or open issues `>= issue_steward_warn` | `stewardship_supervisor` (or `cycle_supervisor`) | `closure_steward` (read-only diff review of green PRs via `gh`) |
-| `discover` | Open PRs `< pr_backlog_warn`, zero failing checks across all open PRs, and open issues `< issue_steward_warn` | `discovery_supervisor` (or `cycle_supervisor`) | `closure_steward` (read-only diff review of green PRs via `gh`) |
+| `steward` | Open PRs `>= pr_backlog_warn`, any non-cohort failing check, truncated PR sample (`open_prs > len(prs)`), or open issues `>= issue_steward_warn` (ignored when `discover_ignores_issue_backlog` is true) | `stewardship_supervisor` (or `cycle_supervisor`) | `closure_steward` (read-only diff review of green PRs via `gh`) |
+| `discover` | Open PRs `< pr_backlog_warn`, zero failing checks across all open PRs, and open issues `< issue_steward_warn` (any issue count when `discover_ignores_issue_backlog` is true) | `discovery_supervisor` (or `cycle_supervisor`) | `closure_steward` (diff review of green PRs via `gh`); with the opt-in, `stewardship_supervisor` triages issues without editing records |
 | `unknown` | Backlog unobserved (`--no-issues` or query failure) | `stewardship_supervisor` / `cycle_supervisor` (never triggers blind discovery) | Coordinator restores backlog observation |
 
 **Workload-matched host placement.** Because `discover`, `steward` and `infra`

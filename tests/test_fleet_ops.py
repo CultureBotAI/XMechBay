@@ -1489,5 +1489,72 @@ class DashboardBlockerAndHtmlTests(unittest.TestCase):
         self.assertIn("waits for a human (idle)", reason_ns)
 
 
+class IssueBacklogDiscoveryAndMergeAuthorityTests(unittest.TestCase):
+    """Synthetic claws and Mechs: an issues-only backlog may stay in the discover lane when the
+    deployment opts in, and a closure steward's briefs reflect an explicit merge_authority."""
+
+    CLAWS = {
+        "io-discovery": {"host": "laptop-b", "repo": "sample-claw", "mechs": ["*"], "roles": ["discovery_supervisor"]},
+        "compute-steward": {"host": "laptop-a", "repo": "sample-claw", "mechs": ["*"], "roles": ["stewardship_supervisor"]},
+        "compute-closure": {"host": "laptop-a", "repo": "sample-claw", "mechs": [],
+                            "roles": ["closure_steward", "fleet_maintainer"], "merge_authority": "after_per_pr_review"},
+    }
+    ISSUES = {"IssueHeavyMech": {"repo": "example-org/IssueHeavyMech", "open_issues": 400, "open_prs": 4, "prs": [
+        {"number": n, "draft": False, "mergeable": "MERGEABLE", "checks": "SUCCESS", "review": None,
+         "updated_at": "2026-01-01T00:00:00Z"} for n in range(1, 5)]}}
+
+    def cfg(self, opt_in):
+        return config(claws=self.CLAWS, mech_owner={}, thresholds={"discover_ignores_issue_backlog": opt_in})
+
+    def test_issue_backlog_keeps_steward_lane_by_default(self):
+        cfg = self.cfg(False)
+        self.assertEqual(OPS.mech_mode("IssueHeavyMech", self.ISSUES["IssueHeavyMech"], cfg["thresholds"]), "steward")
+        self.assertEqual(OPS.claw_for_mech("IssueHeavyMech", {}, cfg, issues=self.ISSUES), "compute-steward")
+
+    def test_opt_in_routes_writer_to_discovery_and_issues_to_triage_only(self):
+        cfg = self.cfg(True)
+        self.assertEqual(OPS.mech_mode("IssueHeavyMech", self.ISSUES["IssueHeavyMech"], cfg["thresholds"]), "discover")
+        self.assertEqual(OPS.claw_for_mech("IssueHeavyMech", {}, cfg, issues=self.ISSUES), "io-discovery")
+        found = [f for f in OPS.backlog_findings(self.ISSUES, cfg, {}) if "open issues" in f["title"]]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["owner"], OPS.owner("claw", "compute-steward"))
+        self.assertIn("do not edit record files", found[0]["action"])
+
+    def test_opt_in_never_overrides_pr_cap_or_failing_checks(self):
+        cfg = self.cfg(True)
+        over_cap = dict(self.ISSUES["IssueHeavyMech"], open_prs=30)
+        self.assertEqual(OPS.mech_mode("IssueHeavyMech", over_cap, cfg["thresholds"]), "steward")
+        failing = dict(self.ISSUES["IssueHeavyMech"])
+        failing["prs"] = [dict(p, checks="FAILURE") if p["number"] == 1 else p for p in failing["prs"]]
+        self.assertEqual(OPS.mech_mode("IssueHeavyMech", failing, cfg["thresholds"]), "steward")
+
+    def test_merge_authority_changes_closure_brief_and_goal_only_for_that_claw(self):
+        cfg = self.cfg(False)
+        closure = cfg["claws"]["compute-closure"]
+        brief = OPS.render_brief("r1", "compute-closure", closure, [], "~/out", cfg["thresholds"])
+        self.assertIn("owner-granted merge authority", brief)
+        self.assertIn("--match-head-commit", brief)
+        self.assertIn("No merges except under the closure lane's merge authority above", brief)
+        self.assertIn("merges only as the brief's merge authority allows",
+                      OPS.render_goal("r1", "~/out/brief.md", "~/out", merge_authority=OPS.has_merge_authority(closure)))
+        steward = OPS.render_brief("r1", "compute-steward", cfg["claws"]["compute-steward"], [], "~/out", cfg["thresholds"])
+        self.assertIn("- No merges, no answering", steward)
+        self.assertNotIn("merge authority", steward)
+        self.assertIn(", no merges,", OPS.render_goal("r1", "~/out/brief.md", "~/out"))
+
+    def test_merge_authority_is_validated(self):
+        claws = dict(self.CLAWS)
+        claws["compute-closure"] = dict(claws["compute-closure"], merge_authority="always")
+        claws["compute-steward"] = dict(claws["compute-steward"], merge_authority="after_per_pr_review")
+        cfg = config(claws=claws, mech_owner={})
+        titles = [f["title"] for f in OPS.config_findings(cfg)]
+        self.assertTrue(any("compute-closure" in t and "merge_authority must be one of" in t for t in titles))
+        self.assertTrue(any("compute-steward" in t and "without the closure_steward role" in t for t in titles))
+        self.assertFalse(OPS.has_merge_authority(cfg["claws"]["compute-closure"]))
+        self.assertFalse(OPS.has_merge_authority(cfg["claws"]["compute-steward"]))
+        brief = OPS.render_brief("r1", "compute-closure", cfg["claws"]["compute-closure"], [], "~/out", cfg["thresholds"])
+        self.assertIn("Never merge, push", brief)
+
+
 if __name__ == "__main__":
     unittest.main()
