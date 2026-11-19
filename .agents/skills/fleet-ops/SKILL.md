@@ -77,8 +77,14 @@ PRs and owns stale-draft triage. A closure steward whose config sets
 merge Mech-repository PRs after its own review of the exact head with green
 checks; every other claw keeps the no-merge rule. With
 `discover_ignores_issue_backlog`, a Mech whose only backlog is open issues stays
-in the `discover` lane, and its issue finding goes to a stewardship claw as
-triage-only work (no record edits) so the discovery claw remains the only writer.
+in the `discover` lane. Its issue finding goes to a live stewardship claw, else a
+live cycle supervisor (then offline ones), as triage-only work: that claw's brief
+lists the Mech as triage-only, with no record edits or PRs, so the discovery claw
+remains the only writer. With no such claw in scope, the finding goes to the user
+as a configuration warning, never to the discovery claw. `merge_authority` is
+rejected on a claw that also holds a supervisor (writer) role, and green PRs in
+`infra_repos` repositories always stay with `user:merges`. With a valid grant,
+the Mech's green-PR finding goes to that closure claw instead of `user:merges`.
 
 ## 3. Plan
 

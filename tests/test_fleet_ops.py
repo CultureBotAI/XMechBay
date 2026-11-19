@@ -1555,6 +1555,76 @@ class IssueBacklogDiscoveryAndMergeAuthorityTests(unittest.TestCase):
         brief = OPS.render_brief("r1", "compute-closure", cfg["claws"]["compute-closure"], [], "~/out", cfg["thresholds"])
         self.assertIn("Never merge, push", brief)
 
+    def test_triage_claw_brief_marks_the_mech_triage_only(self):
+        cfg = self.cfg(True)
+        items = [f for f in OPS.backlog_findings(self.ISSUES, cfg, {}) if f["owner"] == OPS.owner("claw", "compute-steward")]
+        for n, item in enumerate(items, 1):
+            item["id"] = f"F{n:03d}"
+        brief = OPS.render_brief("r1", "compute-steward", cfg["claws"]["compute-steward"], items, "~/out", cfg["thresholds"])
+        self.assertIn("Triage-only Mechs (IssueHeavyMech)", brief)
+        self.assertIn("Do not run record_review, resolve_review_findings or repairs", brief)
+        plain = OPS.render_brief("r1", "compute-steward", cfg["claws"]["compute-steward"], [], "~/out", cfg["thresholds"])
+        self.assertNotIn("Triage-only Mechs", plain)
+
+    def test_no_triage_claw_sends_issue_finding_to_user_not_discovery(self):
+        claws = {k: v for k, v in self.CLAWS.items() if k != "compute-steward"}
+        cfg = config(claws=claws, mech_owner={}, thresholds={"discover_ignores_issue_backlog": True})
+        found = [f for f in OPS.backlog_findings(self.ISSUES, cfg, {}) if "open issues" in f["title"]]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["owner"], OPS.owner("user", "config"))
+        self.assertNotIn(OPS.owner("claw", "io-discovery"), [f["owner"] for f in OPS.backlog_findings(self.ISSUES, cfg, {})
+                                                              if "issue" in f["title"]])
+
+    def test_triage_prefers_a_live_claw_across_roles(self):
+        claws = dict(self.CLAWS)
+        claws["compute-cycle"] = {"host": "laptop-a", "repo": "sample-claw", "mechs": ["*"], "roles": ["cycle_supervisor"]}
+        cfg = config(claws=claws, mech_owner={}, thresholds={"discover_ignores_issue_backlog": True})
+        self.assertEqual(OPS.issue_triage_claw_for_mech("IssueHeavyMech", cfg, live={"io-discovery", "compute-cycle"}), "compute-cycle")
+        self.assertEqual(OPS.issue_triage_claw_for_mech("IssueHeavyMech", cfg, live=None), "compute-steward")
+
+    def test_merge_authority_rejected_on_a_writer_claw(self):
+        claws = dict(self.CLAWS)
+        claws["compute-closure"] = dict(claws["compute-closure"], roles=["closure_steward", "stewardship_supervisor"])
+        cfg = config(claws=claws, mech_owner={})
+        titles = [f["title"] for f in OPS.config_findings(cfg)]
+        self.assertTrue(any("compute-closure" in t and "also a writer role" in t for t in titles))
+        self.assertFalse(OPS.has_merge_authority(cfg["claws"]["compute-closure"]))
+
+    def test_green_prs_route_to_merge_claw_except_infra_repos(self):
+        cfg = self.cfg(False)
+        green = [f for f in OPS.backlog_findings(self.ISSUES, cfg, {}) if "mergeable with green checks" in f["title"]]
+        self.assertEqual([f["owner"] for f in green], [OPS.owner("claw", "compute-closure")])
+        self.assertIn("Under your merge authority", green[0]["action"])
+        self.assertFalse(any("awaiting closure-steward diff review" in f["title"] for f in OPS.backlog_findings(self.ISSUES, cfg, {})))
+        infra = {"InfraTool": dict(self.ISSUES["IssueHeavyMech"], repo=cfg["infra_repos"]["xmechbay"])}
+        infra_green = [f for f in OPS.backlog_findings(infra, cfg, {}) if "mergeable with green checks" in f["title"]]
+        self.assertEqual([f["owner"] for f in infra_green], [OPS.owner("user", "merges")])
+
+    def test_non_boolean_opt_in_is_flagged_and_treated_as_off(self):
+        cfg = config(claws=self.CLAWS, mech_owner={}, thresholds={"discover_ignores_issue_backlog": "true"})
+        self.assertTrue(any("must be a boolean" in f["title"] for f in OPS.config_findings(cfg)))
+        self.assertEqual(OPS.mech_mode("IssueHeavyMech", self.ISSUES["IssueHeavyMech"], cfg["thresholds"]), "steward")
+
+    def test_plan_writes_merge_goal_only_for_the_merge_claw(self):
+        cfg = self.cfg(True)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / "run-merge"
+            run.mkdir()
+            payload = {"sessions": []}
+            (run / "sessions.json").write_text(json.dumps(payload))
+            live = {"io-discovery", "compute-steward", "compute-closure"}
+            findings = OPS.rank(OPS.backlog_findings(self.ISSUES, cfg, {}, live=live))
+            for n, item in enumerate(findings, 1):
+                item["id"] = f"F{n:03d}"
+            self.assertIn(OPS.owner("claw", "compute-closure"), [f["owner"] for f in findings])
+            (run / "findings.json").write_text(json.dumps(findings))
+            OPS.plan(run, cfg)
+            goals = {p.stem: p.read_text() for p in (run / "plan/goals").iterdir()}
+            self.assertIn("merges only as the brief's merge authority allows", goals["compute-closure"])
+            for key, text in goals.items():
+                if key != "compute-closure":
+                    self.assertIn("no merges", text)
+
 
 if __name__ == "__main__":
     unittest.main()
