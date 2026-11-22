@@ -87,6 +87,46 @@ explicit shell command only in the newly opened Terminal window.
 Review `--help` for the remaining commands. Never copy credentials between agent
 homes or inspect keychains as part of orchestration.
 
+## Session model policy
+
+Every Codex session in the fleet runs one of two settings:
+
+| Session | Model and effort | Profile |
+| --- | --- | --- |
+| A Mech's own session (addition, discovery, review or merge in that Mech) | GPT-6 Rosalind (Research), xhigh | `mech` |
+| Claw session in any lane, discovery included, and infrastructure session (orchestration, fleet tooling) | GPT-6-Astra, high, Fast tier | `claw` |
+
+Classify by the work, not the window title: an orchestrator whose title names a
+Mech is an infrastructure session.
+
+Each Codex home on each host holds two profile files. `codex -p NAME` (codex-cli
+0.170) layers `$CODEX_HOME/NAME.config.toml` on top of the base config, so the
+base `config.toml` stays unchanged:
+
+```toml
+# mech.config.toml
+model = "gpt-rosalind-astra"
+model_reasoning_effort = "xhigh"
+
+# claw.config.toml
+model = "gpt-6-astra"
+model_reasoning_effort = "high"
+service_tier = "priority"   # the catalog id shown as "Fast"
+```
+
+- **Starting or resuming a session:** pass the profile, for example
+  `codex -p mech …` or `codex resume <id> -p claw`. Then read the footer: it
+  must show `GPT-6 Rosalind (Research) xhigh` or `GPT-6-Astra high fast`. Only
+  `codex exec -p` has been verified so far. Whether a resumed thread takes the
+  profile, and whether the footer shows the Fast tier, has not yet been
+  observed. If the footer differs, use the session-only switch below.
+- **Switching a live session:** use `/model gpt-rosalind-astra --reasoning=xhigh`
+  or `/model gpt-6-astra --reasoning=high --speed=fast`. This lasts only for the
+  session. Send it only to an empty, idle composer with no prompt, sign-in or
+  question on screen, and read the footer afterwards.
+- **Checking a model id:** `codex debug models` lists the model ids, effort
+  levels and service tiers without making a model call.
+
 ## Synthetic example
 
 Run from the repository root, replacing the reserved example hostname only in
