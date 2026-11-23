@@ -318,26 +318,6 @@ def probe_host(
         last_error = f"probe exit {proc.returncode}: {stderr_txt[-300:]}"
         if proc.returncode != 255:
             return {"error": last_error}
-        if (
-            alias
-            and not host_cfg.get("host_key_alias")
-            and "Host key verification failed" in stderr_txt
-            and "REMOTE HOST IDENTIFICATION HAS CHANGED" not in stderr_txt
-        ):
-            retry_cmd = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={conn_timeout}", "--", destination, remote]
-            try:
-                retry = subprocess.run(retry_cmd, input=probe_src, capture_output=True, text=True, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                last_error = "probe timeout"
-                continue
-            if retry.returncode == 0:
-                try:
-                    return json.loads(retry.stdout)
-                except ValueError:
-                    return {"error": "probe output is not JSON: " + (retry.stdout or "").strip()[:120]}
-            last_error = f"probe exit {retry.returncode}: {(retry.stderr or '').strip()[-300:]}"
-            if retry.returncode != 255:
-                return {"error": last_error}
     return {"error": last_error}
 
 
@@ -1690,7 +1670,19 @@ def plan(run_dir: Path, config: dict) -> dict:
     out = ensure_private_dir(run_dir / "plan", enforce_leaf_mode=True)
     ensure_private_dir(out / "briefs", enforce_leaf_mode=True)
     ensure_private_dir(out / "goals", enforce_leaf_mode=True)
-    hosts = status_hosts(config)
+    raw_status = status_config_raw(config)
+    hosts = raw_status.get("hosts") if isinstance(raw_status.get("hosts"), dict) else {}
+    aliases = raw_status.get("aliases") if isinstance(raw_status.get("aliases"), dict) else {}
+    sys.path.insert(0, str(STATUS_SCRIPTS))
+    import fleet_status as fs_mod  # noqa: E402
+
+    need_auto_ts = any(
+        isinstance(h, dict)
+        and h.get("route") == "tailscale"
+        and not (hosts.get(h.get("key")) or {}).get("tailscale_host")
+        for h in (payload.get("hosts") or [])
+    )
+    ts_status = fs_mod.discover_tailscale_status() if need_auto_ts else None
     groups = defaultdict(list)
     for f in findings:
         groups[(f["owner"]["kind"], f["owner"]["key"])].append(f)
@@ -1719,12 +1711,24 @@ def plan(run_dir: Path, config: dict) -> dict:
         if host_cfg.get("transport") == "local":
             dest = "local"
             ssh_alias = None
-        elif host_card.get("route") == "tailscale" and host_cfg.get("tailscale_host"):
-            dest = host_cfg["tailscale_host"]
-            ssh_alias = host_cfg.get("host_key_alias") or host_cfg.get("host")
+        elif host_card.get("route") == "tailscale":
+            enriched = fs_mod.enrich_host_with_tailscale(
+                claw.get("host"), host_cfg, aliases=aliases, ts_status=ts_status
+            )
+            candidates, _ = fs_mod.resolve_ssh_candidates(enriched)
+            ts_cand = next((c for c in candidates if c[1] == "tailscale"), None)
+            if ts_cand is not None:
+                dest, _, ssh_alias = ts_cand
+            else:
+                dest = host_cfg.get("host", "<ssh-host>")
+                ssh_alias = host_cfg.get("host_key_alias")
         else:
             dest = host_cfg.get("host", "<ssh-host>")
             ssh_alias = host_cfg.get("host_key_alias")
+        q_dest = dest if dest == "<ssh-host>" else shlex.quote(dest)
+        raw_scp_host = f"[{dest}]" if (":" in dest and not dest.startswith("[")) else dest
+        scp_remote_target = f"{raw_scp_host}:{remote_dir.replace('~/', '')}/brief.md"
+        q_scp_target = scp_remote_target if raw_scp_host == "<ssh-host>" else shlex.quote(scp_remote_target)
         ssh_opt_str = f"-o HostKeyAlias={shlex.quote(ssh_alias)} " if (ssh_alias and ssh_alias != dest) else ""
         mt_alias_str = f"--host-key-alias {shlex.quote(ssh_alias)} " if (ssh_alias and ssh_alias != dest) else ""
         targets = claw_targets(payload, claw)
@@ -1737,18 +1741,18 @@ def plan(run_dir: Path, config: dict) -> dict:
                      ("Chosen target: " + json.dumps(chosen)) if chosen else f"**Not resolved: {reason}. Confirm the claw session before sending.**",
                      "", "```bash"]
         dispatch.append(f"mkdir -p {remote_dir} && cp {shlex.quote(str(brief_file))} {remote_dir}/brief.md" if dest == "local"
-                        else f"ssh {ssh_opt_str}{dest} 'mkdir -p {remote_dir}' && scp {ssh_opt_str}{shlex.quote(str(brief_file))} {dest}:{remote_dir.replace('~/', '')}/brief.md")
+                        else f"ssh {ssh_opt_str}{q_dest} 'mkdir -p {remote_dir}' && scp {ssh_opt_str}{shlex.quote(str(brief_file))} {q_scp_target}")
         if chosen and chosen["transport"] == "tmux" and chosen.get("tmux_window"):
-            dispatch.append(f"XMECHBAY_TMUX_SESSION={shlex.quote(controller)} bash {shlex.quote(str(mt))} {mt_alias_str}-H {dest} tmux-paste "
+            dispatch.append(f"XMECHBAY_TMUX_SESSION={shlex.quote(controller)} bash {shlex.quote(str(mt))} {mt_alias_str}-H {q_dest} tmux-paste "
                             f"{shlex.quote(str(chosen['tmux_window']))} {shlex.quote(str(goal_file))}")
         else:
             window = chosen["window"] if chosen else "<window-id>"
             tty = chosen["tty"] if chosen else "<claw tty>"
             dispatch += [f"# Proceed only if this line shows tty {tty} (the selected tab must be the claw):",
-                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {dest} windows | grep '|{window}|'",
-                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {dest} screen {window} 40",
-                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {dest} paste {window} {shlex.quote(str(goal_file))}",
-                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {dest} screen {window} 40"]
+                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {q_dest} windows | grep '|{window}|'",
+                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {q_dest} screen {window} 40",
+                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {q_dest} paste {window} {shlex.quote(str(goal_file))}",
+                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {q_dest} screen {window} 40"]
         dispatch += ["```", ""]
         summary["claws"][key] = {"findings": len(items), "targets": len(targets), "target_resolved": chosen is not None, "reason": reason}
     decisions = [f for f in findings if f["owner"]["kind"] == "user"]

@@ -1658,6 +1658,52 @@ class IssueBacklogDiscoveryAndMergeAuthorityTests(unittest.TestCase):
         self.assertIn("<redacted-host>", scrubbed)
         self.assertIn("<redacted-ip>", scrubbed)
 
+        # Auto-discovered IPv6 Tailscale route in plan() resolves target, HostKeyAlias, and scp brackets (#30)
+        ts_ipv6 = "fd7a:115c:" + "a1e0::abcd:99"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fs_cfg_path = tmp_path / "fleet-status.json"
+            fs_cfg_path.write_text(json.dumps({
+                "schema_version": 1,
+                "hosts": {"h1": {"host": "worker-lan.example.invalid", "python": "/usr/bin/python3"}},
+            }))
+            cfg = config(
+                fleet_status_config=str(fs_cfg_path),
+                claws={"c1": {"host": "h1", "repo": "claw", "mechs": ["*"], "roles": ["stewardship_supervisor"]}},
+            )
+            cfg["_dir"] = str(tmp_path)
+            run_dir = tmp_path / "run-ts-plan"
+            run_dir.mkdir()
+            (run_dir / "sessions.json").write_text(json.dumps({
+                "hosts": [{"key": "h1", "reachable": True, "route": "tailscale"}],
+                "sessions": [],
+            }))
+            (run_dir / "findings.json").write_text(json.dumps([{
+                "id": "F001",
+                "severity": "warning",
+                "category": "backlog",
+                "title": "Sample finding",
+                "action": "Inspect queue.",
+                "owner": OPS.owner("claw", "c1"),
+                "evidence": {},
+            }]))
+            import fleet_status as fs_mod
+            fake_ts = {"peers": [{
+                "short_name": "h1",
+                "dns_name": None,
+                "host_slug": "h1",
+                "ips": [ts_ipv6],
+                "ipv4": None,
+                "online": True,
+                "targets": [ts_ipv6],
+            }]}
+            with mock.patch.object(fs_mod, "discover_tailscale_status", return_value=fake_ts):
+                OPS.plan(run_dir, cfg)
+            disp = (run_dir / "plan" / "DISPATCH.md").read_text()
+            self.assertIn("HostKeyAlias=worker-lan.example.invalid", disp)
+            self.assertIn(f"[{ts_ipv6}]:", disp)
+            self.assertIn("--host-key-alias worker-lan.example.invalid", disp)
+
 
 if __name__ == "__main__":
     unittest.main()

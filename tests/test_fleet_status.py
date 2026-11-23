@@ -730,7 +730,7 @@ class CommandTests(unittest.TestCase):
         # Offline peer targets were skipped, so only the primary host was attempted
         self.assertEqual(off_mock.call_count, 1)
 
-        # 3. Host key MITM warning (REMOTE HOST IDENTIFICATION HAS CHANGED) never retries without HostKeyAlias
+        # 3. Host key verification failure (even without IDENTIFICATION HAS CHANGED) never drops HostKeyAlias (#29)
         mitm_cfg = {"host": "worker-m5.example.invalid", "tailscale_host": ts_m5_ip}
         mitm_calls = []
 
@@ -738,12 +738,22 @@ class CommandTests(unittest.TestCase):
             mitm_calls.append(cmd)
             if cmd[-2] == "worker-m5.example.invalid":
                 return Res(255, stderr=b"Could not resolve hostname")
-            return Res(255, stderr=b"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost key verification failed.")
+            return Res(255, stderr=b"Host key verification failed.")
 
         with patch.object(FLEET.subprocess, "run", side_effect=fake_mitm_run):
             with self.assertRaisesRegex(RuntimeError, "ssh_host_key_unverified"):
                 FLEET.fetch_snapshot(mitm_cfg)
         self.assertEqual(len(mitm_calls), 2)
+        self.assertIn("HostKeyAlias=worker-m5.example.invalid", mitm_calls[1])
+
+        # 4. Ambiguous implicit peer match (2 peers sharing lookup name) returns None (#29)
+        ambig_ts = {
+            "peers": [
+                {"short_name": "dup", "dns_name": "dup-1.sample-net.invalid", "ips": [], "online": True, "targets": [ts_m5_ip]},
+                {"short_name": "dup", "dns_name": "dup-2.sample-net.invalid", "ips": [], "online": True, "targets": [ts_intel_ip]},
+            ]
+        }
+        self.assertIsNone(FLEET.match_tailscale_peer("dup", {"host": "dup-lan.example.invalid"}, ts_status=ambig_ts))
 
 
 if __name__ == "__main__":

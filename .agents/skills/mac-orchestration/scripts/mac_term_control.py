@@ -283,8 +283,9 @@ const f=s.visibleFrame; const F=s.frame;
 # interpolate directories, timeout strings, or user commands into shell source.
 RESOLVE_DIRECTORY_SCRIPT = 'cd -- "$1" && pwd -P'
 WAIT_FILE_SCRIPT = '''end=$(( $(date +%s) + $2 ))
-while [ "$(date +%s)" -lt "$end" ]; do
+while :; do
   if [ -s "$1" ]; then printf 'present\\n'; exit 0; fi
+  [ "$(date +%s)" -ge "$end" ] && break
   sleep 5
 done
 printf 'timeout\\n'; exit 1

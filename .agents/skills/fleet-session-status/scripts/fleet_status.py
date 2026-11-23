@@ -189,10 +189,14 @@ def match_tailscale_peer(key, host_cfg, aliases=None, ts_status=None):
     explicit_ts = host_cfg.get("tailscale_host")
     if isinstance(explicit_ts, str) and explicit_ts.strip():
         needle = explicit_ts.strip().rstrip(".").lower()
-        for peer in peers:
-            peer_keys = {peer.get("short_name"), peer.get("dns_name"), *(ip.lower() for ip in peer.get("ips", ()))}
-            if needle in peer_keys:
-                return peer
+        explicit_hits = [
+            peer for peer in peers
+            if needle in {peer.get("short_name"), peer.get("dns_name"), *(ip.lower() for ip in peer.get("ips", ()))}
+        ]
+        if len(explicit_hits) == 1:
+            return explicit_hits[0]
+        if len(explicit_hits) > 1:
+            return None
     lookup_names = {str(key).strip().lower()}
     for alias_name, target_key in (aliases or {}).items():
         if target_key == key and isinstance(alias_name, str):
@@ -202,9 +206,14 @@ def match_tailscale_peer(key, host_cfg, aliases=None, ts_status=None):
         stem = primary.split(".")[0]
         if stem:
             lookup_names.add(stem)
-    for peer in peers:
-        if peer.get("short_name") in lookup_names or peer.get("dns_name") in lookup_names:
-            return peer
+    name_hits = [
+        peer for peer in peers
+        if peer.get("short_name") in lookup_names or peer.get("dns_name") in lookup_names
+    ]
+    if len(name_hits) == 1:
+        return name_hits[0]
+    if len(name_hits) > 1:
+        return None
     slug_hits = [peer for peer in peers if peer.get("host_slug") in lookup_names]
     if len(slug_hits) == 1:
         return slug_hits[0]
@@ -282,29 +291,7 @@ def run_ssh_command(host_cfg, remote_cmd_str, input_bytes=None, timeout=60):
         if result.returncode != 255:
             raise RuntimeError("ssh_probe_failed")
         stderr_txt = (result.stderr or b"").decode("utf-8", errors="replace")
-        if "REMOTE HOST IDENTIFICATION HAS CHANGED" in stderr_txt:
-            saw_unverified_key = True
-            continue
-        if alias and not host_cfg.get("host_key_alias") and "Host key verification failed" in stderr_txt:
-            try:
-                retry = subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=" + conn_timeout, "--", target, remote_cmd_str],
-                    input=input_bytes,
-                    capture_output=True,
-                    timeout=timeout,
-                )
-            except subprocess.TimeoutExpired:
-                saw_timeout = True
-                continue
-            except OSError:
-                raise RuntimeError("ssh_probe_unavailable")
-            if retry.returncode == 0:
-                return retry.stdout, route_kind, target, None
-            if retry.returncode != 255:
-                raise RuntimeError("ssh_probe_failed")
-            if "Host key verification failed" in (retry.stderr or b"").decode("utf-8", errors="replace"):
-                saw_unverified_key = True
-        elif "Host key verification failed" in stderr_txt:
+        if "REMOTE HOST IDENTIFICATION HAS CHANGED" in stderr_txt or "Host key verification failed" in stderr_txt:
             saw_unverified_key = True
     if saw_timeout:
         raise RuntimeError("ssh_probe_timed_out")

@@ -4680,7 +4680,8 @@ def resolve_local_tailscale_bind(ts_status=None):
             extra_names.append(val)
     return {
         "ips": ips,
-        "ipv4": self_node.get("ipv4") or ips[0],
+        "ipv4": self_node.get("ipv4"),
+        "primary_ip": self_node.get("ipv4") or ips[0],
         "dns_name": self_node.get("dns_name"),
         "short_name": self_node.get("short_name"),
         "extra_host_names": extra_names,
@@ -4723,15 +4724,6 @@ def main(argv=None):
         parser.error("--port must be between 0 and 65535")
 
     try:
-        ts_bind = resolve_local_tailscale_bind() if args.tailscale else None
-        local_ts_ips = ts_bind["ips"] if ts_bind else ()
-        extra_host_names = ts_bind["extra_host_names"] if ts_bind else ()
-        bind_host = validate_bind_host(
-            args.host,
-            allow_tailscale=bool(args.tailscale),
-            local_tailscale_ips=local_ts_ips,
-        )
-
         def collect_once():
             return collect_dashboard_reports(
                 config_path=args.config,
@@ -4756,6 +4748,15 @@ def main(argv=None):
             out_path = atomic_private_html(args.export_html, doc)
             print(str(out_path))
             return 0 if all(r.get("reachable") for r in reports) else 2
+
+        ts_bind = resolve_local_tailscale_bind() if args.tailscale else None
+        local_ts_ips = ts_bind["ips"] if ts_bind else ()
+        extra_host_names = ts_bind["extra_host_names"] if ts_bind else ()
+        bind_host = validate_bind_host(
+            args.host,
+            allow_tailscale=bool(args.tailscale),
+            local_tailscale_ips=local_ts_ips,
+        )
 
         latest_html = None if (args.no_cache or args.snapshot is not None) else (args.report_dir / "dashboard-latest.html")
         state = DashboardState(collect_once, snapshot_html_path=latest_html)
@@ -4793,8 +4794,9 @@ def main(argv=None):
             url = "http://" + url_host + ":" + str(bound_port) + "/"
             ts_note = ""
             if ts_bind:
-                ts_host_disp = ts_bind.get("dns_name") or ts_bind.get("ipv4")
-                ts_note = " and Tailscale http://" + str(ts_host_disp) + ":" + str(bound_port) + "/"
+                raw_disp = ts_bind.get("dns_name") or ts_bind.get("ipv4") or ts_bind.get("primary_ip")
+                ts_host_disp = "[" + str(raw_disp) + "]" if (raw_disp and ":" in str(raw_disp) and not str(raw_disp).startswith("[")) else str(raw_disp)
+                ts_note = " and Tailscale http://" + ts_host_disp + ":" + str(bound_port) + "/"
             print("MechBay dashboard listening on " + url + ts_note + " (Ctrl+C to stop)", flush=True)
             if args.open:
                 try:
