@@ -912,6 +912,30 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("USER_INSTRUCTION", result.stdout)
 
+    def test_host_key_alias_propagates_to_ssh_and_scp(self):
+        ts_ip = ".".join(["100", "73", "4", "5"])
+        tr = control.Transport(ts_ip, host_key_alias="worker-a.example.invalid")
+        seen = []
+
+        class OkRes:
+            returncode = 0
+            stdout = "/tmp/xmechbay-mac-term.AbCdEf12\n"
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            seen.append(cmd)
+            return OkRes()
+
+        prompt_p = Path(self.temp.name) / "goal.txt"
+        prompt_p.write_text("Check status\n")
+        with patch.object(control.subprocess, "run", side_effect=fake_run):
+            with tr.prompt_file(prompt_p):
+                pass
+        self.assertEqual(seen[0][0], "ssh")
+        self.assertIn("HostKeyAlias=worker-a.example.invalid", seen[0])
+        self.assertEqual(seen[1][0], "scp")
+        self.assertIn("HostKeyAlias=worker-a.example.invalid", seen[1])
+
 
 if __name__ == "__main__":
     unittest.main()

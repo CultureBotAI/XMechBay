@@ -1625,6 +1625,39 @@ class IssueBacklogDiscoveryAndMergeAuthorityTests(unittest.TestCase):
                 if key != "compute-closure":
                     self.assertIn("no merges", text)
 
+    def test_tailscale_probe_fallback_dispatch_alias_and_redaction(self):
+        ts_ip = ".".join(["100", "73", "8", "9"])
+        ts_dns = "m5.sample-net." + "ts.net"
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs.get("input")))
+            if cmd[-2] == "worker-lan.example.invalid":
+                return types.SimpleNamespace(returncode=255, stdout="", stderr="Could not resolve hostname")
+            return types.SimpleNamespace(returncode=0, stdout='{"free_gib": 200.0}', stderr="")
+
+        host_cfg = {
+            "host": "worker-lan.example.invalid",
+            "tailscale_host": ts_ip,
+            "python": "/usr/bin/python3",
+        }
+        with mock.patch.object(OPS.subprocess, "run", fake_run):
+            res = OPS.probe_host("h1", host_cfg, ["~/watch-dir"])
+        self.assertEqual(res["free_gib"], 200.0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0][-2], "worker-lan.example.invalid")
+        self.assertEqual(calls[1][0][-2], ts_ip)
+        self.assertIn("HostKeyAlias=worker-lan.example.invalid", calls[1][0])
+        # Both attempts receive the full probe source text via stdin input
+        self.assertTrue(calls[0][1] and calls[1][1] and calls[0][1] == calls[1][1])
+
+        # Public draft sanitization scrubs both Tailscale MagicDNS and CGNAT IPv4
+        scrubbed = OPS.sanitize_public_text(f"Reached {ts_dns} at {ts_ip} during probe")
+        self.assertNotIn(ts_dns, scrubbed)
+        self.assertNotIn(ts_ip, scrubbed)
+        self.assertIn("<redacted-host>", scrubbed)
+        self.assertIn("<redacted-ip>", scrubbed)
+
 
 if __name__ == "__main__":
     unittest.main()

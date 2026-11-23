@@ -643,6 +643,108 @@ class CommandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "snapshot_process_invalid"):
             FLEET.validate_snapshot(unverified)
 
+    def test_tailscale_peer_matching_fallback_and_host_key_alias_roaming(self):
+        ts_self_ip = ".".join(["100", "74", "1", "10"])
+        ts_m5_ip = ".".join(["100", "73", "2", "20"])
+        ts_intel_ip = ".".join(["100", "82", "3", "30"])
+        ts_suffix = "sample-net." + "ts.net."
+        raw_ts = {
+            "BackendState": "Running",
+            "Self": {
+                "HostName": "workstation",
+                "DNSName": "m1." + ts_suffix,
+                "TailscaleIPs": [ts_self_ip],
+                "Online": True,
+            },
+            "Peer": {
+                "k1": {
+                    "HostName": "Laptop M5",
+                    "DNSName": "m5." + ts_suffix,
+                    "TailscaleIPs": [ts_m5_ip],
+                    "Online": True,
+                },
+                "k2": {
+                    "HostName": "Laptop Intel",
+                    "DNSName": "intel." + ts_suffix,
+                    "TailscaleIPs": [ts_intel_ip],
+                    "Online": False,
+                },
+            },
+        }
+        parsed = FLEET.parse_tailscale_status_json(raw_ts)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["self"]["ipv4"], ts_self_ip)
+        aliases = {"intel": "intelmbpro"}
+
+        # 1. Direct key match (m5) + off-LAN primary 255 -> Tailscale IPv4 with HostKeyAlias=<primary>
+        m5_cfg = {"host": "worker-m5.example.invalid", "label": "M5 Laptop"}
+        enriched_m5 = FLEET.enrich_host_with_tailscale("m5", m5_cfg, aliases=aliases, ts_status=parsed)
+        self.assertIn(ts_m5_ip, enriched_m5["_auto_tailscale_targets"])
+
+        live_snap = snapshot()
+        live_snap["observed_at"] = datetime.now(timezone.utc).isoformat()
+        seen_cmds = []
+
+        class Res:
+            def __init__(self, rc, stdout=b"", stderr=b""):
+                self.returncode = rc
+                self.stdout = stdout
+                self.stderr = stderr
+
+        def fake_ssh_run(cmd, **kwargs):
+            seen_cmds.append(cmd)
+            dest = cmd[-2]
+            if dest == "worker-m5.example.invalid":
+                return Res(255, stderr=b"ssh: Could not resolve hostname")
+            self.assertIn("HostKeyAlias=worker-m5.example.invalid", cmd)
+            return Res(0, stdout=json.dumps(live_snap).encode("utf-8"))
+
+        cache_dir = Path(self.temporary.name) / "roam-cache"
+        # First sample on LAN:
+        lan_snap = dict(live_snap)
+        with patch.object(FLEET, "fetch_snapshot", return_value=lan_snap):
+            first = FLEET.collect_host("m5", m5_cfg, 120, cache_dir)
+        self.assertEqual(first["route"], "ssh")
+        self.assertEqual(first["sessions"][0]["delta"]["kind"], "first")
+
+        # Second sample roaming over Tailscale: preserves comparison cache identity (delta == unchanged)
+        with patch.object(FLEET.subprocess, "run", side_effect=fake_ssh_run):
+            second = FLEET.collect_host("m5", m5_cfg, 120, cache_dir, aliases=aliases, ts_status=parsed)
+        self.assertTrue(second["reachable"])
+        self.assertEqual(second["route"], "tailscale")
+        self.assertEqual(second["sessions"][0]["delta"]["kind"], "unchanged")
+        self.assertIn("Tailscale SSH observed", FLEET.render_host(second))
+        self.assertEqual(seen_cmds[0][-2], "worker-m5.example.invalid")
+        self.assertEqual(seen_cmds[1][-2], ts_m5_ip)
+
+        # 2. Alias match (intel -> intelmbpro) when Online is False appends tailscale_peer_offline
+        intel_cfg = {"host": "worker-intel.example.invalid", "label": "Intel Laptop"}
+        with patch.object(
+            FLEET.subprocess, "run", return_value=Res(255, stderr=b"Could not resolve hostname")
+        ) as off_mock:
+            offline_rep = FLEET.collect_host(
+                "intelmbpro", intel_cfg, 120, cache_dir, aliases=aliases, ts_status=parsed
+            )
+        self.assertFalse(offline_rep["reachable"])
+        self.assertEqual(offline_rep["errors"], ["ssh_probe_failed", "tailscale_peer_offline"])
+        # Offline peer targets were skipped, so only the primary host was attempted
+        self.assertEqual(off_mock.call_count, 1)
+
+        # 3. Host key MITM warning (REMOTE HOST IDENTIFICATION HAS CHANGED) never retries without HostKeyAlias
+        mitm_cfg = {"host": "worker-m5.example.invalid", "tailscale_host": ts_m5_ip}
+        mitm_calls = []
+
+        def fake_mitm_run(cmd, **kwargs):
+            mitm_calls.append(cmd)
+            if cmd[-2] == "worker-m5.example.invalid":
+                return Res(255, stderr=b"Could not resolve hostname")
+            return Res(255, stderr=b"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost key verification failed.")
+
+        with patch.object(FLEET.subprocess, "run", side_effect=fake_mitm_run):
+            with self.assertRaisesRegex(RuntimeError, "ssh_host_key_unverified"):
+                FLEET.fetch_snapshot(mitm_cfg)
+        self.assertEqual(len(mitm_calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,8 +27,11 @@ PATTERNS = {
     # mDNS host names (a name ending in the local domain), not file names whose
     # stem ends in that word, such as a settings file with a .json suffix
     "local-hostname": re.compile(r"(?i)\b[A-Za-z0-9][A-Za-z0-9.-]*\.local\b(?![.-]?[A-Za-z0-9])"),
+    "tailscale-hostname": re.compile(
+        r"(?i)\b[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)*\.ts\.net\b(?![.-]?[A-Za-z0-9])"
+    ),
     "private-network-address": re.compile(
-        r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?![\d.])"
+        r"(?i)(?:(?<![\d.])(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2})(?![\d.])|\bfd7a:115c:a1e0:[0-9a-f:]+)"
     ),
     "credential-token": re.compile(
         r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{16,})\b"

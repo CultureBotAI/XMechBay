@@ -34,6 +34,7 @@ MENU_NAV_HINT = re.compile(
 DURATION = re.compile(r"\d+(?:\.\d+)?\s*(?:days?|hours?|minutes?|seconds?|[dhms])(?:\s*\d+(?:\.\d+)?\s*(?:days?|hours?|minutes?|seconds?|[dhms]))*", re.I)
 PATH_TEXT = re.compile(r"(?<![\w:/↑←→↓])(?:~/|/(?![↓→\s])|[A-Za-z]:\\)[^\s<>\[\]{}()'\";,]+")
 EMAIL = re.compile(r"[\w.+\-]+@(?:[\w\-]+\.)+[A-Za-z]{2,}")
+TAILSCALE_DOMAIN = re.compile(r"(?i)\b[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)*\.ts\.net\b")
 SECRET = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_\-]{20,})\b")
 UUID = re.compile(r"\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b", re.I)
 RULE = re.compile(r"^[\s─━═┄┈\-_|│┃┌┐└┘├┤┬┴┼╭╮╰╯]+$")
@@ -118,6 +119,7 @@ KNOWN_ERRORS = {
     "agent_process_unverified", "argv_identity_unavailable", "session_id_ambiguous",
     "pane_rows_invalid", "screen_unavailable", "screen_shared_between_agents",
     "screen_bytes_truncated", "cwd_unavailable", "cwd_from_pane",
+    "tailscale_peer_offline", "ssh_host_key_unverified",
 }
 
 CANONICAL_MECHS = {
@@ -212,6 +214,7 @@ def private_text(value, limit=92):
     text = SECRET.sub("[secret]", text)
     text = EMAIL.sub("[account]", text)
     text = re.sub(r"https?://\S+", "[link]", text)
+    text = TAILSCALE_DOMAIN.sub("[host]", text)
     text = PATH_TEXT.sub(lambda match: match.group() if SLASH_COMMAND.fullmatch(match.group()) else "[path]", text)
     text = UUID.sub("[id]", text)
     text = re.sub(r"\s+", " ", text).strip(" │┃")
@@ -1430,16 +1433,26 @@ def render_host(report):
     """Render one host without collapsing duplicate repositories or sessions."""
     label = cell(report.get("label", "Host"))
     source = report.get("source", "ssh")
+    route = report.get("route") or source
     offline = source == "snapshot"
     stale = bool(report.get("snapshot_stale"))
-    provenance = "OFFLINE snapshot" if offline else ("LOCAL observed" if source == "local" else "SSH observed")
+    provenance = (
+        "OFFLINE snapshot" if offline else
+        ("LOCAL observed" if source == "local" else
+         ("Tailscale SSH observed" if route == "tailscale" else "SSH observed"))
+    )
     if stale:
         provenance += " · STALE, last observed"
     heading = "**" + label + " · " + cell(_stamp(report.get("observed_at"))) + " · " + provenance + "**"
     errors = _error_codes(report.get("errors", []))
     if not report.get("reachable", False):
         detail = " Codes: " + ", ".join("`" + code + "`" for code in errors[:5]) + "." if errors else ""
-        unreachable_heading = heading.replace("SSH observed", "UNREACHABLE").replace("LOCAL observed", "UNREACHABLE")
+        unreachable_heading = (
+            heading
+            .replace("Tailscale SSH observed", "UNREACHABLE")
+            .replace("SSH observed", "UNREACHABLE")
+            .replace("LOCAL observed", "UNREACHABLE")
+        )
         return unreachable_heading + "\n\nCollection unavailable; current session count and state are unknown." + detail + "\n"
     sessions = list(report.get("sessions") or [])
     coverage = report.get("coverage") or {}

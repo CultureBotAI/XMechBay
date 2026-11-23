@@ -2975,6 +2975,178 @@ function boot(src, storageMap, fetchImpl, selectionFactory = null) {
             self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
             self.assertIn("CLIENT_JS_M1_FOCUS_OK", proc.stdout)
 
+    def test_tailscale_route_badges_bind_validation_and_loopback_only_focus(self):
+        ts_self_ip = ".".join(["100", "74", "9", "11"])
+        ts_other_ip = ".".join(["100", "74", "9", "99"])
+        lan_ip = ".".join(["192", "168", "1", "20"])
+        ts_dns = "m1.sample-net." + "ts.net"
+
+        # Default bind validation still rejects Tailscale IPs; allow_tailscale accepts only verified local Tailscale IPs
+        with self.assertRaises(ValueError):
+            DASH.validate_bind_host(ts_self_ip)
+        self.assertEqual(
+            DASH.validate_bind_host(ts_self_ip, allow_tailscale=True, local_tailscale_ips=[ts_self_ip]),
+            ts_self_ip,
+        )
+        for bad in ("0.0.0.0", "::", lan_ip, ts_other_ip):
+            with self.assertRaises(ValueError):
+                DASH.validate_bind_host(bad, allow_tailscale=True, local_tailscale_ips=[ts_self_ip])
+
+        # Build payload with one local M1 host, one live Tailscale M5 host, and one offline Tailscale Intel host
+        reports = [
+            {
+                "key": "m1",
+                "label": "M1 MacBook Pro",
+                "source": "local",
+                "route": "local",
+                "reachable": True,
+                "observed_at": "2026-11-22T12:00:00+00:00",
+                "snapshot_stale": False,
+                "health": {"status": "ok", "occupancy_ratio": 0.02, "age_seconds": 5, "process_status": "ok"},
+                "system": {"arch": "arm64", "cpu_count": 10, "loadavg_1m": 1.2, "disk_free_gib": 120.0, "disk_total_gib": 500.0},
+                "coverage": {"processes": "complete", "agent_discovery": "complete", "screens_read": 1, "sessions_seen": 1},
+                "errors": [],
+                "sessions": [{
+                    "agent": "agy",
+                    "pid": 201,
+                    "tty": "ttys002",
+                    "started_at": "2026-11-22T11:00:00+00:00",
+                    "age_seconds": 3600,
+                    "status": "idle",
+                    "repo_label": "XMechBay",
+                    "role": "mechbay",
+                    "project_label": "XMechBay",
+                    "target": {"transport": "terminal", "window_id": 10, "tab": 1},
+                    "flags": [],
+                    "errors": [],
+                }],
+            },
+            {
+                "key": "m5",
+                "label": "M5 MacBook Pro",
+                "source": "ssh",
+                "route": "tailscale",
+                "reachable": True,
+                "observed_at": "2026-11-22T12:00:01+00:00",
+                "snapshot_stale": False,
+                "health": {"status": "ok", "occupancy_ratio": 0.01, "age_seconds": 8, "process_status": "ok"},
+                "system": {"arch": "arm64", "cpu_count": 18, "loadavg_1m": 2.0, "disk_free_gib": 200.0, "disk_total_gib": 1000.0},
+                "coverage": {"processes": "complete", "agent_discovery": "complete", "screens_read": 1, "sessions_seen": 1},
+                "errors": [],
+                "sessions": [{
+                    "agent": "codex",
+                    "pid": 305,
+                    "tty": "ttys010",
+                    "started_at": "2026-11-22T10:00:00+00:00",
+                    "age_seconds": 7200,
+                    "status": "Working",
+                    "repo_label": "CultureMech",
+                    "role": "mech",
+                    "project_label": "CultureMech",
+                    "target": {"transport": "tmux", "pane": "%2", "tmux_session": "fleet", "window": "CultureMech"},
+                    "flags": [],
+                    "errors": [],
+                }],
+            },
+            {
+                "key": "intelmbpro",
+                "label": "Intel MacBook Pro",
+                "source": "ssh",
+                "route": "ssh",
+                "reachable": False,
+                "observed_at": "2026-11-22T12:00:02+00:00",
+                "snapshot_stale": False,
+                "health": {"status": "unknown"},
+                "system": {},
+                "coverage": {},
+                "errors": ["ssh_probe_failed", "tailscale_peer_offline"],
+                "sessions": [],
+            },
+        ]
+        state = DASH.DashboardState(lambda: (reports, {"mode": "live", "role_overrides": None}))
+        payload = state.get_payload()
+        by_key = {h["key"]: h for h in payload["hosts"]}
+        self.assertEqual(by_key["m5"]["route"], "tailscale")
+        self.assertIn("tailscale_peer_offline", by_key["intelmbpro"]["errors"])
+
+        # HTTP handler with extra_host_names accepts Tailscale Host/Origin for GET and POST /api/refresh,
+        # while POST /api/focus-terminal rejects non-loopback client_address (tested in-process via socketpair)
+        port = 8765
+
+        class FakeTailscaleServer:
+            server_address = (ts_self_ip, port)
+            extra_host_names = (ts_self_ip, ts_dns, "m1")
+
+        FakeTailscaleServer.state = state
+
+        def send_inprocess(method, path, headers=None, body=b"", client_ip=ts_other_ip):
+            hdrs = dict(headers or {})
+            hdrs["Connection"] = "close"
+            if body:
+                hdrs["Content-Length"] = str(len(body))
+            raw_lines = [method + " " + path + " HTTP/1.1"]
+            for k, v in hdrs.items():
+                raw_lines.append(k + ": " + str(v))
+            raw_req = ("\r\n".join(raw_lines) + "\r\n\r\n").encode("utf-8") + body
+            c_sock, s_sock = socket.socketpair()
+            try:
+                def serve_one():
+                    try:
+                        DASH.DashboardHandler(s_sock, (client_ip, 54321), FakeTailscaleServer)
+                    finally:
+                        s_sock.close()
+
+                worker = threading.Thread(target=serve_one, daemon=True)
+                worker.start()
+                c_sock.sendall(raw_req)
+                resp = http.client.HTTPResponse(c_sock)
+                resp.begin()
+                resp_body = resp.read()
+                worker.join(timeout=5)
+                return resp.status, resp_body
+            finally:
+                c_sock.close()
+
+        st_get, body_get = send_inprocess("GET", "/", headers={"Host": f"{ts_dns}:{port}"})
+        html_body = body_get.decode("utf-8")
+        self.assertEqual(st_get, 200)
+        self.assertIn("🔗 Tailscale", html_body)
+        self.assertIn("Tailscale offline", html_body)
+
+        # Unlisted Host header is still rejected even when Tailscale extra_host_names are active
+        st_bad_host, _ = send_inprocess("GET", "/", headers={"Host": f"evil.example.invalid:{port}"})
+        self.assertEqual(st_bad_host, 403)
+
+        st_ref, _ = send_inprocess(
+            "POST",
+            "/api/refresh",
+            body=b"{}",
+            headers={
+                "Host": f"{ts_dns}:{port}",
+                "Origin": f"http://{ts_dns}:{port}",
+                "X-MechBay-Token": state.csrf_token,
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(st_ref, 200)
+
+        # Non-loopback Tailscale client_address hitting /api/focus-terminal is rejected with 403 loopback_client_required
+        m1_row_id = payload["sessions"][0]["row_id"]
+        st_foc, body_foc = send_inprocess(
+            "POST",
+            "/api/focus-terminal",
+            body=json.dumps({"row_id": m1_row_id}).encode("utf-8"),
+            headers={
+                "Host": f"{ts_dns}:{port}",
+                "Origin": f"http://{ts_dns}:{port}",
+                "X-MechBay-Token": state.csrf_token,
+                "Content-Type": "application/json",
+            },
+            client_ip=ts_other_ip,
+        )
+        self.assertEqual(st_foc, 403)
+        self.assertEqual(json.loads(body_foc.decode("utf-8"))["error"], "loopback_client_required")
+
 
 if __name__ == "__main__":
     unittest.main()

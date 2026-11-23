@@ -16,12 +16,14 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import ipaddress
 import json
 import math
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -39,6 +41,8 @@ TRANSPORTS = {"ssh", "local"}
 ROLES = {"mechbay", "claw", "mech", "other"}
 HOST_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")
 UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+TAILSCALE_IPV4_NET = ipaddress.IPv4Network(((100 << 24) | (64 << 16), 10))
+TAILSCALE_IPV6_NET = ipaddress.IPv6Network((0xfd7a115ca1e0 << 80, 48))
 
 
 def timestamp(value):
@@ -63,6 +67,250 @@ def bare_host(value):
     return (isinstance(value, str) and 0 < len(value) <= 253
             and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", value)
             and all(part and len(part) <= 63 for part in value.split(".")))
+
+
+def is_tailscale_ip(value):
+    if not isinstance(value, str) or not value or "%" in value:
+        return False
+    try:
+        addr = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv4Address):
+        return addr in TAILSCALE_IPV4_NET
+    return addr in TAILSCALE_IPV6_NET
+
+
+def is_tailscale_hostname(value):
+    if not isinstance(value, str) or not value:
+        return False
+    cleaned = value.strip().rstrip(".").lower()
+    return is_tailscale_ip(cleaned) or cleaned.endswith("." + "ts.net")
+
+
+def ssh_target_valid(value):
+    return bare_host(value) or is_tailscale_ip(value)
+
+
+def find_tailscale_bin():
+    override = os.environ.get("XMECHBAY_TAILSCALE_BIN")
+    if override is not None:
+        return override if os.path.isfile(override) and os.access(override, os.X_OK) else None
+    for candidate in (
+        shutil.which("tailscale"),
+        "/usr/local/bin/tailscale",
+        "/opt/homebrew/bin/tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    ):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _parse_tailscale_node(node):
+    if not isinstance(node, dict):
+        return None
+    raw_dns = str(node.get("DNSName") or "").strip().rstrip(".").lower()
+    dns_name = raw_dns if bare_host(raw_dns) else None
+    short_name = dns_name.split(".")[0] if dns_name and bare_host(dns_name.split(".")[0]) else None
+    host_raw = str(node.get("HostName") or "").strip()
+    host_slug = re.sub(r"[^a-z0-9-]+", "-", host_raw.lower()).strip("-") or None
+    ips = []
+    ipv4 = None
+    for item in (node.get("TailscaleIPs") or [])[:8]:
+        if isinstance(item, str) and is_tailscale_ip(item.strip()):
+            ip_str = item.strip()
+            ips.append(ip_str)
+            if ipv4 is None and "." in ip_str:
+                ipv4 = ip_str
+    online = node.get("Online") if type(node.get("Online")) is bool else None
+    targets = []
+    for cand in [ipv4, dns_name, short_name, *ips]:
+        if cand and ssh_target_valid(cand) and cand not in targets:
+            targets.append(cand)
+    return {
+        "dns_name": dns_name,
+        "short_name": short_name,
+        "host_slug": host_slug,
+        "ips": ips,
+        "ipv4": ipv4,
+        "online": online,
+        "targets": targets,
+    }
+
+
+def parse_tailscale_status_json(raw_data):
+    if not isinstance(raw_data, dict):
+        return None
+    backend = str(raw_data.get("BackendState") or "")
+    if backend and backend in {"Stopped", "NeedsLogin", "NoState"}:
+        return None
+    self_node = _parse_tailscale_node(raw_data.get("Self"))
+    peers = []
+    raw_peers = raw_data.get("Peer")
+    if isinstance(raw_peers, dict):
+        for peer_val in list(raw_peers.values())[:256]:
+            parsed = _parse_tailscale_node(peer_val)
+            if parsed and (parsed["targets"] or parsed["short_name"] or parsed["host_slug"]):
+                peers.append(parsed)
+    return {"self": self_node, "peers": peers}
+
+
+def discover_tailscale_status(timeout=3.0):
+    ts_bin = find_tailscale_bin()
+    if not ts_bin:
+        return None
+    try:
+        proc = subprocess.run(
+            [ts_bin, "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout or len(proc.stdout) > MAX_BYTES:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return None
+    return parse_tailscale_status_json(data)
+
+
+def match_tailscale_peer(key, host_cfg, aliases=None, ts_status=None):
+    if (not isinstance(ts_status, dict)
+            or not isinstance(host_cfg, dict)
+            or host_cfg.get("transport", "ssh") != "ssh"
+            or host_cfg.get("tailscale") is False):
+        return None
+    peers = ts_status.get("peers") or []
+    explicit_ts = host_cfg.get("tailscale_host")
+    if isinstance(explicit_ts, str) and explicit_ts.strip():
+        needle = explicit_ts.strip().rstrip(".").lower()
+        for peer in peers:
+            peer_keys = {peer.get("short_name"), peer.get("dns_name"), *(ip.lower() for ip in peer.get("ips", ()))}
+            if needle in peer_keys:
+                return peer
+    lookup_names = {str(key).strip().lower()}
+    for alias_name, target_key in (aliases or {}).items():
+        if target_key == key and isinstance(alias_name, str):
+            lookup_names.add(alias_name.strip().lower())
+    primary = str(host_cfg.get("host") or "").strip().rstrip(".").lower()
+    if primary:
+        stem = primary.split(".")[0]
+        if stem:
+            lookup_names.add(stem)
+    for peer in peers:
+        if peer.get("short_name") in lookup_names or peer.get("dns_name") in lookup_names:
+            return peer
+    slug_hits = [peer for peer in peers if peer.get("host_slug") in lookup_names]
+    if len(slug_hits) == 1:
+        return slug_hits[0]
+    return None
+
+
+def enrich_host_with_tailscale(key, host_cfg, aliases=None, ts_status=None):
+    if not isinstance(host_cfg, dict) or host_cfg.get("transport", "ssh") != "ssh":
+        return host_cfg
+    peer = match_tailscale_peer(key, host_cfg, aliases=aliases, ts_status=ts_status)
+    if peer is None:
+        return host_cfg
+    enriched = dict(host_cfg)
+    enriched["_tailscale_peer_online"] = peer.get("online")
+    if peer.get("online") is not False and peer.get("targets"):
+        enriched["_auto_tailscale_targets"] = list(peer["targets"])
+    return enriched
+
+
+def resolve_ssh_candidates(host_cfg):
+    primary = host_cfg.get("host")
+    explicit_alias = host_cfg.get("host_key_alias")
+    explicit_alias = explicit_alias if bare_host(explicit_alias) else None
+    peer_online = host_cfg.get("_tailscale_peer_online")
+    candidates = []
+    seen = set()
+
+    def _add(target, route_kind):
+        if not ssh_target_valid(target) or target in seen:
+            return
+        seen.add(target)
+        alias = explicit_alias
+        if alias is None and primary and target != primary and bare_host(primary):
+            alias = primary
+        candidates.append((target, route_kind, alias))
+
+    if primary:
+        _add(primary, "tailscale" if is_tailscale_hostname(primary) else "ssh")
+    if peer_online is not False:
+        for auto_target in (host_cfg.get("_auto_tailscale_targets") or []):
+            _add(auto_target, "tailscale")
+        if host_cfg.get("tailscale_host"):
+            _add(host_cfg["tailscale_host"], "tailscale")
+    for fallback in (host_cfg.get("fallback_hosts") or []):
+        _add(fallback, "tailscale" if is_tailscale_hostname(fallback) else "ssh")
+    return candidates, peer_online
+
+
+def run_ssh_command(host_cfg, remote_cmd_str, input_bytes=None, timeout=60):
+    candidates, _ = resolve_ssh_candidates(host_cfg)
+    if not candidates:
+        raise RuntimeError("ssh_probe_unavailable")
+    has_fallbacks = len(candidates) > 1
+    saw_timeout = False
+    saw_unverified_key = False
+    for idx, (target, route_kind, alias) in enumerate(candidates):
+        conn_timeout = "4" if (idx == 0 and has_fallbacks) else ("8" if has_fallbacks else "10")
+        ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=" + conn_timeout]
+        if alias:
+            ssh_opts.extend(["-o", "HostKeyAlias=" + alias])
+        try:
+            result = subprocess.run(
+                ["ssh", *ssh_opts, "--", target, remote_cmd_str],
+                input=input_bytes,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            saw_timeout = True
+            continue
+        except OSError:
+            raise RuntimeError("ssh_probe_unavailable")
+        if result.returncode == 0:
+            return result.stdout, route_kind, target, alias
+        if result.returncode != 255:
+            raise RuntimeError("ssh_probe_failed")
+        stderr_txt = (result.stderr or b"").decode("utf-8", errors="replace")
+        if "REMOTE HOST IDENTIFICATION HAS CHANGED" in stderr_txt:
+            saw_unverified_key = True
+            continue
+        if alias and not host_cfg.get("host_key_alias") and "Host key verification failed" in stderr_txt:
+            try:
+                retry = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=" + conn_timeout, "--", target, remote_cmd_str],
+                    input=input_bytes,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                saw_timeout = True
+                continue
+            except OSError:
+                raise RuntimeError("ssh_probe_unavailable")
+            if retry.returncode == 0:
+                return retry.stdout, route_kind, target, None
+            if retry.returncode != 255:
+                raise RuntimeError("ssh_probe_failed")
+            if "Host key verification failed" in (retry.stderr or b"").decode("utf-8", errors="replace"):
+                saw_unverified_key = True
+        elif "Host key verification failed" in stderr_txt:
+            saw_unverified_key = True
+    if saw_timeout:
+        raise RuntimeError("ssh_probe_timed_out")
+    if saw_unverified_key:
+        raise RuntimeError("ssh_host_key_unverified")
+    raise RuntimeError("ssh_probe_failed")
 
 
 def _validate_role_overrides(overrides):
@@ -100,10 +348,21 @@ def load_config(path):
             raise ValueError("configuration_transport_invalid")
         ssh_target = host.get("host")
         if transport == "ssh":
-            if not bare_host(ssh_target):
+            if not ssh_target_valid(ssh_target):
                 raise ValueError("configuration_ssh_host_invalid")
-        elif ssh_target is not None and not bare_host(ssh_target):
+        elif ssh_target is not None and not ssh_target_valid(ssh_target):
             raise ValueError("configuration_ssh_host_invalid")
+        if "tailscale" in host and type(host["tailscale"]) is not bool:
+            raise ValueError("configuration_tailscale_invalid")
+        if host.get("tailscale_host") is not None and not ssh_target_valid(host["tailscale_host"]):
+            raise ValueError("configuration_ssh_host_invalid")
+        if host.get("host_key_alias") is not None and not bare_host(host["host_key_alias"]):
+            raise ValueError("configuration_ssh_host_invalid")
+        fallbacks = host.get("fallback_hosts")
+        if fallbacks is not None:
+            if (not isinstance(fallbacks, list) or len(fallbacks) > 8
+                    or any(not ssh_target_valid(item) for item in fallbacks)):
+                raise ValueError("configuration_ssh_host_invalid")
         label = host.get("label", key)
         if not isinstance(label, str) or not 0 < len(label) <= 80 or any(ord(c) < 32 for c in label):
             raise ValueError("configuration_label_invalid")
@@ -226,6 +485,7 @@ def safe_codes(values):
 def fetch_snapshot(host):
     transport = host.get("transport", "ssh")
     python = host.get("python", "/usr/bin/python3")
+    route_used = "local" if transport == "local" else "ssh"
     if transport == "local":
         command = [python, "-B", str(SCRIPT_DIR / "fleet_collect.py"), "--collect"]
         if host.get("health_report"):
@@ -238,28 +498,25 @@ def fetch_snapshot(host):
             raise RuntimeError("local_probe_unavailable")
         if result.returncode:
             raise RuntimeError("local_probe_failed")
+        raw_stdout = result.stdout
     else:
         command = [python, "-B", "-", "--collect"]
         if host.get("health_report"):
             command.extend(["--health-report", host["health_report"]])
-        try:
-            result = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host["host"], shlex.join(command)],
-                input=(SCRIPT_DIR / "fleet_collect.py").read_bytes(), capture_output=True, timeout=60,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("ssh_probe_timed_out")
-        except OSError:
-            raise RuntimeError("ssh_probe_unavailable")
-        if result.returncode:
-            raise RuntimeError("ssh_probe_failed")
-    if len(result.stdout) > MAX_BYTES:
+        raw_stdout, route_used, _, _ = run_ssh_command(
+            host,
+            shlex.join(command),
+            input_bytes=(SCRIPT_DIR / "fleet_collect.py").read_bytes(),
+            timeout=60,
+        )
+    if len(raw_stdout) > MAX_BYTES:
         raise ValueError("snapshot_size_limit")
     try:
-        snapshot = json.loads(result.stdout)
+        snapshot = json.loads(raw_stdout)
     except ValueError:
         raise ValueError("snapshot_json_invalid")
     validate_snapshot(snapshot)
+    snapshot["_route"] = route_used
     return snapshot
 
 
@@ -306,7 +563,7 @@ def health_summary(raw, now, max_age):
     return health, owners, observed
 
 
-def normalize_host(key, label, snapshot, max_health_age=120, source="ssh", now=None, role_overrides=None):
+def normalize_host(key, label, snapshot, max_health_age=120, source="ssh", now=None, role_overrides=None, route=None):
     validate_snapshot(snapshot)
     now = now or datetime.now(timezone.utc)
     observed = timestamp(snapshot["observed_at"])
@@ -336,7 +593,10 @@ def normalize_host(key, label, snapshot, max_health_age=120, source="ssh", now=N
     coverage.update({"screens_read": sum(bool(row.get("screen")) for row in snapshot["sessions"]),
                      "sessions_seen": len(rows),
                      "process_only": sum(row["target"]["transport"] == "process" for row in rows)})
-    return {"key": key, "label": label, "source": source, "reachable": True,
+    resolved_route = route or snapshot.get("_route") or source
+    if resolved_route not in {"local", "ssh", "tailscale", "snapshot"}:
+        resolved_route = source
+    return {"key": key, "label": label, "source": source, "route": resolved_route, "reachable": True,
             "observed_at": snapshot["observed_at"], "queried_at": now.isoformat(),
             "snapshot_stale": stale, "sessions": rows, "health": health, "system": system,
             "coverage": coverage, "errors": safe_codes(snapshot.get("errors", []))}
@@ -550,6 +810,7 @@ def save_last_reachable(report, directory):
                 "schema_version": 1,
                 "key": key,
                 "label": report.get("label", key),
+                "route": report.get("route", report.get("source", "ssh")),
                 "observed_at": report.get("observed_at"),
                 "health": report.get("health", {"status": "unknown"}),
                 "system": report.get("system"),
@@ -591,9 +852,13 @@ def load_last_reachable(key, directory, now=None):
         if cached_health.get("process_status") not in {"unknown", None}:
             cached_health["process_status"] = "stale"
         cached_health["age_seconds"] = age
+        stored_route = stored.get("route")
+        if stored_route not in {"local", "ssh", "tailscale", "snapshot"}:
+            stored_route = "ssh"
         return {
             "observed_at": stored["observed_at"],
             "age_seconds": age,
+            "route": stored_route,
             "health": cached_health,
             "system": _normalize_system(stored.get("system")),
             "coverage": stored.get("coverage") if isinstance(stored.get("coverage"), dict) else {},
@@ -603,23 +868,28 @@ def load_last_reachable(key, directory, now=None):
         return None
 
 
-def unavailable(key, label, code, source="ssh", last_reachable=None):
-    result = {"key": key, "label": label, "source": source, "reachable": False,
+def unavailable(key, label, code, source="ssh", last_reachable=None, extra_codes=()):
+    codes = [code]
+    for extra in extra_codes:
+        if extra and extra not in codes:
+            codes.append(extra)
+    result = {"key": key, "label": label, "source": source, "route": source, "reachable": False,
               "observed_at": datetime.now(timezone.utc).isoformat(), "sessions": [],
-              "errors": [code], "coverage": {}, "health": {"status": "unknown"},
+              "errors": codes, "coverage": {}, "health": {"status": "unknown"},
               "system": _normalize_system(None)}
     if last_reachable is not None:
         result["last_reachable"] = last_reachable
     return result
 
 
-def collect_host(key, host, max_age, state_dir=None, role_overrides=None):
+def collect_host(key, host, max_age, state_dir=None, role_overrides=None, aliases=None, ts_status=None):
     label = host.get("label", key)
     transport = host.get("transport", "ssh")
     identity = host.get("host") or ("local:" + key)
+    effective_host = enrich_host_with_tailscale(key, host, aliases=aliases, ts_status=ts_status)
     try:
         report = normalize_host(
-            key, label, fetch_snapshot(host), max_age,
+            key, label, fetch_snapshot(effective_host), max_age,
             source=transport, role_overrides=role_overrides,
         )
         if state_dir:
@@ -630,8 +900,9 @@ def collect_host(key, host, max_age, state_dir=None, role_overrides=None):
         code = str(error)
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
             code = "host_observation_failed"
+        extra = ("tailscale_peer_offline",) if effective_host.get("_tailscale_peer_online") is False else ()
         cached = load_last_reachable(key, state_dir) if state_dir else None
-        return unavailable(key, label, code, source=transport, last_reachable=cached)
+        return unavailable(key, label, code, source=transport, last_reachable=cached, extra_codes=extra)
 
 
 def open_excel(workbook, zoom=150):
@@ -689,9 +960,17 @@ def main(argv=None):
             keys = selected_keys(args.hosts, config["hosts"], config.get("aliases"), args.all)
             state_dir = None if args.no_cache else Path(config["resolved_state_dir"])
             overrides = config.get("role_overrides")
+            aliases = config.get("aliases")
+            need_ts = any(
+                config["hosts"][k].get("transport", "ssh") == "ssh"
+                and config["hosts"][k].get("tailscale") is not False
+                for k in keys
+            )
+            ts_status = discover_tailscale_status() if need_ts else None
             with ThreadPoolExecutor(max_workers=min(4, len(keys))) as executor:
                 futures = [executor.submit(collect_host, key, config["hosts"][key],
-                            config.get("max_health_age_seconds", 120), state_dir, overrides) for key in keys]
+                            config.get("max_health_age_seconds", 120), state_dir, overrides,
+                            aliases, ts_status) for key in keys]
                 reports = [future.result() for future in futures]
         if args.json:
             print(json.dumps({"schema_version": 1, "hosts": reports}, indent=2))

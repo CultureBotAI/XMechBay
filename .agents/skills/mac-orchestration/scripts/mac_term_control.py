@@ -10,6 +10,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -104,16 +105,39 @@ class ScreenUnreadable(Refused):
     """The next input cannot be authorized because the screen is unavailable."""
 
 
+TAILSCALE_IPV6_NET = ipaddress.IPv6Network((0xfd7a115ca1e0 << 80, 48))
+
+
+def _is_tailscale_ipv6(value):
+    if not isinstance(value, str) or "%" in value or ":" not in value:
+        return False
+    try:
+        addr = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return False
+    return isinstance(addr, ipaddress.IPv6Address) and addr in TAILSCALE_IPV6_NET
+
+
 class Transport:
-    def __init__(self, host):
+    def __init__(self, host, host_key_alias=None):
         self.host = "" if host == "local" else host
-        if self.host and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", self.host):
+        if self.host and not (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", self.host) or _is_tailscale_ipv6(self.host)):
             raise ValueError("host must be a bare hostname")
+        alias = (host_key_alias or "").strip()
+        if alias and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", alias):
+            raise ValueError("host_key_alias must be a bare hostname")
+        self.host_key_alias = alias or None
+
+    def _ssh_opts(self):
+        opts = list(SSH_OPTIONS)
+        if self.host and self.host_key_alias:
+            opts.extend(["-o", f"HostKeyAlias={self.host_key_alias}"])
+        return opts
 
     def run(self, args, input=None, timeout=RUN_TIMEOUT):
         command = list(args)
         if self.host:
-            command = ["ssh", *SSH_OPTIONS, self.host, shlex.join(command)]
+            command = ["ssh", *self._ssh_opts(), self.host, shlex.join(command)]
         try:
             result = subprocess.run(command, input=input, text=True, capture_output=True,
                                     timeout=timeout)
@@ -164,8 +188,9 @@ class Transport:
             target = folder + "/prompt.txt"
             try:
                 try:
-                    result = subprocess.run(["scp", "-q", *SSH_OPTIONS, str(local),
-                                             f"{self.host}:{target}"], capture_output=True,
+                    scp_host = f"[{self.host}]" if ":" in self.host else self.host
+                    result = subprocess.run(["scp", "-q", *self._ssh_opts(), str(local),
+                                             f"{scp_host}:{target}"], capture_output=True,
                                             timeout=SCP_TIMEOUT)
                 except subprocess.TimeoutExpired:
                     raise TransportTimeout(f"scp timed out after {SCP_TIMEOUT}s; no input sent") from None
@@ -553,7 +578,9 @@ def auxiliary_command(args, transport, control, parser):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-H", "--host", default=os.environ.get("MAC_TERM_HOST", "local"),
-                        help="local or an explicit bare SSH hostname; no built-in host aliases")
+                        help="local or an explicit bare SSH hostname/IP; no built-in host aliases")
+    parser.add_argument("--host-key-alias", default=os.environ.get("XMECHBAY_SSH_HOST_KEY_ALIAS", ""),
+                        help="optional OpenSSH HostKeyAlias when connecting via Tailscale or fallback IP")
     parser.add_argument("--override-prompt", metavar="USER_INSTRUCTION",
                         help="only for the user's explicit instruction to answer this prompt; recorded")
     parser.add_argument("command", choices=["windows", "screen", "open", "front", "cascade", "wait-file",
@@ -571,7 +598,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.override_prompt is not None and not args.override_prompt.strip():
         parser.error("override requires the user's explicit instruction")
-    transport = Transport(args.host)
+    alias_arg = (args.host_key_alias or "").strip()
+    transport = Transport(args.host, host_key_alias=alias_arg) if alias_arg else Transport(args.host)
     control = Controller(transport, args.command, args.override_prompt)
     if auxiliary_command(args, transport, control, parser):
         return
