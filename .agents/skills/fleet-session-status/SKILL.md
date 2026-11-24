@@ -24,6 +24,9 @@ host telemetry cards, and an opt-in auto-refresh selector (`Off` by default):
 # Serve on http://127.0.0.1:8765/ and open in the local browser on macOS
 bash scripts/fleet-dashboard.sh --open --config .local/fleet-status.json
 
+# Also listen on this Mac's own Tailscale interface (never 0.0.0.0 / LAN)
+bash scripts/fleet-dashboard.sh --tailscale --config .local/fleet-status.json
+
 # Export a private (0600) self-contained static HTML snapshot without serving
 bash scripts/fleet-dashboard.sh --config .local/fleet-status.json \
   --export-html .local/fleet-reports/dashboard-snapshot.html
@@ -33,10 +36,12 @@ bash scripts/fleet-dashboard.sh --snapshot examples/fleet-snapshot.json
 ```
 
 Dashboard guarantees:
-- Binds exclusively to loopback (`127.0.0.1`, `localhost`, or `::1`), sets a
-  strict `Content-Security-Policy` with zero external requests, and validates
-  `Host`, `Origin`, and a per-process `X-MechBay-Token` on `POST /api/refresh`
-  and `POST /api/focus-terminal`.
+- Binds exclusively to loopback (`127.0.0.1`, `localhost`, or `::1`) by default—or,
+  when `--tailscale` is passed, additionally to this Mac's verified Tailscale
+  interface IP (never `0.0.0.0` or LAN)—sets a strict `Content-Security-Policy`
+  with zero external requests, validates `Host`, `Origin`, and a per-process
+  `X-MechBay-Token` on `POST /api/refresh` and `POST /api/focus-terminal`, and
+  restricts `POST /api/focus-terminal` to loopback browser clients.
   When an open tab hits `403 invalid_csrf_token` after a local server restart,
   the UI reloads once (with a 30s loop cooldown), restores view/filter state,
   and completes the refresh or pending M1 Terminal jump—or surfaces a manual
@@ -90,9 +95,13 @@ Dashboard guarantees:
   needs human input, so host totals reconcile 100%, with instant client-side
   switches to **By Mac** and **Project × Mac Matrix** views.
 - Supports `"transport": "local"` in `.local/fleet-status.json` for probing the
-  local Mac directly without SSH, and retains dimmed `last_reachable` cached
-  rows stamped with their age when a remote laptop is unreachable on another
-  network.
+  local Mac directly without SSH, automatically falls back from off-LAN `.local`
+  hostnames to Tailscale peers (`tailscale_host`, `fallback_hosts`, or automatic
+  `tailscale status --json` peer discovery with OpenSSH `HostKeyAlias` pinned to
+  the canonical configured host so `known_hosts` stays strict and `Δ` comparison
+  history survives roaming), badges Tailscale-connected host cards (`🔗 Tailscale`),
+  and retains dimmed `last_reachable` cached rows stamped with their age when a
+  remote laptop is genuinely offline.
 
 ## Terminal Markdown and Excel host tables
 

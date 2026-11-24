@@ -36,7 +36,9 @@ from fleet_status import (
     HOST_KEY,
     ROOT,
     collect_host,
+    discover_tailscale_status,
     ensure_private_dir,
+    is_tailscale_ip,
     load_config,
     normalize_host,
     read_json,
@@ -65,11 +67,20 @@ CSP_POLICY = (
 )
 
 
-def validate_bind_host(host):
+def validate_bind_host(host, allow_tailscale=False, local_tailscale_ips=()):
     value = str(host or "").strip()
-    if value not in LOOPBACK_HOSTS:
-        raise ValueError("dashboard_bind_must_be_loopback")
-    return value
+    if value in LOOPBACK_HOSTS:
+        return value
+    if allow_tailscale and is_tailscale_ip(value) and value in set(local_tailscale_ips or ()):
+        return value
+    if allow_tailscale:
+        raise ValueError("dashboard_bind_must_be_loopback_or_tailscale")
+    raise ValueError("dashboard_bind_must_be_loopback")
+
+
+def _is_loopback_client(addr_str):
+    val = str(addr_str or "").strip().lower()
+    return val in {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
 
 
 def _scrub_surrogates(value):
@@ -316,6 +327,7 @@ def _enrich_session(
     cached_age_text=None,
     host_source="ssh",
     mode="live",
+    host_route=None,
 ):
     role, raw_project, raw_stream = _resolve_row_role(raw_row, role_overrides)
     project_label = private_text(raw_project, 48)
@@ -420,6 +432,7 @@ def _enrich_session(
         "host_key": host_key,
         "host_label": private_text(host_label, 64),
         "host_source": host_source,
+        "host_route": host_route or host_source,
         "stale_cached": is_stale_cached,
         "cached_age_text": cached_age_text,
         "role": role,
@@ -497,6 +510,9 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
         reachable = bool(report.get("reachable", False))
         stale_snap = bool(report.get("snapshot_stale", False))
         source = str(report.get("source") or "ssh")
+        route = str(report.get("route") or source)
+        if route not in {"local", "ssh", "tailscale", "snapshot"}:
+            route = source
         errors = _error_codes(report.get("errors", []))
         mac_sym = host_symbol(key, label, stale=(not reachable or stale_snap))
 
@@ -569,6 +585,7 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
                 cached_age_text=cached_age_text,
                 host_source=source,
                 mode=mode,
+                host_route=route,
             )
             sessions.append(enriched)
             all_role_counts[enriched["role"]] += 1
@@ -715,6 +732,7 @@ def build_dashboard_payload(reports, duration_ms=0, refresh_seq=1, mode="live", 
             "key": key,
             "label": private_text(label, 64),
             "source": source,
+            "route": route,
             "reachable": reachable,
             "snapshot_stale": stale_snap,
             "observed_at": report.get("observed_at"),
@@ -834,6 +852,13 @@ def collect_dashboard_reports(config_path=None, snapshot_path=None, requested_ho
     )
     state_dir = None if not use_cache else Path(config["resolved_state_dir"])
     overrides = config.get("role_overrides")
+    aliases = config.get("aliases")
+    need_ts = any(
+        config["hosts"][k].get("transport", "ssh") == "ssh"
+        and config["hosts"][k].get("tailscale") is not False
+        for k in keys
+    )
+    ts_status = discover_tailscale_status() if need_ts else None
     with ThreadPoolExecutor(max_workers=min(4, len(keys))) as executor:
         futures = [
             executor.submit(
@@ -843,6 +868,8 @@ def collect_dashboard_reports(config_path=None, snapshot_path=None, requested_ho
                 config.get("max_health_age_seconds", 120),
                 state_dir,
                 overrides,
+                aliases,
+                ts_status,
             )
             for key in keys
         ]
@@ -2380,8 +2407,15 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     }
   }
 
+  function isLoopbackPageHost() {
+    if (!window.location || !window.location.hostname) return true;
+    const h = String(window.location.hostname).trim().toLowerCase();
+    return h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "[::1]";
+  }
+
   function isRowM1Focusable(row) {
     if (!row || STATIC_EXPORT || window.location.protocol === "file:") return false;
+    if (!isLoopbackPageHost()) return false;
     if (!payload || payload.mode !== "live") return false;
     if (row.stale_cached || !row.can_focus_terminal) return false;
     const glyph = row.symbols && row.symbols.mac ? row.symbols.mac.glyph : (row.mac ? row.mac.glyph : "");
@@ -2461,9 +2495,16 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       autoSelect.disabled = true;
       linkExport.style.display = "none";
     } else if (payload.mode === "snapshot") {
-      modeBadge.textContent = "Synthetic Fixture · 127.0.0.1";
+      modeBadge.textContent = isLoopbackPageHost() ? "Synthetic Fixture · 127.0.0.1" : "Synthetic Fixture · Tailscale";
     } else {
-      modeBadge.textContent = "Read-only · 127.0.0.1";
+      const tsHostCount = (payload.hosts || []).filter(function(h) { return h.reachable && h.route === "tailscale"; }).length;
+      if (!isLoopbackPageHost()) {
+        modeBadge.textContent = "Read-only · Tailscale";
+      } else if (tsHostCount > 0) {
+        modeBadge.textContent = "Read-only · 127.0.0.1 + Tailscale (" + tsHostCount + ")";
+      } else {
+        modeBadge.textContent = "Read-only · 127.0.0.1";
+      }
     }
 
     const stamp = document.getElementById("stamp-line");
@@ -2730,6 +2771,20 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       const statusTone = !h.reachable ? "red" : (h.source === "snapshot" ? "blue" : "green");
       const statusLabel = !h.reachable ? "🔴 UNREACHABLE" : (h.source === "snapshot" ? "🔵 SNAPSHOT" : "🟢 LIVE");
       const statusPill = el("span", {className: "sym-pill tone-" + statusTone, text: statusLabel});
+      let routePill = null;
+      if (h.reachable && h.route === "tailscale") {
+        routePill = el("span", {
+          className: "sym-pill tone-teal",
+          title: "Connected remotely over Tailscale SSH",
+          text: "🔗 Tailscale"
+        });
+      } else if (!h.reachable && Array.isArray(h.errors) && h.errors.includes("tailscale_peer_offline")) {
+        routePill = el("span", {
+          className: "sym-pill tone-slate",
+          title: "Tailscale reports this peer is currently offline",
+          text: "◌ Tailscale offline"
+        });
+      }
       const hostHumanTotal = typeof h.human_total_count === "number" ? h.human_total_count : 0;
       const hostKeystrokes = typeof h.human_keystroke_count === "number"
         ? h.human_keystroke_count
@@ -2846,7 +2901,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       const card = el("article", {className: cardCls}, [
         el("div", {className: "host-head"}, [
           el("div", {className: "host-title"}, [renderSymPill(h.mac, false), el("span", {text: h.label})]),
-          el("div", {className: "host-head-pills"}, [hostInputBtn, statusPill])
+          el("div", {className: "host-head-pills"}, [hostInputBtn, routePill, statusPill])
         ]),
         el("div", {className: "host-main-row"}, [el("div", {className: "host-count", text: countText}), dotsWrap]),
         rolesLine,
@@ -4015,28 +4070,66 @@ class DashboardState:
 class LoopbackHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, server_address, handler_cls, state):
-        host = validate_bind_host(server_address[0])
-        if host == "::1":
+    def __init__(
+        self,
+        server_address,
+        handler_cls,
+        state,
+        allow_tailscale=False,
+        local_tailscale_ips=(),
+        extra_host_names=(),
+    ):
+        host = validate_bind_host(
+            server_address[0],
+            allow_tailscale=allow_tailscale,
+            local_tailscale_ips=local_tailscale_ips,
+        )
+        if ":" in host:
             self.address_family = socket.AF_INET6
         self.state = state
+        self.extra_host_names = tuple(extra_host_names or ())
         super().__init__((host, server_address[1]), handler_cls)
 
 
-def _allowed_host_headers(port):
-    return {
+def _format_host_for_header(raw_host):
+    val = str(raw_host or "").strip().rstrip(".").lower()
+    if not val:
+        return None
+    if ":" in val and not val.startswith("["):
+        return "[" + val + "]"
+    return val
+
+
+def _allowed_host_headers(port, extra_hosts=()):
+    allowed = {
         "127.0.0.1:" + str(port),
         "localhost:" + str(port),
         "[::1]:" + str(port),
     } | ({"127.0.0.1", "localhost", "[::1]"} if port == 80 else set())
+    for raw in extra_hosts or ():
+        fmt = _format_host_for_header(raw)
+        if not fmt:
+            continue
+        allowed.add(fmt + ":" + str(port))
+        allowed.add(fmt)
+    return allowed
 
 
-def _allowed_origins(port):
-    return {
+def _allowed_origins(port, extra_hosts=()):
+    allowed = {
         "http://127.0.0.1:" + str(port),
         "http://localhost:" + str(port),
         "http://[::1]:" + str(port),
     } | ({"http://127.0.0.1", "http://localhost", "http://[::1]"} if port == 80 else set())
+    for raw in extra_hosts or ():
+        fmt = _format_host_for_header(raw)
+        if not fmt:
+            continue
+        allowed.add("http://" + fmt + ":" + str(port))
+        allowed.add("https://" + fmt + ":" + str(port))
+        allowed.add("http://" + fmt)
+        allowed.add("https://" + fmt)
+    return allowed
 
 
 TERMINAL_FOCUS_JXA = """function run(argv) {
@@ -4412,8 +4505,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _check_host_header(self):
         port = self.server.server_address[1]
+        extra = getattr(self.server, "extra_host_names", ())
         host_hdr = (self.headers.get("Host") or "").strip().lower()
-        return host_hdr in _allowed_host_headers(port)
+        return host_hdr in _allowed_host_headers(port, extra_hosts=extra)
 
     def _read_post_body(self, max_bytes=4096):
         if self.headers.get("Transfer-Encoding") is not None:
@@ -4480,8 +4574,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not_found"})
             return
         port = self.server.server_address[1]
+        extra = getattr(self.server, "extra_host_names", ())
         origin = self.headers.get("Origin")
-        if origin is not None and origin.strip().lower() not in _allowed_origins(port):
+        if origin is not None and origin.strip().lower() not in _allowed_origins(port, extra_hosts=extra):
             self._send_json(403, {"error": "forbidden_origin"})
             return
         supplied = self.headers.get("X-MechBay-Token") or ""
@@ -4499,6 +4594,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": "dashboard_refresh_failed"})
                 return
             self._send_json(200, payload)
+            return
+
+        if not _is_loopback_client(self.client_address[0]):
+            self._send_json(403, {"error": "loopback_client_required"})
             return
 
         try:
@@ -4543,8 +4642,50 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_json(focus_status, focus_body)
 
 
-def create_server(state, host="127.0.0.1", port=8765):
-    return LoopbackHTTPServer((validate_bind_host(host), port), DashboardHandler, state)
+def create_server(
+    state,
+    host="127.0.0.1",
+    port=8765,
+    allow_tailscale=False,
+    local_tailscale_ips=(),
+    extra_host_names=(),
+):
+    validated = validate_bind_host(
+        host,
+        allow_tailscale=allow_tailscale,
+        local_tailscale_ips=local_tailscale_ips,
+    )
+    return LoopbackHTTPServer(
+        (validated, port),
+        DashboardHandler,
+        state,
+        allow_tailscale=allow_tailscale,
+        local_tailscale_ips=local_tailscale_ips,
+        extra_host_names=extra_host_names,
+    )
+
+
+def resolve_local_tailscale_bind(ts_status=None):
+    status = ts_status if isinstance(ts_status, dict) else discover_tailscale_status()
+    self_node = (status or {}).get("self")
+    if not isinstance(self_node, dict) or self_node.get("online") is False:
+        raise ValueError("tailscale_unavailable")
+    ips = [ip for ip in (self_node.get("ips") or []) if is_tailscale_ip(ip)]
+    if not ips:
+        raise ValueError("tailscale_unavailable")
+    extra_names = list(ips)
+    for field in ("dns_name", "short_name"):
+        val = self_node.get(field)
+        if isinstance(val, str) and val and val not in extra_names:
+            extra_names.append(val)
+    return {
+        "ips": ips,
+        "ipv4": self_node.get("ipv4"),
+        "primary_ip": self_node.get("ipv4") or ips[0],
+        "dns_name": self_node.get("dns_name"),
+        "short_name": self_node.get("short_name"),
+        "extra_host_names": extra_names,
+    }
 
 
 def open_browser_local(url):
@@ -4564,8 +4705,9 @@ def main(argv=None):
     parser.add_argument("--all", action="store_true", help="include all configured hosts (default when none specified)")
     parser.add_argument("--snapshot", type=Path, help="offline multi-host fixture; no SSH or caches")
     parser.add_argument("--no-cache", action="store_true", help="do not read/write comparison or fallback caches")
-    parser.add_argument("--host", default="127.0.0.1", help="loopback bind address (127.0.0.1, localhost, or ::1)")
-    parser.add_argument("--port", type=int, default=8765, help="TCP port on loopback (0 chooses an ephemeral port)")
+    parser.add_argument("--host", default="127.0.0.1", help="loopback bind address (or local Tailscale IP with --tailscale)")
+    parser.add_argument("--tailscale", action="store_true", help="also serve over this Mac's Tailscale interface (no LAN wildcard)")
+    parser.add_argument("--port", type=int, default=8765, help="TCP port on loopback/Tailscale (0 chooses an ephemeral port)")
     parser.add_argument("--export-html", type=Path, help="write one private static HTML snapshot (0600) and exit")
     parser.add_argument(
         "--report-dir",
@@ -4582,8 +4724,6 @@ def main(argv=None):
         parser.error("--port must be between 0 and 65535")
 
     try:
-        bind_host = validate_bind_host(args.host)
-
         def collect_once():
             return collect_dashboard_reports(
                 config_path=args.config,
@@ -4609,24 +4749,67 @@ def main(argv=None):
             print(str(out_path))
             return 0 if all(r.get("reachable") for r in reports) else 2
 
+        ts_bind = resolve_local_tailscale_bind() if args.tailscale else None
+        local_ts_ips = ts_bind["ips"] if ts_bind else ()
+        extra_host_names = ts_bind["extra_host_names"] if ts_bind else ()
+        bind_host = validate_bind_host(
+            args.host,
+            allow_tailscale=bool(args.tailscale),
+            local_tailscale_ips=local_ts_ips,
+        )
+
         latest_html = None if (args.no_cache or args.snapshot is not None) else (args.report_dir / "dashboard-latest.html")
         state = DashboardState(collect_once, snapshot_html_path=latest_html)
         state.get_payload()  # Initial collection before opening browser.
-        server = create_server(state, host=bind_host, port=args.port)
-        bound_port = server.server_address[1]
-        url_host = "[::1]" if bind_host == "::1" else "127.0.0.1"
-        url = "http://" + url_host + ":" + str(bound_port) + "/"
-        print("MechBay dashboard listening on " + url + " (Ctrl+C to stop)", flush=True)
-        if args.open:
-            try:
-                open_browser_local(url)
-            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-                print("Browser launch skipped: " + str(error), file=sys.stderr)
+        server = create_server(
+            state,
+            host=bind_host,
+            port=args.port,
+            allow_tailscale=bool(args.tailscale),
+            local_tailscale_ips=local_ts_ips,
+            extra_host_names=extra_host_names,
+        )
+        secondary_server = None
         try:
+            bound_port = server.server_address[1]
+            if ts_bind and bind_host in LOOPBACK_HOSTS and ts_bind.get("ipv4"):
+                secondary_server = create_server(
+                    state,
+                    host=ts_bind["ipv4"],
+                    port=bound_port,
+                    allow_tailscale=True,
+                    local_tailscale_ips=local_ts_ips,
+                    extra_host_names=extra_host_names,
+                )
+                sec_thread = threading.Thread(target=secondary_server.serve_forever, daemon=True)
+                sec_thread.start()
+            if bind_host == "::1":
+                url_host = "[::1]"
+            elif bind_host in LOOPBACK_HOSTS:
+                url_host = "127.0.0.1"
+            elif ":" in bind_host:
+                url_host = "[" + bind_host + "]"
+            else:
+                url_host = bind_host
+            url = "http://" + url_host + ":" + str(bound_port) + "/"
+            ts_note = ""
+            if ts_bind:
+                raw_disp = ts_bind.get("dns_name") or ts_bind.get("ipv4") or ts_bind.get("primary_ip")
+                ts_host_disp = "[" + str(raw_disp) + "]" if (raw_disp and ":" in str(raw_disp) and not str(raw_disp).startswith("[")) else str(raw_disp)
+                ts_note = " and Tailscale http://" + ts_host_disp + ":" + str(bound_port) + "/"
+            print("MechBay dashboard listening on " + url + ts_note + " (Ctrl+C to stop)", flush=True)
+            if args.open:
+                try:
+                    open_browser_local(url)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    print("Browser launch skipped: " + str(error), file=sys.stderr)
             server.serve_forever()
         except KeyboardInterrupt:
             pass
         finally:
+            if secondary_server is not None:
+                secondary_server.shutdown()
+                secondary_server.server_close()
             server.server_close()
         return 0
     except (OSError, ValueError, TypeError, RuntimeError) as error:

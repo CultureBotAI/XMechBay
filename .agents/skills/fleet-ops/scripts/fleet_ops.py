@@ -118,8 +118,11 @@ EMAIL_OR_MENTION_RE = re.compile(
     r"(?<![A-Za-z0-9_])@*(?P<email>[A-Za-z0-9_][\w.+-]*@(?:[\w-]+\.)+[A-Za-z]{2,})(?![.-]?[A-Za-z0-9_])"
 )
 LOCAL_HOSTNAME_RE = re.compile(r"(?i)\b[A-Za-z0-9][A-Za-z0-9.-]*\.local\b(?![.-]?[A-Za-z0-9])")
+TAILSCALE_HOSTNAME_RE = re.compile(
+    r"(?i)\b[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)*\.ts\.net\b(?![.-]?[A-Za-z0-9])"
+)
 PRIVATE_IP_RE = re.compile(
-    r"(?<!\d)(?<!\d\.)(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?!(?:\.\d|\d))"
+    r"(?i)(?:(?<!\d)(?<!\d\.)(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2})(?!(?:\.\d|\d))|\bfd7a:115c:a1e0:[0-9a-f:]+)"
 )
 UNIX_LOCAL_PATH_RE = re.compile(
     r"(?i)(?:~[A-Za-z0-9_.-]*/|/(?:Users|home|Volumes)/|/private/var/(?:folders|tmp)/|/var/(?:folders|tmp)/|/private/tmp/|/tmp/)[^\s)\]>\"'`,;]*[^\s)\]>\"'`,;.:]"
@@ -244,54 +247,106 @@ def collect_sessions(args, config: dict) -> dict:
     return fleet_dashboard.build_dashboard_payload(reports, mode=meta["mode"], role_overrides=meta["role_overrides"])
 
 
-def status_hosts(config: dict) -> dict:
+def status_config_raw(config: dict) -> dict:
     path = resolve_path(config, config.get("fleet_status_config"))
     if not path or not path.exists():
         return {}
     raw = json.loads(path.read_text())
-    hosts = raw.get("hosts") if isinstance(raw, dict) else None
+    return raw if isinstance(raw, dict) else {}
+
+
+def status_hosts(config: dict) -> dict:
+    raw = status_config_raw(config)
+    hosts = raw.get("hosts")
     return hosts if isinstance(hosts, dict) else {}
 
 
-def probe_host(key: str, host_cfg: dict, watch: list, timeout: int = 1800) -> dict:
+def probe_host(
+    key: str,
+    host_cfg: dict,
+    watch: list,
+    timeout: int = 1800,
+    aliases: dict | None = None,
+    ts_status: dict | None = None,
+) -> dict:
     args = []
     for item in watch:
         args += ["--watch", item]
     python = host_cfg.get("python", "/usr/bin/python3")
     if host_cfg.get("transport") == "local":
         cmd = [python, str(PROBE)] + args
-        stdin = None
-    else:
-        destination = host_cfg.get("host")
-        if not destination:
-            return {"error": "no ssh host configured"}
-        # The remote command is parsed by the remote shell: quote every word (no expansion, UTF-8 kept).
-        remote = " ".join(shlex.quote(word) for word in [python, "-"] + args)
-        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", destination, remote]
-        stdin = PROBE.open()
-    try:
-        proc = subprocess.run(cmd, stdin=stdin, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return {"error": "probe timeout"}
-    finally:
-        if stdin:
-            stdin.close()
-    if proc.returncode != 0:
-        return {"error": f"probe exit {proc.returncode}: {proc.stderr.strip()[-300:]}"}
-    try:
-        return json.loads(proc.stdout)
-    except ValueError:
-        return {"error": "probe output is not JSON: " + proc.stdout.strip()[:120]}
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"error": "probe timeout"}
+        if proc.returncode != 0:
+            return {"error": f"probe exit {proc.returncode}: {(proc.stderr or '').strip()[-300:]}"}
+        try:
+            return json.loads(proc.stdout)
+        except ValueError:
+            return {"error": "probe output is not JSON: " + (proc.stdout or "").strip()[:120]}
+
+    sys.path.insert(0, str(STATUS_SCRIPTS))
+    import fleet_status as fs_mod  # noqa: E402
+
+    effective = fs_mod.enrich_host_with_tailscale(key, host_cfg, aliases=aliases, ts_status=ts_status)
+    candidates, _ = fs_mod.resolve_ssh_candidates(effective)
+    if not candidates:
+        return {"error": "no ssh host configured"}
+    # The remote command is parsed by the remote shell: quote every word (no expansion, UTF-8 kept).
+    remote = " ".join(shlex.quote(word) for word in [python, "-"] + args)
+    probe_src = PROBE.read_text(encoding="utf-8")
+    has_fallbacks = len(candidates) > 1
+    last_error = "probe failed"
+    for idx, (destination, _, alias) in enumerate(candidates):
+        conn_timeout = "4" if (idx == 0 and has_fallbacks) else ("8" if has_fallbacks else "10")
+        ssh_opts = ["-o", "BatchMode=yes", f"-o", f"ConnectTimeout={conn_timeout}"]
+        if alias:
+            ssh_opts.extend(["-o", f"HostKeyAlias={alias}"])
+        cmd = ["ssh", *ssh_opts, "--", destination, remote]
+        try:
+            proc = subprocess.run(cmd, input=probe_src, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            last_error = "probe timeout"
+            continue
+        if proc.returncode == 0:
+            try:
+                return json.loads(proc.stdout)
+            except ValueError:
+                return {"error": "probe output is not JSON: " + (proc.stdout or "").strip()[:120]}
+        stderr_txt = (proc.stderr or "").strip()
+        last_error = f"probe exit {proc.returncode}: {stderr_txt[-300:]}"
+        if proc.returncode != 255:
+            return {"error": last_error}
+    return {"error": last_error}
 
 
 def collect_resources(config: dict, host_keys: list) -> dict:
-    hosts = status_hosts(config)
+    raw_status = status_config_raw(config)
+    hosts = raw_status.get("hosts") if isinstance(raw_status.get("hosts"), dict) else {}
+    aliases = raw_status.get("aliases") if isinstance(raw_status.get("aliases"), dict) else {}
+    sys.path.insert(0, str(STATUS_SCRIPTS))
+    import fleet_status as fs_mod  # noqa: E402
+
+    need_ts = any(
+        isinstance(hosts.get(k), dict)
+        and hosts[k].get("transport", "ssh") != "local"
+        and hosts[k].get("tailscale") is not False
+        for k in host_keys
+    )
+    ts_status = fs_mod.discover_tailscale_status() if need_ts else None
     out = {}
     for key in host_keys:
         if key not in hosts:
             out[key] = {"error": "host missing from fleet-status config"}
             continue
-        out[key] = probe_host(key, hosts[key], config["hosts"].get(key, {}).get("watch", []))
+        out[key] = probe_host(
+            key,
+            hosts[key],
+            config["hosts"].get(key, {}).get("watch", []),
+            aliases=aliases,
+            ts_status=ts_status,
+        )
     return out
 
 
@@ -1615,7 +1670,19 @@ def plan(run_dir: Path, config: dict) -> dict:
     out = ensure_private_dir(run_dir / "plan", enforce_leaf_mode=True)
     ensure_private_dir(out / "briefs", enforce_leaf_mode=True)
     ensure_private_dir(out / "goals", enforce_leaf_mode=True)
-    hosts = status_hosts(config)
+    raw_status = status_config_raw(config)
+    hosts = raw_status.get("hosts") if isinstance(raw_status.get("hosts"), dict) else {}
+    aliases = raw_status.get("aliases") if isinstance(raw_status.get("aliases"), dict) else {}
+    sys.path.insert(0, str(STATUS_SCRIPTS))
+    import fleet_status as fs_mod  # noqa: E402
+
+    need_auto_ts = any(
+        isinstance(h, dict)
+        and h.get("route") == "tailscale"
+        and not (hosts.get(h.get("key")) or {}).get("tailscale_host")
+        for h in (payload.get("hosts") or [])
+    )
+    ts_status = fs_mod.discover_tailscale_status() if need_auto_ts else None
     groups = defaultdict(list)
     for f in findings:
         groups[(f["owner"]["kind"], f["owner"]["key"])].append(f)
@@ -1640,7 +1707,30 @@ def plan(run_dir: Path, config: dict) -> dict:
         write_private_file(out / "briefs" / f"{key}.md", brief)
         write_private_file(out / "goals" / f"{key}.txt", goal)
         host_cfg = hosts.get(claw.get("host")) or {}
-        dest = "local" if host_cfg.get("transport") == "local" else host_cfg.get("host", "<ssh-host>")
+        host_card = next((h for h in (payload.get("hosts") or []) if isinstance(h, dict) and h.get("key") == claw.get("host")), {})
+        if host_cfg.get("transport") == "local":
+            dest = "local"
+            ssh_alias = None
+        elif host_card.get("route") == "tailscale":
+            enriched = fs_mod.enrich_host_with_tailscale(
+                claw.get("host"), host_cfg, aliases=aliases, ts_status=ts_status
+            )
+            candidates, _ = fs_mod.resolve_ssh_candidates(enriched)
+            ts_cand = next((c for c in candidates if c[1] == "tailscale"), None)
+            if ts_cand is not None:
+                dest, _, ssh_alias = ts_cand
+            else:
+                dest = host_cfg.get("host", "<ssh-host>")
+                ssh_alias = host_cfg.get("host_key_alias")
+        else:
+            dest = host_cfg.get("host", "<ssh-host>")
+            ssh_alias = host_cfg.get("host_key_alias")
+        q_dest = dest if dest == "<ssh-host>" else shlex.quote(dest)
+        raw_scp_host = f"[{dest}]" if (":" in dest and not dest.startswith("[")) else dest
+        scp_remote_target = f"{raw_scp_host}:{remote_dir.replace('~/', '')}/brief.md"
+        q_scp_target = scp_remote_target if raw_scp_host == "<ssh-host>" else shlex.quote(scp_remote_target)
+        ssh_opt_str = f"-o HostKeyAlias={shlex.quote(ssh_alias)} " if (ssh_alias and ssh_alias != dest) else ""
+        mt_alias_str = f"--host-key-alias {shlex.quote(ssh_alias)} " if (ssh_alias and ssh_alias != dest) else ""
         targets = claw_targets(payload, claw)
         controller = controller_tmux_for_claw(claw, config)
         chosen, reason = choose_target(targets, claw, controller)
@@ -1651,18 +1741,18 @@ def plan(run_dir: Path, config: dict) -> dict:
                      ("Chosen target: " + json.dumps(chosen)) if chosen else f"**Not resolved: {reason}. Confirm the claw session before sending.**",
                      "", "```bash"]
         dispatch.append(f"mkdir -p {remote_dir} && cp {shlex.quote(str(brief_file))} {remote_dir}/brief.md" if dest == "local"
-                        else f"ssh {dest} 'mkdir -p {remote_dir}' && scp {shlex.quote(str(brief_file))} {dest}:{remote_dir.replace('~/', '')}/brief.md")
+                        else f"ssh {ssh_opt_str}{q_dest} 'mkdir -p {remote_dir}' && scp {ssh_opt_str}{shlex.quote(str(brief_file))} {q_scp_target}")
         if chosen and chosen["transport"] == "tmux" and chosen.get("tmux_window"):
-            dispatch.append(f"XMECHBAY_TMUX_SESSION={shlex.quote(controller)} bash {shlex.quote(str(mt))} -H {dest} tmux-paste "
+            dispatch.append(f"XMECHBAY_TMUX_SESSION={shlex.quote(controller)} bash {shlex.quote(str(mt))} {mt_alias_str}-H {q_dest} tmux-paste "
                             f"{shlex.quote(str(chosen['tmux_window']))} {shlex.quote(str(goal_file))}")
         else:
             window = chosen["window"] if chosen else "<window-id>"
             tty = chosen["tty"] if chosen else "<claw tty>"
             dispatch += [f"# Proceed only if this line shows tty {tty} (the selected tab must be the claw):",
-                         f"bash {shlex.quote(str(mt))} -H {dest} windows | grep '|{window}|'",
-                         f"bash {shlex.quote(str(mt))} -H {dest} screen {window} 40",
-                         f"bash {shlex.quote(str(mt))} -H {dest} paste {window} {shlex.quote(str(goal_file))}",
-                         f"bash {shlex.quote(str(mt))} -H {dest} screen {window} 40"]
+                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {q_dest} windows | grep '|{window}|'",
+                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {q_dest} screen {window} 40",
+                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {q_dest} paste {window} {shlex.quote(str(goal_file))}",
+                         f"bash {shlex.quote(str(mt))} {mt_alias_str}-H {q_dest} screen {window} 40"]
         dispatch += ["```", ""]
         summary["claws"][key] = {"findings": len(items), "targets": len(targets), "target_resolved": chosen is not None, "reason": reason}
     decisions = [f for f in findings if f["owner"]["kind"] == "user"]
@@ -1785,6 +1875,10 @@ def collect_private_host_terms(config: dict, payload: dict | None = None, resour
         _add(key)
         if isinstance(cfg, dict):
             _add(cfg.get("host"))
+            _add(cfg.get("tailscale_host"))
+            _add(cfg.get("host_key_alias"))
+            for fb in (cfg.get("fallback_hosts") or ()):
+                _add(fb)
     return out
 
 
@@ -1803,6 +1897,7 @@ def sanitize_public_text(text: str, private_terms=()) -> str:
     cleaned = UNIX_LOCAL_PATH_RE.sub("<local-path>", cleaned)
     cleaned = WIN_LOCAL_PATH_RE.sub("<local-path>", cleaned)
     cleaned = LOCAL_HOSTNAME_RE.sub("<redacted-host>", cleaned)
+    cleaned = TAILSCALE_HOSTNAME_RE.sub("<redacted-host>", cleaned)
     cleaned = PRIVATE_IP_RE.sub("<redacted-ip>", cleaned)
     for term in sorted({str(t) for t in (private_terms or ()) if t}, key=len, reverse=True):
         if len(term) < 2 or term.lower() in GENERIC_HOST_TOKENS:

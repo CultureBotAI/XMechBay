@@ -8,11 +8,13 @@
     },
     "laptop-a": {
       "host": "worker-a.example.invalid",
+      "tailscale_host": "worker-a-ts.example.invalid",
       "label": "Laptop A",
       "python": "/usr/bin/python3"
     },
     "laptop-b": {
       "host": "worker-b.example.invalid",
+      "tailscale_host": "worker-b-ts.example.invalid",
       "label": "Laptop B",
       "python": "/usr/bin/python3"
     }

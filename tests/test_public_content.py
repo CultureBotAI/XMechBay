@@ -194,6 +194,23 @@ class PublicationGateTests(unittest.TestCase):
             gate.main(["--root", str(self.root), "--deny-patterns", str(self.root / "patterns.txt")])
         self.assertEqual(caught.exception.code, 2)
 
+    def test_tailscale_hostnames_and_cgnat_ips_are_flagged_without_public_false_positives(self):
+        ts_host = "node-a.sample-tailnet." + "ts.net"
+        ts_ipv4 = ".".join(["100", "74", "10", "20"])
+        ts_ipv6 = "fd7a:115c:" + "a1e0::abcd:1"
+        self.write("notes.txt", f"tailscale={ts_host} ip4={ts_ipv4} ip6={ts_ipv6}\n")
+        self.git("add", ".")
+        findings, _ = self.scan()
+        cats = self.categories(findings)
+        self.assertIn("tailscale-hostname", cats)
+        self.assertIn("private-network-address", cats)
+
+        # Public addresses outside RFC 6598 shared CGNAT space are not flagged
+        self.write("notes.txt", "public_ips = " + ".".join(["100", "20", "1", "2"]) + ", " + ".".join(["100", "128", "1", "2"]) + "\n")
+        self.git("add", ".")
+        clean_findings, _ = self.scan()
+        self.assertEqual(clean_findings, set())
+
 
 if __name__ == "__main__":
     unittest.main()
