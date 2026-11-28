@@ -844,28 +844,45 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(report["coverage"]["tmux"], "not_running")
         self.assertNotIn("tmux_probe_failed", report["errors"])
 
-        # Runner.run strips TMUX, sets LC_ALL=C, maps list-panes absent-server stderr to not_running,
+        # Runner.run strips TMUX, forces tmux -u without forcing LC_ALL=C (which breaks tab delimiters),
+        # maps English and localized list-panes absent-server stderr to not_running,
         # and does not misclassify capture-pane on a socket named "list-panes".
         seen_envs = []
+        seen_cmds = []
 
         def fake_subproc(stderr_bytes, returncode=1):
             def _run(cmd, stdout, stderr, timeout, check, **kwargs):
+                seen_cmds.append(cmd)
                 seen_envs.append(kwargs.get("env"))
                 stderr.write(stderr_bytes)
                 return type("Proc", (), {"returncode": returncode})()
             return _run
 
         runner = COLLECTOR.Runner()
-        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/alt_server,123,0"}, clear=False):
+        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/alt_server,123,0", "LC_ALL": "en_US.UTF-8"}, clear=False):
             with patch.object(COLLECTOR.subprocess, "run", side_effect=fake_subproc(b"no server running on /tmp/tmux-501/default\n")):
                 with self.assertRaisesRegex(COLLECTOR.ProbeFailure, "^not_running$"):
                     runner.run(["/opt/homebrew/bin/tmux", "list-panes", "-a", "-F", "#{pane_id}"])
             self.assertNotIn("TMUX", seen_envs[-1])
-            self.assertEqual(seen_envs[-1]["LC_ALL"], "C")
+            self.assertEqual(seen_envs[-1].get("LC_ALL"), "en_US.UTF-8")
+            self.assertEqual(seen_cmds[-1][:3], ["/opt/homebrew/bin/tmux", "-u", "list-panes"])
+
+            # Existing -u flag is not duplicated
+            with patch.object(COLLECTOR.subprocess, "run", side_effect=fake_subproc(b"no server running on /tmp/tmux-501/default\n")):
+                with self.assertRaisesRegex(COLLECTOR.ProbeFailure, "^not_running$"):
+                    runner.run(["/opt/homebrew/bin/tmux", "-u", "list-panes", "-a", "-F", "#{pane_id}"])
+            self.assertEqual(seen_cmds[-1][:3], ["/opt/homebrew/bin/tmux", "-u", "list-panes"])
 
             with patch.object(COLLECTOR.subprocess, "run", side_effect=fake_subproc(b"error connecting to /tmp/tmux-501/stale (Connection refused)\n")):
                 with self.assertRaisesRegex(COLLECTOR.ProbeFailure, "^not_running$"):
                     runner.run(["/opt/homebrew/bin/tmux", "-L", "stale", "list-panes", "-a", "-F", "#{pane_id}"])
+            self.assertEqual(seen_cmds[-1][:5], ["/opt/homebrew/bin/tmux", "-u", "-L", "stale", "list-panes"])
+
+            # Localized strerror() matches without forcing LC_ALL=C
+            with patch.object(COLLECTOR.os, "strerror", side_effect=lambda code: "fichier absent" if code == COLLECTOR.errno.ENOENT else "refuse"):
+                with patch.object(COLLECTOR.subprocess, "run", side_effect=fake_subproc(b"error connecting to /tmp/tmux-501/default (Fichier absent)\n")):
+                    with self.assertRaisesRegex(COLLECTOR.ProbeFailure, "^not_running$"):
+                        runner.run(["/opt/homebrew/bin/tmux", "list-panes", "-a", "-F", "#{pane_id}"])
 
             with patch.object(COLLECTOR.subprocess, "run", side_effect=fake_subproc(b"no server running on /tmp/tmux-501/list-panes\n")):
                 with self.assertRaisesRegex(COLLECTOR.ProbeFailure, "^probe_failed$"):
