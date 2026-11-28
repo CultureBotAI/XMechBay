@@ -453,6 +453,14 @@ def validate_snapshot(snapshot):
         target = row.get("target")
         if not isinstance(target, dict) or target.get("transport") not in {"tmux", "terminal", "process"}:
             raise ValueError("snapshot_target_invalid")
+        tmux_socket = target.get("tmux_socket")
+        if tmux_socket is not None and (
+            target.get("transport") != "tmux"
+            or not isinstance(tmux_socket, str)
+            or tmux_socket == "default"
+            or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}", tmux_socket)
+        ):
+            raise ValueError("snapshot_target_invalid")
         memberships = target.get("tmux_sessions", [])
         if not isinstance(memberships, list) or any(not isinstance(name, str) for name in memberships):
             raise ValueError("snapshot_target_invalid")
@@ -566,7 +574,7 @@ def normalize_host(key, label, snapshot, max_health_age=120, source="ssh", now=N
         row["session_id_current_verified"] = False
         # Targets contain only transport selectors, never titles, screens or argv.
         row["target"] = {field: session["target"][field] for field in
-                         ("transport", "pane", "tmux_session", "tmux_sessions", "window", "window_id", "tab", "selected", "minimized")
+                         ("transport", "pane", "tmux_socket", "tmux_session", "tmux_sessions", "window", "window_id", "tab", "selected", "minimized")
                          if field in session["target"]}
         started = timestamp(session.get("started_at"))
         row["listeners"] = {"count": None, "status": "unknown", "stale": health["status"] == "stale"}

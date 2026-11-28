@@ -1149,16 +1149,81 @@ def activity_findings(payload: dict, config: dict, by_mech: dict, issues: dict |
                 evidence["mode"] = lane
             out.append(finding("info", "activity", f"{mech}: no session is working", action, m_owner, None, mech, evidence))
     absent = [mech for mech in (payload.get("canonical_mechs") or []) if isinstance(mech, str) and mech and mech not in by_mech]
-    if absent:
-        out.append(finding("info", "activity", f"{len(absent)} fleet Mechs have no session on any observed host",
+    observed_hosts = [h for h in (payload.get("hosts") or ()) if isinstance(h, dict)]
+    observed_host_keys = {h.get("key") for h in observed_hosts if isinstance(h.get("key"), str) and h.get("key")}
+    expected_hosts = (
+        {k for k in (config.get("hosts") or {}) if isinstance(k, str) and k}
+        | {c.get("host") for c in (config.get("claws") or {}).values()
+           if isinstance(c, dict) and isinstance(c.get("host"), str) and c.get("host")}
+    )
+    unobserved_error_codes = {
+        "session_inventory_truncated", "runtime_candidates_truncated",
+        "terminal_probe_failed", "terminal_tabs_truncated",
+        "tmux_probe_failed", "tmux_probe_timed_out",
+        "tmux_panes_truncated", "tmux_sockets_truncated",
+        "collection_error",
+    }
+    any_host_unobserved = (
+        not observed_hosts
+        or not (expected_hosts <= observed_host_keys)
+        or any(
+            h.get("reachable") is False
+            or h.get("snapshot_stale") is True
+            or h.get("inventory_state") == "unknown"
+            or any(
+                isinstance(e, str) and (
+                    (e.startswith("process_") and e != "process_start_unparsed")
+                    or e.startswith("agent_identity_")
+                    or e in unobserved_error_codes
+                )
+                for e in (h.get("errors") or ())
+            )
+            for h in observed_hosts
+        )
+    )
+    stale_mechs = {
+        r.get("project_label") for r in (payload.get("sessions") or ())
+        if isinstance(r, dict) and r.get("stale_cached") and r.get("role") == "mech"
+    }
+    role_mode = has_role_routing(config)
+    dormant = []
+    for mech in absent:
+        if role_mode and not any_host_unobserved and mech not in stale_mechs:
+            lane = mech_lane_label(mech, config, issues=issues)
+            if lane == "discover":
+                m_owner = mech_owner(mech, by_mech, config, live=live, issues=issues)
+                owner_claw = config["claws"].get(m_owner["key"]) if m_owner["kind"] == "claw" else None
+                if (m_owner["kind"] == "claw" and m_owner["key"] in live
+                        and "discovery_supervisor" in claw_roles(owner_claw)):
+                    out.append(finding(
+                        "info", "activity", f"{mech}: no active session (ready for discovery)",
+                        "Run bounded source discovery and add_records up to the open-PR WIP cap, recording the discovery saturation ledger.",
+                        m_owner, None, mech, {"mode": "discover", "states": {}},
+                    ))
+                    continue
+        dormant.append(mech)
+    if dormant:
+        out.append(finding("info", "activity", f"{len(dormant)} fleet Mechs have no session on any observed host",
                            "Confirm each is intentionally dormant, or assign it to a claw (mech_owner) and start a supervised loop.",
-                           owner("user", "dormant-mechs"), evidence={"mechs": absent}))
+                           owner("user", "dormant-mechs"), evidence={"mechs": dormant}))
     for key, claw in sorted(config["claws"].items()):
         c_host = claw.get("host") if isinstance(claw, dict) else None
         if not claw_matching_targets(payload, claw):
             host_candidates = claw_targets(payload, claw)
-            action = ("No live claw session on that host matches this claw's tmux_session/target_hint; start the missing claw or update its binding."
-                      if host_candidates else "Delegation to this claw is impossible until it runs; start it on that host (user-authorized).")
+            non_default_matches = [
+                t for t in host_candidates
+                if t["transport"] == "tmux" and t.get("tmux_socket")
+                and (claw.get("tmux_session") is None or t.get("tmux_session") == valid_tmux_session_name(claw.get("tmux_session")))
+                and (claw.get("target_hint") is None or hint_matches(str(claw.get("target_hint")), t))
+            ]
+            if non_default_matches:
+                sock = non_default_matches[0]["tmux_socket"]
+                action = (f"Matching live claw on {c_host} runs on non-default tmux socket {sock!r}; "
+                          f"move it to the default tmux server or deliver manually via tmux -L {shlex.quote(str(sock))}.")
+            elif host_candidates:
+                action = "No live claw session on that host matches this claw's tmux_session/target_hint; start the missing claw or update its binding."
+            else:
+                action = "Delegation to this claw is impossible until it runs; start it on that host (user-authorized)."
             out.append(finding("critical", "delegation", f"claw {key} has no live session on {c_host}",
                                action, owner("user", "claws"), c_host))
     host_sessions = [r for r in sessions if isinstance(r.get("host_key"), str) and r.get("host_key")]
@@ -1502,6 +1567,7 @@ def claw_targets(payload: dict, claw: dict) -> list:
         )
         out.append({"target": target, "transport": transport,
                     "window": int(match.group(1)) if match else None, "tab": int(match.group(2)) if match else None,
+                    "tmux_socket": r.get("tmux_socket") if transport == "tmux" else None,
                     "tmux_session": r.get("tmux_session"), "tmux_window": r.get("tmux_window"),
                     "tty": r.get("tty"), "pid": r.get("pid"), "status": r.get("status"),
                     "has_draft": has_composer_draft(r),
@@ -1526,7 +1592,7 @@ def hint_matches(hint: str, t: dict) -> bool:
 
 def claw_matching_targets(payload: dict, claw: dict) -> list:
     """Controllable claw sessions matching this claw's host, repo, tmux_session and target_hint."""
-    targets = claw_targets(payload, claw)
+    targets = [t for t in claw_targets(payload, claw) if not (t["transport"] == "tmux" and t.get("tmux_socket"))]
     if not targets or not isinstance(claw, dict):
         return []
     if claw.get("tmux_session") is not None:
@@ -1567,6 +1633,9 @@ def choose_target(targets: list, claw: dict, controller_session: str):
         pool = [t for t in targets if t["transport"] == "tmux" and t["tmux_session"] == claw_tmux]
         if not pool:
             return None, f"no live claw session in configured tmux_session {claw_tmux!r} ({len(targets)} other session(s) on this host)"
+    default_pool = [t for t in pool if not t.get("tmux_socket")]
+    if default_pool:
+        pool = default_pool
     hint = claw.get("target_hint") if isinstance(claw, dict) else None
     if hint is not None:
         hint_str = str(hint).strip()
@@ -1580,6 +1649,9 @@ def choose_target(targets: list, claw: dict, controller_session: str):
         chosen = pool[0]
     else:
         return None, f"{len(pool)} live claw sessions on this host; set target_hint after confirming which claw owns these Mechs"
+    if chosen["transport"] == "tmux" and chosen.get("tmux_socket"):
+        return None, (f"claw runs on non-default tmux socket {chosen['tmux_socket']!r}; "
+                      f"deliver via tmux -L {shlex.quote(str(chosen['tmux_socket']))} or move to the default tmux server")
     if chosen["transport"] == "tmux" and chosen["tmux_session"] != controller_session:
         return None, (f"claw runs in tmux session {chosen['tmux_session']!r}, not the controller's owned session "
                       f"{controller_session!r}; that session's owner must deliver the goal")

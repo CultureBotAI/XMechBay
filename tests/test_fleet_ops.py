@@ -1704,6 +1704,139 @@ class IssueBacklogDiscoveryAndMergeAuthorityTests(unittest.TestCase):
             self.assertIn(f"[{ts_ipv6}]:", disp)
             self.assertIn("--host-key-alias worker-lan.example.invalid", disp)
 
+    def test_zero_session_discover_mechs_route_to_live_discovery_supervisor_and_socket_guard(self):
+        cfg = config(
+            claws={
+                "io-discovery": {"host": "laptop-b", "repo": "sample-claw", "mechs": ["*"],
+                                 "tmux_session": "claw-discovery", "roles": ["discovery_supervisor"]},
+                "compute-steward": {"host": "laptop-a", "repo": "sample-claw", "mechs": ["*"],
+                                    "tmux_session": "claw-fleet", "roles": ["stewardship_supervisor"]},
+            },
+            mech_owner={"ZeroPinnedMech": "compute-steward"},
+        )
+        issues = {
+            "ZeroDiscoverMech": {"repo": "example-org/ZeroDiscoverMech", "open_issues": 3, "open_prs": 1, "prs": [
+                {"number": 1, "draft": False, "mergeable": "MERGEABLE", "checks": "SUCCESS", "review": None,
+                 "updated_at": "2026-11-15T00:00:00Z"},
+            ]},
+            "ZeroPinnedMech": {"repo": "example-org/ZeroPinnedMech", "open_issues": 0, "open_prs": 0, "prs": []},
+            "ZeroStewardMech": {"repo": "example-org/ZeroStewardMech", "open_issues": 1, "open_prs": 30, "prs": []},
+        }
+        canonical = ["ZeroDiscoverMech", "ZeroPinnedMech", "ZeroStewardMech", "ZeroUnknownMech"]
+        healthy_hosts = [
+            {"key": "laptop-a", "reachable": True, "errors": [], "health": {"status": "ok", "process_status": "ok"}},
+            {"key": "laptop-b", "reachable": True, "errors": [], "health": {"status": "ok", "process_status": "ok"}},
+        ]
+        live_claws_sessions = [
+            session("laptop-b", "claw", "sample-claw", "idle", repo="sample-claw",
+                    target="%4", tmux="claw-discovery", window="primary", tty="ttys004"),
+            session("laptop-a", "claw", "sample-claw", "idle", repo="sample-claw",
+                    target="%5", tmux="claw-fleet", window="primary", tty="ttys005"),
+        ]
+
+        # 1. All hosts reachable & live discovery_supervisor -> ZeroDiscoverMech routes to io-discovery; others stay dormant
+        payload = {"hosts": healthy_hosts, "canonical_mechs": canonical, "sessions": live_claws_sessions}
+        findings = OPS.analyze(payload, {}, issues, cfg)
+        by_title = {f["title"]: f for f in findings}
+        self.assertIn("ZeroDiscoverMech: no active session (ready for discovery)", by_title)
+        disc_f = by_title["ZeroDiscoverMech: no active session (ready for discovery)"]
+        self.assertEqual(disc_f["owner"], OPS.owner("claw", "io-discovery"))
+        self.assertEqual(disc_f["evidence"], {"mode": "discover", "states": {}})
+        dormant = [f for f in findings if f["owner"] == OPS.owner("user", "dormant-mechs")]
+        self.assertEqual(len(dormant), 1)
+        self.assertEqual(dormant[0]["evidence"]["mechs"], ["ZeroPinnedMech", "ZeroStewardMech", "ZeroUnknownMech"])
+
+        # 2. Offline discovery_supervisor -> ZeroDiscoverMech stays in dormant-mechs
+        no_disc_payload = {"hosts": healthy_hosts, "canonical_mechs": canonical, "sessions": [live_claws_sessions[1]]}
+        no_disc_findings = OPS.analyze(no_disc_payload, {}, issues, cfg)
+        self.assertFalse(any("ready for discovery" in f["title"] for f in no_disc_findings))
+        dormant_no_disc = [f for f in no_disc_findings if f["owner"] == OPS.owner("user", "dormant-mechs")][0]
+        self.assertIn("ZeroDiscoverMech", dormant_no_disc["evidence"]["mechs"])
+
+        # 3. Unreachable/stale/missing host or severe collector errors -> ZeroDiscoverMech stays in dormant-mechs
+        for bad_hosts in (
+            [],
+            [healthy_hosts[1]],  # laptop-a configured by compute-steward is missing
+            [{"key": "laptop-a", "reachable": False, "errors": ["ssh_probe_timed_out"]}, healthy_hosts[1]],
+            [{"key": "laptop-a", "reachable": True, "snapshot_stale": True, "errors": []}, healthy_hosts[1]],
+            [{"key": "laptop-a", "reachable": True, "inventory_state": "unknown", "errors": []}, healthy_hosts[1]],
+            [{"key": "laptop-a", "reachable": True, "errors": ["process_probe_failed"]}, healthy_hosts[1]],
+            [{"key": "laptop-a", "reachable": True, "errors": ["agent_identity_probe_failed"]}, healthy_hosts[1]],
+            [{"key": "laptop-a", "reachable": True, "errors": ["terminal_probe_failed"]}, healthy_hosts[1]],
+            [{"key": "laptop-a", "reachable": True, "errors": ["tmux_probe_failed"]}, healthy_hosts[1]],
+        ):
+            unobs_payload = {
+                "hosts": bad_hosts,
+                "canonical_mechs": canonical,
+                "sessions": live_claws_sessions,
+            }
+            unobs_findings = OPS.analyze(unobs_payload, {}, issues, cfg)
+            self.assertFalse(any("ready for discovery" in f["title"] for f in unobs_findings), bad_hosts)
+
+        # Benign agent_discovery_partial + terminal_window_unreadable still allow zero-session discovery
+        benign_hosts = [
+            healthy_hosts[0],
+            {"key": "laptop-b", "reachable": True, "errors": ["agent_discovery_partial", "terminal_window_unreadable"],
+             "health": {"status": "ok", "process_status": "ok"}},
+        ]
+        benign_findings = OPS.analyze(
+            {"hosts": benign_hosts, "canonical_mechs": canonical, "sessions": live_claws_sessions},
+            {}, issues, cfg,
+        )
+        self.assertTrue(any(f["title"] == "ZeroDiscoverMech: no active session (ready for discovery)" for f in benign_findings))
+
+        # Role routing disabled keeps zero-session Mechs in dormant-mechs
+        legacy_cfg = config(
+            claws={"legacy": {"host": "laptop-b", "repo": "sample-claw", "mechs": ["*"], "tmux_session": "claw-discovery"}},
+            mech_owner={},
+        )
+        legacy_findings = OPS.analyze(
+            {"hosts": healthy_hosts, "canonical_mechs": canonical, "sessions": [live_claws_sessions[0]]},
+            {}, issues, legacy_cfg,
+        )
+        self.assertFalse(any("ready for discovery" in f["title"] for f in legacy_findings))
+
+        # End-to-end plan() populates io-discovery brief with ZeroDiscoverMech
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-zero-disc"
+            run_dir.mkdir()
+            (run_dir / "sessions.json").write_text(json.dumps(payload))
+            (run_dir / "issues.json").write_text(json.dumps(issues))
+            (run_dir / "findings.json").write_text(json.dumps(findings))
+            OPS.plan(run_dir, cfg)
+            brief_txt = (run_dir / "plan/briefs/io-discovery.md").read_text()
+            self.assertIn("ZeroDiscoverMech: no active session (ready for discovery)", brief_txt)
+
+        # 4. Stale cached session for ZeroDiscoverMech keeps it out of zero-session discovery
+        stale_payload = {
+            "hosts": healthy_hosts,
+            "canonical_mechs": canonical,
+            "sessions": live_claws_sessions + [session("laptop-a", "mech", "ZeroDiscoverMech", "Working", stale_cached=True)],
+        }
+        self.assertFalse(any("ready for discovery" in f["title"] for f in OPS.analyze(stale_payload, {}, issues, cfg)))
+
+        # 5. Non-default tmux_socket claw is excluded from claw_matching_targets, reported clearly in activity_findings,
+        # and rejected cleanly in choose_target
+        alt_row = dict(
+            session("laptop-b", "claw", "sample-claw", "idle", repo="sample-claw",
+                    target="alt_server:%0", tmux="claw-discovery", window="primary", tty="ttys009"),
+            tmux_socket="alt_server",
+        )
+        alt_payload = {"hosts": healthy_hosts, "sessions": [alt_row, live_claws_sessions[1]]}
+        self.assertEqual(OPS.claw_matching_targets(alt_payload, cfg["claws"]["io-discovery"]), [])
+        alt_findings = OPS.analyze(alt_payload, {}, {}, cfg)
+        missing_f = [f for f in alt_findings if f["title"] == "claw io-discovery has no live session on laptop-b"][0]
+        self.assertIn("non-default tmux socket 'alt_server'", missing_f["action"])
+        alt_targets = OPS.claw_targets(alt_payload, cfg["claws"]["io-discovery"])
+        chosen_alt, reason_alt = OPS.choose_target(alt_targets, cfg["claws"]["io-discovery"], "claw-discovery")
+        self.assertIsNone(chosen_alt)
+        self.assertIn("non-default tmux socket 'alt_server'", reason_alt)
+        # Sibling default-socket claw still resolves cleanly despite an extra non-default-socket session
+        mixed_targets = OPS.claw_targets({"sessions": [live_claws_sessions[0], alt_row]}, cfg["claws"]["io-discovery"])
+        chosen_ok, _ = OPS.choose_target(mixed_targets, cfg["claws"]["io-discovery"], "claw-discovery")
+        self.assertIsNotNone(chosen_ok)
+        self.assertEqual(chosen_ok["target"], "%4")
+
 
 if __name__ == "__main__":
     unittest.main()

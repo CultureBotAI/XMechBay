@@ -7,7 +7,11 @@ No SSH or live agent sessions; 2026-11-14.
 import ast
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
+import socket
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -345,9 +349,10 @@ class ObservationTests(unittest.TestCase):
             path.symlink_to(real)
             self.assertEqual(COLLECTOR.read_health(path)["error"], "health_report_missing_or_unsupported")
 
+    @patch.object(COLLECTOR, "discover_tmux_sockets", return_value=([], False))
     @patch.object(COLLECTOR.shutil, "which", return_value="/mock/tmux")
     @patch.object(COLLECTOR.Path, "is_file", return_value=False)
-    def test_no_terminal_still_collects_tmux_without_any_input(self, is_file, which):
+    def test_no_terminal_still_collects_tmux_without_any_input(self, is_file, which, discover):
         commands = []
         class FakeRunner:
             def run(self, command, **kwargs):
@@ -377,9 +382,10 @@ class ObservationTests(unittest.TestCase):
         self.assertFalse(any(word in {"send-keys", "paste-buffer", "kill", "do script"} for command in commands for word in command))
         self.assertNotIn("args", report["sessions"][0])
 
+    @patch.object(COLLECTOR, "discover_tmux_sockets", return_value=([], False))
     @patch.object(COLLECTOR.shutil, "which", return_value="/mock/tmux")
     @patch.object(COLLECTOR.Path, "is_file", return_value=False)
-    def test_linked_pane_without_verified_process_has_one_unknown_row(self, is_file, which):
+    def test_linked_pane_without_verified_process_has_one_unknown_row(self, is_file, which, discover):
         class FakeRunner:
             def run(self, command, **kwargs):
                 if command[0] == "/usr/bin/env":
@@ -600,6 +606,274 @@ class ObservationTests(unittest.TestCase):
         )
         self.assertEqual(conflict_rows, [])
         self.assertEqual(conflict_errors, ["pane_rows_invalid"])
+
+    def test_terminal_script_guards_null_tabs_window_id_and_tty(self):
+        script = COLLECTOR.TERMINAL_SCRIPT
+        self.assertIn("!windows || !Number.isInteger(windows.length) || windows.length < 0", script)
+        self.assertIn("!tabs || !Number.isInteger(tabs.length) || tabs.length < 0", script)
+        self.assertIn('typeof rawId !== "number" || !Number.isInteger(rawId) || rawId <= 0', script)
+        self.assertIn('typeof rawTty !== "string" || !rawTty', script)
+        self.assertIn('typeof rawScreen !== "string"', script)
+
+        # Partial unreadable window reports terminal_window_unreadable while preserving readable tab screens
+        fake = {
+            "tabs": [{
+                "window_id": 12, "tab": 1, "tty": "ttys009", "selected": True,
+                "visible": True, "minimized": False, "title": "claude",
+                "process_names": ["claude"], "processes_readable": True,
+                "screen": "readable window screen", "errors": [],
+            }],
+            "errors": ["terminal_window_unreadable"],
+        }
+        class PartialTerminalRunner:
+            def run(self, command, **kwargs):
+                return json.dumps(fake)
+        procs = {1: process(1, 0, "Terminal")}
+        procs[1]["executable_path"] = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+        rows, errors = COLLECTOR.terminal_tabs(PartialTerminalRunner(), procs, {"ttys009"})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["screen"], "readable window screen")
+        self.assertEqual(errors, ["terminal_window_unreadable"])
+
+        # Execute TERMINAL_SCRIPT against a pure synthetic Application mock via osascript or node (never touches Terminal)
+        mock_body = (
+            "const mockApplication = function(name) {\n"
+            "  return {\n"
+            "    running: function() { return true; },\n"
+            "    windows: function() {\n"
+            "      return [\n"
+            "        { id: function() { return null; }, tabs: function() { return []; } },\n"
+            "        { id: function() { return 7; }, tabs: function() { return null; } },\n"
+            "        { id: function() { return 12; }, name: function() { return null; },\n"
+            "          visible: function() { return true; }, miniaturized: function() { return false; },\n"
+            "          tabs: function() {\n"
+            "            return [\n"
+            "              { tty: function() { return '/dev/ttys009'; }, selected: function() { return true; },\n"
+            "                customTitle: function() { return null; }, processes: function() { return ['claude']; },\n"
+            "                contents: function() { return null; } },\n"
+            "              { tty: function() { return '/dev/ttys010'; }, selected: function() { return false; },\n"
+            "                customTitle: function() { return 'ok'; }, processes: function() { return ['codex']; },\n"
+            "                contents: function() { return 'synthetic live screen'; } }\n"
+            "            ];\n"
+            "          }\n"
+            "        }\n"
+            "      ];\n"
+            "    }\n"
+            "  };\n"
+            "};\n"
+            "function execHarness(argv) {\n"
+            "  return (function(Application) {\n"
+            + script
+            + "\n    return run(argv);\n"
+            "  })(mockApplication);\n"
+            "}\n"
+        )
+        js_cmd = None
+        if shutil.which("/usr/bin/osascript"):
+            js_cmd = [
+                "/usr/bin/osascript", "-l", "JavaScript", "-e",
+                mock_body + "function run(argv) { return execHarness(argv); }\n",
+                json.dumps(["ttys009", "ttys010"]),
+            ]
+        elif shutil.which("node"):
+            js_cmd = [
+                shutil.which("node"), "-e",
+                mock_body + "process.stdout.write(execHarness(process.argv.slice(1)));\n",
+                json.dumps(["ttys009", "ttys010"]),
+            ]
+        if js_cmd:
+            proc = subprocess.run(js_cmd, capture_output=True, text=True, check=True, timeout=10)
+            parsed = json.loads(proc.stdout)
+            self.assertEqual([t["tty"] for t in parsed["tabs"]], ["ttys009", "ttys010"])
+            self.assertEqual(parsed["tabs"][0]["screen"], "")
+            self.assertEqual(parsed["tabs"][0]["errors"], ["terminal_screen_unreadable"])
+            self.assertEqual(parsed["tabs"][1]["screen"], "synthetic live screen")
+            self.assertEqual(parsed["tabs"][1]["errors"], [])
+            self.assertIn("terminal_window_unreadable", parsed["errors"])
+
+    def test_discover_tmux_sockets_filters_default_symlinks_unsafe_names_and_caps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sock_dir = Path(tmp) / "tmux-test"
+            sock_dir.mkdir(mode=0o700)
+            sockets = []
+            try:
+                for name in ("default", "alt_server", "-badflag", "good.sock"):
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.bind(str(sock_dir / name))
+                    sockets.append(s)
+                (sock_dir / "regular_file").write_text("not a socket")
+                (sock_dir / "sym_sock").symlink_to(sock_dir / "alt_server")
+                names, truncated = COLLECTOR.discover_tmux_sockets(sock_dir)
+                self.assertEqual(names, ["alt_server", "good.sock"])
+                self.assertFalse(truncated)
+
+                # Symlinked socket_dir itself is rejected
+                sym_dir = Path(tmp) / "tmux-sym"
+                sym_dir.symlink_to(sock_dir)
+                self.assertEqual(COLLECTOR.discover_tmux_sockets(sym_dir), ([], False))
+
+                # Relative TMUX_TMPDIR is rejected
+                with patch.dict(os.environ, {"TMUX_TMPDIR": "relative/tmp"}, clear=False):
+                    self.assertEqual(COLLECTOR.discover_tmux_sockets(), ([], False))
+
+                with patch.object(COLLECTOR, "MAX_TMUX_SOCKETS", 1):
+                    capped, was_truncated = COLLECTOR.discover_tmux_sockets(sock_dir)
+                self.assertEqual(capped, ["alt_server"])
+                self.assertTrue(was_truncated)
+
+                # Group-readable (0o740) or group-writable directory is rejected
+                os.chmod(sock_dir, 0o740)
+                self.assertEqual(COLLECTOR.discover_tmux_sockets(sock_dir), ([], False))
+            finally:
+                for s in sockets:
+                    s.close()
+
+    @patch.object(COLLECTOR, "discover_tmux_sockets", return_value=(["alt_server", "stale_server"], False))
+    @patch.object(COLLECTOR.shutil, "which", return_value="/mock/tmux")
+    @patch.object(COLLECTOR.Path, "is_file", return_value=False)
+    def test_multi_socket_tmux_disambiguates_colliding_pane_ids_and_ignores_stale_sockets(self, is_file, which, discover):
+        commands = []
+        class FakeRunner:
+            def run(self, command, **kwargs):
+                commands.append(command)
+                if command[0] == "/usr/bin/env":
+                    return (
+                        "10 1 ttys001 01:00 Mon Jan 5 12:00:00 2026 /bin/bash\n"
+                        "11 10 ttys001 00:59 Mon Jan 5 12:00:01 2026 /opt/bin/codex\n"
+                        "20 1 ttys002 01:00 Mon Jan 5 12:00:00 2026 /bin/bash\n"
+                        "21 20 ttys002 00:58 Mon Jan 5 12:00:02 2026 /opt/bin/claude\n"
+                    )
+                if command[1:2] == ["list-panes"]:
+                    return "%0\t10\t/dev/ttys001\tdefault-sess\t@0\tdefault-win\t0\tcodex\t/srv/default-app\n"
+                if command[1:4] == ["-L", "alt_server", "list-panes"]:
+                    return (
+                        "%0\t20\t/dev/ttys002\talt-sess\t@0\talt-win\t0\tclaude\t/srv/alt-app\n"
+                        "%1\t30\t/dev/ttys003\talt-sess\t@1\tunverified-win\t0\tcodex\t/srv/unverified\n"
+                    )
+                if command[1:4] == ["-L", "stale_server", "list-panes"]:
+                    raise COLLECTOR.ProbeFailure("not_running")
+                if command[0] == "/bin/ps":
+                    return "10 /bin/bash\n11 codex\n20 /bin/bash\n21 claude\n"
+                if command[0] == "/usr/sbin/lsof":
+                    return "p11\nfcwd\nn/srv/default-app\np21\nfcwd\nn/srv/alt-app\n"
+                if command[1:2] == ["capture-pane"]:
+                    return "default socket screen\n>\n"
+                if command[1:4] == ["-L", "alt_server", "capture-pane"]:
+                    return "alt socket screen\n>\n"
+                raise AssertionError(command)
+
+        report = COLLECTOR.collect(Path("/example/absent-health.json"), FakeRunner())
+        self.assertEqual(report["coverage"]["tmux"], "complete")
+        self.assertNotIn("tmux_probe_failed", report["errors"])
+        self.assertEqual(len(report["sessions"]), 3)
+        by_pid = {row["pid"]: row for row in report["sessions"]}
+        self.assertEqual(by_pid[11]["screen"], "default socket screen\n>")
+        self.assertNotIn("tmux_socket", by_pid[11]["target"])
+        self.assertEqual(by_pid[11]["errors"], [])
+        self.assertEqual(by_pid[21]["screen"], "alt socket screen\n>")
+        self.assertEqual(by_pid[21]["target"]["tmux_socket"], "alt_server")
+        self.assertEqual(by_pid[21]["target"]["pane"], "%0")
+        self.assertEqual(by_pid[21]["errors"], [])
+        self.assertEqual(by_pid[None]["target"]["tmux_socket"], "alt_server")
+        self.assertEqual(by_pid[None]["target"]["pane"], "%1")
+        self.assertEqual(by_pid[None]["errors"], ["agent_process_unverified"])
+
+    @patch.object(COLLECTOR, "discover_tmux_sockets", return_value=(["alt_server"], False))
+    @patch.object(COLLECTOR.shutil, "which", return_value="/mock/tmux")
+    @patch.object(COLLECTOR.Path, "is_file", return_value=False)
+    def test_named_socket_only_and_cross_socket_pane_cap_and_partial_errors(self, is_file, which, discover):
+        # 1. Absent default server + live named socket -> complete with zero errors
+        class NamedOnlyRunner:
+            def run(self, command, **kwargs):
+                if command[0] == "/usr/bin/env":
+                    return "20 1 ttys002 01:00 Mon Jan 5 12:00:00 2026 /bin/bash\n"
+                if command[1:2] == ["list-panes"]:
+                    raise COLLECTOR.ProbeFailure("not_running")
+                if command[1:4] == ["-L", "alt_server", "list-panes"]:
+                    return "%0\t20\t/dev/ttys002\talt-sess\t@0\talt-win\t0\tbash\t/srv/alt\n"
+                raise AssertionError(command)
+
+        rep_named = COLLECTOR.collect(Path("/example/absent-health.json"), NamedOnlyRunner())
+        self.assertEqual(rep_named["coverage"]["tmux"], "complete")
+        self.assertNotIn("tmux_probe_failed", rep_named["errors"])
+
+        # 2. Cross-socket MAX_PANES cap truncates second socket cleanly
+        class CapRunner:
+            def run(self, command, **kwargs):
+                if command[0] == "/usr/bin/env":
+                    return "10 1 ttys001 01:00 Mon Jan 5 12:00:00 2026 /bin/bash\n"
+                if command[1:2] == ["list-panes"]:
+                    return "%0\t10\t/dev/ttys001\tdef\t@0\tw\t0\tbash\t/srv/a\n"
+                if command[1:4] == ["-L", "alt_server", "list-panes"]:
+                    return "%0\t20\t/dev/ttys002\talt\t@0\tw\t0\tbash\t/srv/b\n"
+                raise AssertionError(command)
+
+        with patch.object(COLLECTOR, "MAX_PANES", 1):
+            rep_cap = COLLECTOR.collect(Path("/example/absent-health.json"), CapRunner())
+        self.assertEqual(rep_cap["coverage"]["tmux"], "partial")
+        self.assertIn("tmux_panes_truncated", rep_cap["errors"])
+
+        # 3. Default succeeds while named socket fails -> partial + tmux_probe_failed
+        class MixedFailRunner:
+            def run(self, command, **kwargs):
+                if command[0] == "/usr/bin/env":
+                    return "10 1 ttys001 01:00 Mon Jan 5 12:00:00 2026 /bin/bash\n"
+                if command[1:2] == ["list-panes"]:
+                    return "%0\t10\t/dev/ttys001\tdef\t@0\tw\t0\tbash\t/srv/a\n"
+                if command[1:4] == ["-L", "alt_server", "list-panes"]:
+                    raise COLLECTOR.ProbeFailure("probe_failed")
+                raise AssertionError(command)
+
+        rep_mix = COLLECTOR.collect(Path("/example/absent-health.json"), MixedFailRunner())
+        self.assertEqual(rep_mix["coverage"]["tmux"], "partial")
+        self.assertIn("tmux_probe_failed", rep_mix["errors"])
+
+    @patch.object(COLLECTOR, "discover_tmux_sockets", return_value=([], False))
+    @patch.object(COLLECTOR.shutil, "which", return_value="/mock/tmux")
+    @patch.object(COLLECTOR.Path, "is_file", return_value=False)
+    def test_absent_default_tmux_server_reports_not_running_without_error(self, is_file, which, discover):
+        class NoServerRunner:
+            def run(self, command, **kwargs):
+                if command[0] == "/usr/bin/env":
+                    return "10 1 ttys001 01:00 Mon Jan 5 12:00:00 2026 /bin/bash\n"
+                if command[1:2] == ["list-panes"]:
+                    raise COLLECTOR.ProbeFailure("not_running")
+                raise AssertionError(command)
+
+        report = COLLECTOR.collect(Path("/example/absent-health.json"), NoServerRunner())
+        self.assertEqual(report["coverage"]["tmux"], "not_running")
+        self.assertNotIn("tmux_probe_failed", report["errors"])
+
+        # Runner.run strips TMUX, sets LC_ALL=C, maps list-panes absent-server stderr to not_running,
+        # and does not misclassify capture-pane on a socket named "list-panes".
+        seen_envs = []
+
+        def fake_subproc(stderr_bytes, returncode=1):
+            def _run(cmd, stdout, stderr, timeout, check, **kwargs):
+                seen_envs.append(kwargs.get("env"))
+                stderr.write(stderr_bytes)
+                return type("Proc", (), {"returncode": returncode})()
+            return _run
+
+        runner = COLLECTOR.Runner()
+        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/alt_server,123,0"}, clear=False):
+            with patch.object(COLLECTOR.subprocess, "run", side_effect=fake_subproc(b"no server running on /tmp/tmux-501/default\n")):
+                with self.assertRaisesRegex(COLLECTOR.ProbeFailure, "^not_running$"):
+                    runner.run(["/opt/homebrew/bin/tmux", "list-panes", "-a", "-F", "#{pane_id}"])
+            self.assertNotIn("TMUX", seen_envs[-1])
+            self.assertEqual(seen_envs[-1]["LC_ALL"], "C")
+
+            with patch.object(COLLECTOR.subprocess, "run", side_effect=fake_subproc(b"error connecting to /tmp/tmux-501/stale (Connection refused)\n")):
+                with self.assertRaisesRegex(COLLECTOR.ProbeFailure, "^not_running$"):
+                    runner.run(["/opt/homebrew/bin/tmux", "-L", "stale", "list-panes", "-a", "-F", "#{pane_id}"])
+
+            with patch.object(COLLECTOR.subprocess, "run", side_effect=fake_subproc(b"no server running on /tmp/tmux-501/list-panes\n")):
+                with self.assertRaisesRegex(COLLECTOR.ProbeFailure, "^probe_failed$"):
+                    runner.run(["/opt/homebrew/bin/tmux", "-L", "list-panes", "capture-pane", "-p", "-t", "%0", "-S", "-80"])
+
+            with patch.object(COLLECTOR.subprocess, "run", side_effect=fake_subproc(b"permission denied\n")):
+                with self.assertRaisesRegex(COLLECTOR.ProbeFailure, "^probe_failed$"):
+                    runner.run(["/opt/homebrew/bin/tmux", "list-panes", "-a", "-F", "#{pane_id}"])
 
 
 if __name__ == "__main__":
