@@ -3147,6 +3147,60 @@ function boot(src, storageMap, fetchImpl, selectionFactory = null) {
         self.assertEqual(st_foc, 403)
         self.assertEqual(json.loads(body_foc.decode("utf-8"))["error"], "loopback_client_required")
 
+    def test_named_tmux_socket_formats_target_and_disables_default_focus(self):
+        row = {
+            "agent": "claude",
+            "pid": 401,
+            "tty": "ttys012",
+            "started_at": "2026-01-01T11:00:00+00:00",
+            "age_seconds": 3600,
+            "repo_label": "ExampleTool",
+            "role": "other",
+            "project_label": "ExampleTool",
+            "status": "idle",
+            "flags": [],
+            "errors": [],
+            "target": {
+                "transport": "tmux",
+                "pane": "%0",
+                "tmux_socket": "alt_server",
+                "tmux_session": "alt-sess",
+                "tmux_sessions": ["alt-sess"],
+                "window": "main",
+            },
+            "listeners": {"count": 1, "status": "ok", "stale": False},
+            "delta": {"kind": "first", "seconds": None},
+        }
+        enriched = DASH._enrich_session(
+            row, host_key="m1", host_label="M1 Local", host_stale=False,
+            role_overrides={}, host_source="local", mode="live",
+        )
+        self.assertEqual(enriched["target_short"], "alt_server:%0")
+        self.assertEqual(enriched["tmux_socket"], "alt_server")
+        self.assertFalse(enriched["can_focus_terminal"])
+        self.assertIn("on socket alt_server", enriched["symbols"]["view"]["detail"])
+        self.assertEqual(DASH._resolve_local_tmux_client_ttys(enriched), ("not_attached", []))
+
+        # Long and UUID-shaped socket names keep full tmux_socket unmangled and preserve :%N in target_short
+        long_sock = "12345678-1234-4123-8123-123456789abc"
+        long_row = dict(row, target=dict(row["target"], pane="%12", tmux_socket=long_sock))
+        long_enriched = DASH._enrich_session(
+            long_row, host_key="m1", host_label="M1 Local", host_stale=False,
+            role_overrides={}, host_source="local", mode="live",
+        )
+        self.assertEqual(long_enriched["tmux_socket"], long_sock)
+        self.assertTrue(long_enriched["target_short"].endswith(":%12"), long_enriched["target_short"])
+        self.assertLessEqual(len(long_enriched["target_short"]), 24)
+
+        # "default" socket and non-tmux target tmux_socket are ignored
+        default_row = dict(row, target=dict(row["target"], tmux_socket="default"))
+        default_enriched = DASH._enrich_session(
+            default_row, host_key="m1", host_label="M1 Local", host_stale=False,
+            role_overrides={}, host_source="local", mode="live",
+        )
+        self.assertIsNone(default_enriched["tmux_socket"])
+        self.assertEqual(default_enriched["target_short"], "%0")
+
 
 if __name__ == "__main__":
     unittest.main()

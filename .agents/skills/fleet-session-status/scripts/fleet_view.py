@@ -115,7 +115,7 @@ KNOWN_ERRORS = {
     "terminal_window_unreadable", "terminal_tab_unreadable", "terminal_screen_unreadable",
     "terminal_tabs_truncated", "terminal_probe_failed", "terminal_not_running",
     "terminal_target_ambiguous", "tmux_executable_unavailable", "tmux_row_unparsed",
-    "tmux_panes_truncated", "agent_identity_partial", "agent_discovery_partial",
+    "tmux_panes_truncated", "tmux_sockets_truncated", "agent_identity_partial", "agent_discovery_partial",
     "agent_process_unverified", "argv_identity_unavailable", "session_id_ambiguous",
     "pane_rows_invalid", "screen_unavailable", "screen_shared_between_agents",
     "screen_bytes_truncated", "cwd_unavailable", "cwd_from_pane",
@@ -1097,7 +1097,9 @@ def target_label(row):
 def _target(row):
     target = row.get("target") or {}
     if target.get("transport") == "tmux" or target.get("pane"):
-        label = str(target.get("pane") or "pane?")
+        sock = target.get("tmux_socket")
+        pane_id = str(target.get("pane") or "pane?")
+        label = (str(sock) + ":" + pane_id) if sock else pane_id
     elif target.get("window_id") is not None:
         label = "T" + str(target["window_id"]) + "/" + str(target.get("tab", 1))
     else:
@@ -1330,12 +1332,14 @@ def session_symbols(row, host_key="", host_label="", host_stale=False):
         memberships = [str(item) for item in (target.get("tmux_sessions") or [])]
         has_viewer = any(item.lower().startswith(("xmb-view-", "view-", "viewer")) for item in memberships)
         pane_id = str(target.get("pane") or "%?")
+        sock = target.get("tmux_socket")
+        sock_note = (" on socket " + str(sock)) if sock else ""
         if has_viewer:
             view = {"tone": "green", "dot": "🟢", "glyph": "⊞", "short": "view",
-                    "detail": "tmux pane " + pane_id + " with viewer session (" + ", ".join(memberships[:3]) + ")", "rank": 15}
+                    "detail": "tmux pane " + pane_id + sock_note + " with viewer session (" + ", ".join(memberships[:3]) + ")", "rank": 15}
         else:
             view = {"tone": "white", "dot": "⚪", "glyph": "⊟", "short": "tmux",
-                    "detail": "tmux pane " + pane_id + (" in " + str(target.get("tmux_session")) if target.get("tmux_session") else ""), "rank": 20}
+                    "detail": "tmux pane " + pane_id + sock_note + (" in " + str(target.get("tmux_session")) if target.get("tmux_session") else ""), "rank": 20}
     else:
         view = {"tone": "slate", "dot": "⚫", "glyph": "◌", "short": "proc",
                 "detail": "Headless OS process without Terminal tab or tmux pane", "rank": 40}

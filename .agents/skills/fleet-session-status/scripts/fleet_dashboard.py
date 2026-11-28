@@ -304,6 +304,7 @@ def _human_block_metadata(raw_row, status, raw_flags, is_stale_cached):
 
 _TTY_NAME_RE = re.compile(r"^tty[A-Za-z0-9]{1,12}$")
 _TMUX_SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+_TMUX_SOCKET_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 _TMUX_PANE_ID_RE = re.compile(r"^%\d{1,8}$")
 
 
@@ -338,8 +339,27 @@ def _enrich_session(
     symbols = session_symbols(raw_row, host_key=host_key, host_label=host_label, host_stale=stale)
 
     target = raw_row.get("target") or {}
-    if target.get("transport") == "tmux" or target.get("pane"):
-        loc_short = str(target.get("pane") or "pane?")
+    is_tmux_target = target.get("transport") == "tmux" or bool(target.get("pane"))
+    raw_tmux_socket = target.get("tmux_socket")
+    tmux_socket = (
+        raw_tmux_socket
+        if is_tmux_target
+        and isinstance(raw_tmux_socket, str)
+        and raw_tmux_socket != "default"
+        and _TMUX_SOCKET_NAME_RE.fullmatch(raw_tmux_socket)
+        else None
+    )
+    if is_tmux_target:
+        pane_txt = private_text(str(target.get("pane") or "pane?"), 16)
+        if tmux_socket:
+            full_loc = tmux_socket + ":" + pane_txt
+            if len(full_loc) <= 24:
+                loc_short = full_loc
+            else:
+                sock_budget = max(4, 24 - len(pane_txt) - 2)
+                loc_short = tmux_socket[:sock_budget] + "…" + ":" + pane_txt
+        else:
+            loc_short = pane_txt
     elif target.get("window_id") is not None:
         loc_short = "T" + str(target["window_id"]) + "/" + str(target.get("tab", 1))
     else:
@@ -423,7 +443,12 @@ def _enrich_session(
         is_m1_local
         and (
             (transport_str == "terminal" and norm_tty is not None)
-            or (transport_str == "tmux" and bool(raw_lookup_sessions) and (tmux_pane is not None or norm_tty is not None))
+            or (
+                transport_str == "tmux"
+                and tmux_socket is None
+                and bool(raw_lookup_sessions)
+                and (tmux_pane is not None or norm_tty is not None)
+            )
         )
     )
 
@@ -440,13 +465,14 @@ def _enrich_session(
         "stream_label": stream_label,
         "repo_label": private_text(raw_row.get("repo_label") or project_label, 48),
         "color_key": mech_color_key(project_label, role),
-        "target_short": private_text(loc_short, 24),
+        "target_short": loc_short if tmux_socket else private_text(loc_short, 24),
         "target_full": private_text(target_label(raw_row), 48),
         "transport": transport_str,
         "window_id": window_id,
         "tab_index": tab_index,
         "can_focus_terminal": can_focus_terminal,
         "tmux_pane": tmux_pane,
+        "tmux_socket": tmux_socket,
         "tmux_session": private_text(target.get("tmux_session") or "", 40) if target.get("tmux_session") else None,
         "tmux_window": private_text(target.get("window") or "", 40) if target.get("window") else None,
         "tmux_sessions": memberships,
@@ -4256,6 +4282,8 @@ def _find_local_tmux_bin():
 
 
 def _resolve_local_tmux_client_ttys(session_row):
+    if session_row.get("tmux_socket"):
+        return "not_attached", []
     wanted = []
     for candidate_name in (
         list(session_row.get("tmux_lookup_sessions") or [])

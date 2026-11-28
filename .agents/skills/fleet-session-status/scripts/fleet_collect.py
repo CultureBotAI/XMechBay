@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,9 +28,11 @@ RUNTIMES = {"node", "nodejs", "bash", "zsh", "sh"}
 NODE_RUNTIMES = {"node", "nodejs"}
 AGENT_TITLE = re.compile(r"(?:^|[^a-z0-9])(?:agy|antigravity|claude|codex)(?:$|[^a-z0-9])", re.IGNORECASE)
 UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+TMUX_SOCKET_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 MAX_PROCESSES = 8192
 MAX_SESSIONS = 256
 MAX_PANES = 128
+MAX_TMUX_SOCKETS = 16
 MAX_TABS = 128
 MAX_RUNTIME_CANDIDATES = 128
 MAX_SCREEN_BYTES = 16384
@@ -46,11 +49,31 @@ TERMINAL_SCRIPT = r'''function run(argv) {
     result.errors.push("terminal_not_running");
     return JSON.stringify(result);
   }
-  const windows = app.windows();
+  let windows;
+  try { windows = app.windows(); } catch (e) {
+    result.errors.push("terminal_window_unreadable");
+    return JSON.stringify(result);
+  }
+  if (!windows || !Number.isInteger(windows.length) || windows.length < 0) {
+    result.errors.push("terminal_window_unreadable");
+    return JSON.stringify(result);
+  }
   outer: for (let wi = 0; wi < windows.length; wi++) {
     const w = windows[wi];
+    if (!w) {
+      result.errors.push("terminal_window_unreadable"); continue;
+    }
+    let rawId;
+    try { rawId = w.id(); } catch (e) { rawId = null; }
+    if (typeof rawId !== "number" || !Number.isInteger(rawId) || rawId <= 0) {
+      result.errors.push("terminal_window_unreadable"); continue;
+    }
+    const windowId = rawId;
     let tabs;
     try { tabs = w.tabs(); } catch (e) {
+      result.errors.push("terminal_window_unreadable"); continue;
+    }
+    if (!tabs || !Number.isInteger(tabs.length) || tabs.length < 0) {
       result.errors.push("terminal_window_unreadable"); continue;
     }
     for (let ti = 0; ti < tabs.length; ti++) {
@@ -59,30 +82,44 @@ TERMINAL_SCRIPT = r'''function run(argv) {
       }
       try {
         const t = tabs[ti];
-        const tty = String(t.tty()).replace(/^\/dev\//, "");
+        if (!t) { result.errors.push("terminal_tab_unreadable"); continue; }
+        const rawTty = t.tty();
+        if (typeof rawTty !== "string" || !rawTty) {
+          result.errors.push("terminal_tab_unreadable"); continue;
+        }
+        const tty = rawTty.replace(/^\/dev\//, "");
+        if (!tty) { result.errors.push("terminal_tab_unreadable"); continue; }
         const selected = Boolean(t.selected());
         let title = "";
         try { title = String(t.customTitle() || ""); } catch (e) {}
-        if (!title && selected) { try { title = String(w.name()); } catch (e) {} }
+        if (!title && selected) { try { title = String(w.name() || ""); } catch (e) {} }
         let visible = null, minimized = null;
         try { visible = Boolean(w.visible()); } catch (e) {}
         try { minimized = Boolean(w.miniaturized()); } catch (e) {}
         let processNames = [], processesReadable = false;
         try {
           const allowed = new Set(["node", "nodejs", "bash", "zsh", "sh", "agy", "claude", "codex"]);
-          processNames = Array.from(new Set(t.processes().map(String).filter(name => allowed.has(name))));
-          processesReadable = true;
+          const procs = t.processes();
+          if (procs && typeof procs.map === "function") {
+            processNames = Array.from(new Set(procs.map(String).filter(name => allowed.has(name))));
+            processesReadable = true;
+          }
         } catch (e) {}
-        const row = {window_id: Number(w.id()), tab: ti + 1, tty: tty,
+        const row = {window_id: windowId, tab: ti + 1, tty: tty,
           selected: selected, visible: visible, minimized: minimized,
           process_names: processNames, processes_readable: processesReadable,
           title: title.slice(0, 512), screen: "", errors: []};
         if (wanted.has(tty)) {
           try {
-            row.screen = String(t.contents()).split(/\r\n?|\n/).slice(-80).join("\n");
-            if (row.screen.length > 16384) {
-              row.screen = row.screen.slice(-16384);
-              row.errors.push("screen_bytes_truncated");
+            const rawScreen = t.contents();
+            if (typeof rawScreen !== "string") {
+              row.errors.push("terminal_screen_unreadable");
+            } else {
+              row.screen = rawScreen.split(/\r\n?|\n/).slice(-80).join("\n");
+              if (row.screen.length > 16384) {
+                row.screen = row.screen.slice(-16384);
+                row.errors.push("screen_bytes_truncated");
+              }
             }
           } catch (e) { row.errors.push("terminal_screen_unreadable"); }
         }
@@ -106,10 +143,28 @@ class Runner:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise ProbeFailure("collection_deadline_exceeded")
+        is_tmux = bool(command and Path(command[0]).name == "tmux")
+        sub_idx = 3 if len(command) >= 4 and command[1] == "-L" else 1
+        is_tmux_list_panes = is_tmux and len(command) > sub_idx and command[sub_idx] == "list-panes"
+        run_kwargs = {}
+        if is_tmux:
+            env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+            env["LC_ALL"] = "C"
+            run_kwargs["env"] = env
         try:
-            with tempfile.TemporaryFile() as output:
-                subprocess.run(command, stdout=output, stderr=subprocess.DEVNULL,
-                               timeout=min(timeout, remaining), check=True)
+            with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as err_out:
+                proc = subprocess.run(command, stdout=output, stderr=err_out,
+                                      timeout=min(timeout, remaining), check=False, **run_kwargs)
+                if proc.returncode != 0:
+                    err_out.seek(0)
+                    err_text = err_out.read(4096).decode("utf-8", errors="replace").lower()
+                    if (is_tmux_list_panes
+                            and ("no server running" in err_text
+                                 or ("error connecting to" in err_text
+                                     and ("no such file or directory" in err_text
+                                          or "connection refused" in err_text)))):
+                        raise ProbeFailure("not_running")
+                    raise ProbeFailure("probe_failed")
                 output.seek(0)
                 data = output.read(limit + 1)
             if len(data) > limit:
@@ -189,9 +244,52 @@ def ancestors(pid, processes):
         pid = processes[pid]["ppid"]
 
 
-def parse_panes(text):
+def discover_tmux_sockets(socket_dir=None):
+    """Discover safe, user-owned non-default tmux socket names in the tmux socket directory."""
+    if socket_dir is None:
+        base = os.environ.get("TMUX_TMPDIR") or "/tmp"
+        base_path = Path(base)
+        if not base_path.is_absolute():
+            return [], False
+        socket_dir = base_path / ("tmux-" + str(os.getuid()))
+    else:
+        socket_dir = Path(socket_dir)
+    try:
+        dir_stat = os.lstat(socket_dir)
+    except OSError:
+        return [], False
+    uid = os.getuid()
+    if (stat.S_ISLNK(dir_stat.st_mode) or not stat.S_ISDIR(dir_stat.st_mode)
+            or dir_stat.st_uid != uid or (dir_stat.st_mode & 0o077) != 0):
+        return [], False
+    names = []
+    try:
+        with os.scandir(socket_dir) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
+    except OSError:
+        return [], False
+    for entry in entries:
+        name = entry.name
+        if name == "default" or not TMUX_SOCKET_NAME.fullmatch(name):
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISSOCK(info.st_mode) and info.st_uid == uid:
+            names.append(name)
+    truncated = len(names) > MAX_TMUX_SOCKETS
+    return names[:MAX_TMUX_SOCKETS], truncated
+
+
+def pane_key(pane):
+    return (pane.get("tmux_socket"), pane["pane"])
+
+
+def parse_panes(text, tmux_socket=None, max_panes=None):
     # Linked/grouped sessions list the same server-wide pane more than once.
     # Count and probe the pane once; memberships are observations, not ownership.
+    limit = MAX_PANES if max_panes is None else max_panes
     panes, dead_panes, errors = {}, set(), []
     for line in text.splitlines():
         fields = line.split("\t", 8)
@@ -215,10 +313,11 @@ def parse_panes(text):
             panes[pane_id] = None
             continue
         row = {"pane": pane_id, "pid": int(fields[1]), "tty": tty_name(fields[2]),
+               "tmux_socket": tmux_socket,
                "tmux_session": fields[3], "window": fields[5], "tmux_window_id": fields[4],
                "pane_index": fields[6], "command": fields[7], "cwd": fields[8]}
         if row["pane"] not in panes:
-            if len(panes) >= MAX_PANES:
+            if len(panes) >= limit:
                 errors.append("tmux_panes_truncated")
                 continue  # Still retain later memberships of admitted panes.
             row["tmux_sessions"] = {row["tmux_session"]}
@@ -638,12 +737,39 @@ def collect(health_report=None, runner=None):
     panes = []
     if tmux:
         fmt = "#{pane_id}\t#{?pane_dead,dead,#{pane_pid}}\t#{pane_tty}\t#{session_name}\t#{window_id}\t#{window_name}\t#{pane_index}\t#{pane_current_command}\t#{pane_current_path}"
-        try:
-            panes, errors = parse_panes(runner.run([tmux, "list-panes", "-a", "-F", fmt]))
-            result["errors"].extend(errors)
-            result["coverage"]["tmux"] = "partial" if errors else "complete"
-        except ProbeFailure as error:
-            result["errors"].append("tmux_" + str(error))
+        named_sockets, sockets_truncated = discover_tmux_sockets()
+        if sockets_truncated:
+            result["errors"].append("tmux_sockets_truncated")
+        targets = [None] + named_sockets
+        succeeded = 0
+        not_running = 0
+        failed = 0
+        pane_errors = []
+        for sock in targets:
+            cmd = [tmux, "-L", sock, "list-panes", "-a", "-F", fmt] if sock else [tmux, "list-panes", "-a", "-F", fmt]
+            try:
+                raw = runner.run(cmd)
+            except ProbeFailure as error:
+                if str(error) == "not_running":
+                    not_running += 1
+                else:
+                    failed += 1
+                    result["errors"].append("tmux_" + str(error))
+                continue
+            succeeded += 1
+            remaining = max(0, MAX_PANES - len(panes))
+            sock_panes, sock_errors = parse_panes(raw, tmux_socket=sock, max_panes=remaining)
+            panes.extend(sock_panes)
+            pane_errors.extend(sock_errors)
+        result["errors"].extend(pane_errors)
+        if failed and not succeeded:
+            result["coverage"]["tmux"] = "unknown"
+        elif failed or pane_errors or sockets_truncated:
+            result["coverage"]["tmux"] = "partial"
+        elif succeeded:
+            result["coverage"]["tmux"] = "complete"
+        elif not_running:
+            result["coverage"]["tmux"] = "not_running"
     else:
         result["coverage"]["tmux"] = "unavailable"
         result["errors"].append("tmux_executable_unavailable")
@@ -706,16 +832,21 @@ def collect(health_report=None, runner=None):
     terminal_errors = sorted(set(terminal_errors))
     result["errors"].extend(terminal_errors)
     result["coverage"]["terminal"] = "complete" if not terminal_errors else "unavailable" if terminal_errors == ["terminal_not_running"] else "partial"
-    pane_counts = Counter(pane["pane"] for pane in attached.values() if pane)
+    pane_counts = Counter(pane_key(pane) for pane in attached.values() if pane)
     tty_counts = Counter(row["tty"] for row in agents if attached[row["pid"]] is None)
     pane_screens = {}
     for pane in panes:
-        if pane["pane"] not in pane_counts or pane_counts[pane["pane"]] > 1:
+        key = pane_key(pane)
+        if key not in pane_counts or pane_counts[key] > 1:
             continue
+        cmd = [tmux]
+        if pane.get("tmux_socket"):
+            cmd.extend(["-L", pane["tmux_socket"]])
+        cmd.extend(["capture-pane", "-p", "-t", pane["pane"], "-S", "-80"])
         try:
-            pane_screens[pane["pane"]] = runner.run([tmux, "capture-pane", "-p", "-t", pane["pane"], "-S", "-80"], timeout=2, limit=MAX_SCREEN_BYTES * 4)
+            pane_screens[key] = runner.run(cmd, timeout=2, limit=MAX_SCREEN_BYTES * 4)
         except ProbeFailure as error:
-            pane_screens[pane["pane"]] = None
+            pane_screens[key] = None
             result["errors"].append("screen_" + str(error))
     for agent in agents:
         row = {key: agent[key] for key in ("agent", "pid", "ppid", "tty", "started_at", "age_seconds", "session_id")}
@@ -728,17 +859,20 @@ def collect(health_report=None, runner=None):
             row["errors"].append("argv_identity_unavailable")
         pane = attached[row["pid"]]
         if pane:
-            row["target"] = {key: pane[key] for key in ("pane", "tmux_session", "tmux_sessions", "window", "tmux_window_id", "pane_index")}
+            key = pane_key(pane)
+            row["target"] = {field: pane[field] for field in ("pane", "tmux_session", "tmux_sessions", "window", "tmux_window_id", "pane_index")}
+            if pane.get("tmux_socket"):
+                row["target"]["tmux_socket"] = pane["tmux_socket"]
             row["target"]["transport"] = "tmux"
             if not row["cwd"]:
                 row["cwd"] = pane["cwd"]
                 row["errors"].append("cwd_from_pane")
-            if pane_counts[pane["pane"]] > 1:
+            if pane_counts[key] > 1:
                 row["errors"].append("screen_shared_between_agents")
-            elif pane_screens.get(pane["pane"]) is None:
+            elif pane_screens.get(key) is None:
                 row["errors"].append("screen_unavailable")
             else:
-                row["screen"], truncated = screen_tail(pane_screens[pane["pane"]])
+                row["screen"], truncated = screen_tail(pane_screens[key])
                 if truncated:
                     row["errors"].append("screen_bytes_truncated")
         else:
@@ -761,17 +895,20 @@ def collect(health_report=None, runner=None):
     # A known pane command without a matching OS agent remains explicit unknown
     # identity rather than disappearing from the inventory.
     for pane in panes:
-        if pane["pane"] not in pane_counts and pane["command"] in AGENTS:
+        if pane_key(pane) not in pane_counts and pane["command"] in AGENTS:
             if len(result["sessions"]) >= MAX_SESSIONS:
                 result["errors"].append("session_inventory_truncated")
                 result["coverage"]["processes"] = "partial"
                 break
+            target = {"transport": "tmux", "pane": pane["pane"], "tmux_session": pane["tmux_session"],
+                      "tmux_sessions": pane["tmux_sessions"],
+                      "window": pane["window"], "tmux_window_id": pane["tmux_window_id"]}
+            if pane.get("tmux_socket"):
+                target["tmux_socket"] = pane["tmux_socket"]
             result["sessions"].append({"agent": pane["command"], "pid": None, "ppid": None,
                 "tty": pane["tty"], "started_at": None, "age_seconds": None, "cwd": pane["cwd"],
                 "session_id": None, "session_id_source": None, "skip_permissions": None,
-                "target": {"transport": "tmux", "pane": pane["pane"], "tmux_session": pane["tmux_session"],
-                           "tmux_sessions": pane["tmux_sessions"],
-                           "window": pane["window"], "tmux_window_id": pane["tmux_window_id"]},
+                "target": target,
                 "screen": "", "title": "", "errors": ["agent_process_unverified"]})
     result["health"] = read_health(health_report or Path.home() / "Library" / "Application Support" / "XMechBay" / "port-pressure" / "state" / "latest.json")
     result["errors"] = sorted(set(result["errors"]))

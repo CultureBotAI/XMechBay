@@ -47,6 +47,31 @@ class HealthAndIdentityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 FLEET.validate_snapshot(data)
 
+    def test_tmux_socket_survives_normalization_and_rejects_unsafe_values(self):
+        data = snapshot()
+        data["sessions"][0]["target"] = {
+            "transport": "tmux", "pane": "%0", "tmux_socket": "alt_server",
+            "tmux_session": "review", "tmux_sessions": ["review"], "window": "SampleMech",
+        }
+        report = FLEET.normalize_host("a", "A", data, now=NOW)
+        row = report["sessions"][0]
+        self.assertEqual(row["target"]["tmux_socket"], "alt_server")
+        rendered = FLEET.render_host(report)
+        self.assertIn("alt\\_server:%0", rendered)
+        for bad in ("default", "../escape", "/tmp/sock", "-badflag", "", 42, "has space"):
+            with self.subTest(bad=bad):
+                bad_data = snapshot()
+                bad_data["sessions"][0]["target"] = {"transport": "tmux", "pane": "%0", "tmux_socket": bad}
+                with self.assertRaises(ValueError):
+                    FLEET.validate_snapshot(bad_data)
+        for non_tmux in ({"transport": "terminal", "window_id": 12, "tab": 1, "tmux_socket": "alt_server"},
+                         {"transport": "process", "tmux_socket": "alt_server"}):
+            with self.subTest(target=non_tmux):
+                bad_data = snapshot()
+                bad_data["sessions"][0]["target"] = non_tmux
+                with self.assertRaises(ValueError):
+                    FLEET.validate_snapshot(bad_data)
+
     def test_normalized_report_omits_raw_screen_path_and_title(self):
         report = FLEET.normalize_host("a", "Laptop A", snapshot(), now=NOW)
         row = report["sessions"][0]
