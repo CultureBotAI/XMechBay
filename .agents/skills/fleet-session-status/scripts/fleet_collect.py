@@ -10,6 +10,7 @@ No session input, credential inspection, environment dump, or agent model calls.
 import argparse
 from collections import Counter
 from datetime import datetime, timezone
+import errno
 import json
 import math
 import os
@@ -135,6 +136,20 @@ class ProbeFailure(Exception):
     """Fixed error code; never includes raw arguments, output, or private paths."""
 
 
+def _tmux_subcommand(command):
+    """Return the tmux subcommand name, skipping client flags such as -u and -L <name>."""
+    index = 1
+    while index < len(command):
+        token = command[index]
+        if token == "-u":
+            index += 1
+        elif token == "-L":
+            index += 2
+        else:
+            return token
+    return None
+
+
 class Runner:
     def __init__(self, seconds=TOTAL_SECONDS):
         self.deadline = time.monotonic() + seconds
@@ -144,25 +159,34 @@ class Runner:
         if remaining <= 0:
             raise ProbeFailure("collection_deadline_exceeded")
         is_tmux = bool(command and Path(command[0]).name == "tmux")
-        sub_idx = 3 if len(command) >= 4 and command[1] == "-L" else 1
-        is_tmux_list_panes = is_tmux and len(command) > sub_idx and command[sub_idx] == "list-panes"
+        is_tmux_list_panes = is_tmux and _tmux_subcommand(command) == "list-panes"
+        exec_command = list(command)
         run_kwargs = {}
         if is_tmux:
-            env = {k: v for k, v in os.environ.items() if k != "TMUX"}
-            env["LC_ALL"] = "C"
-            run_kwargs["env"] = env
+            # Force UTF-8 client mode (-u) without forcing LC_ALL=C: under a non-UTF-8
+            # locale tmux replaces -F tab delimiters with underscores (tmux_row_unparsed).
+            if len(exec_command) < 2 or exec_command[1] != "-u":
+                exec_command.insert(1, "-u")
+            run_kwargs["env"] = {k: v for k, v in os.environ.items() if k != "TMUX"}
         try:
             with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as err_out:
-                proc = subprocess.run(command, stdout=output, stderr=err_out,
+                proc = subprocess.run(exec_command, stdout=output, stderr=err_out,
                                       timeout=min(timeout, remaining), check=False, **run_kwargs)
                 if proc.returncode != 0:
                     err_out.seek(0)
                     err_text = err_out.read(4096).decode("utf-8", errors="replace").lower()
+                    not_running_reasons = {
+                        reason for reason in (
+                            "no such file or directory",
+                            "connection refused",
+                            os.strerror(errno.ENOENT).lower(),
+                            os.strerror(errno.ECONNREFUSED).lower(),
+                        ) if reason
+                    }
                     if (is_tmux_list_panes
                             and ("no server running" in err_text
                                  or ("error connecting to" in err_text
-                                     and ("no such file or directory" in err_text
-                                          or "connection refused" in err_text)))):
+                                     and any(reason in err_text for reason in not_running_reasons)))):
                         raise ProbeFailure("not_running")
                     raise ProbeFailure("probe_failed")
                 output.seek(0)
